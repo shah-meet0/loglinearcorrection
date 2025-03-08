@@ -10,21 +10,27 @@ matplotlib.use('TkAgg')
 import pandas as pd
 import numpy as np
 import seaborn as sns
+import scipy.stats as stats
 
 ###############################################################################################
-# Error Generators
+# Error Generators\
+# TODO: Replace with scipy.stats implementation
 ###############################################################################################
 
 
 class _ErrorGenerator:
 
+    def __init__(self):
+        self.dist = None
+
     def generate(self, n):
-        raise NotImplementedError(f"{self.__class__} must implement generate")
+        return self.dist.rvs(size=n)
 
     def draw(self):
-        data= self.generate(10000)
+        x = np.linspace(self.dist.ppf(0.01), self.dist.ppf(0.99), 100)
+        y = self.dist.pdf(x)
         fig, ax = plt.subplots(1,1)
-        sns.kdeplot(data, ax=ax)
+        sns.kdeplot(x=x, y=y, ax=ax)
         return fig, ax
 
     def __call__(self, n):
@@ -34,21 +40,42 @@ class _ErrorGenerator:
 class NormalErrorGenerator(_ErrorGenerator):
 
     def __init__(self, mean=0, sd=1):
+        super().__init__()
+        self.dist = stats.norm(loc=mean, scale=sd)
         self.mean = mean
         self.sd = sd
-
-    def generate(self, n):
-        return np.random.normal(self.mean, self.sd, n)
 
 
 class UniformErrorGenerator(_ErrorGenerator):
 
     def __init__(self, low=0, high=1):
+        super().__init__()
+        self.dist = stats.uniform(low=low, high=high)
         self.low = low
         self.high = high
 
-    def generate(self, n):
-        return np.random.uniform(self.low, self.high, n)
+
+class HeteroscedasticErrorGenerator(_ErrorGenerator):
+
+    def __init__(self, mean=np.array([0]), cov=np.array([[1]])):
+        super().__init__()
+        self.dist = stats.multivariate_normal(mean=mean, cov=cov)
+        self.mean = mean
+        self.cov = cov
+
+    def generate(self, n=1):
+        return super().generate(n)
+
+    def draw(self):
+        data = self.generate(1000)
+        fig, ax = plt.subplots(1,1)
+        n = len(self.mean)
+        for i in range(n):
+            sns.kdeplot(data[:, i], ax=ax)
+
+    def __call__(self, n=1):
+        return self.generate(n)
+
 
 
 ###############################################################################################
@@ -99,7 +126,7 @@ class DependentBinaryDataGenerator(_RandomDataGenerator):
 # Data Generating Processes
 ###############################################################################################
 
-
+# TODO: REVAMP THIS CLASS
 class RCT:
 
     def __init__(self, treatment_effect, n_regressors,  intercept, means, sigma, betas, p_treated= 0.5):
@@ -133,9 +160,3 @@ class RCT:
 
             X = np.random.multivariate_normal(mean=self.means, cov=self.sigma, size=n)
 
-
-if __name__ == '__main__':
-    print("Testing Error Generators")
-    print("Testing Normal Error Generator")
-    neg = NormalErrorGenerator(0,1)
-    fig, ax = neg.draw()
