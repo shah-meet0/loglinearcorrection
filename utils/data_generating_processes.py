@@ -17,14 +17,14 @@ class _ErrorGenerator:
     def __init__(self):
         pass
 
-    def generate(self, X):
+    def generate(self, x):
         pass
 
-    def __call__(self, X):
-        return self.generate(X)
+    def __call__(self, x):
+        return self.generate(x)
 
-    def expected_value(self, X, func, trials=10000):
-        draws = np.array([func(self.generate(X)) for _ in range(trials)])
+    def expected_value(self, x, func, trials=10000):
+        draws = np.array([func(self.generate(x)) for _ in range(trials)])
         return np.mean(draws, axis=0)
 
 
@@ -32,21 +32,18 @@ class NormalErrorGenerator(_ErrorGenerator):
 
     def __init__(self, mean_fn=constant_mean(0), cov_fn=constant_variance(1)):
         """
-        :param X: Data
         :param mean_fn: Converts data into a mean function of length n
-        :param var_fn: Converts data into a variance covariance matrix of size nxn
+        :param cov_fn: Converts data into a variance covariance matrix of size nxn
         """
         super().__init__()
 
         self.mean_fn = mean_fn
         self.cov_fn = cov_fn
 
-
-
-    def generate(self, X):
-        n = len(X)
-        means = self.mean_fn(X)
-        cov = self.cov_fn(X)
+    def generate(self, x):
+        n = len(x)
+        means = self.mean_fn(x)
+        cov = self.cov_fn(x)
 
         if len(means) != n:
             raise ValueError(f"Mean function returns vector of length {len(means)} but expected {n}")
@@ -59,13 +56,11 @@ class NormalErrorGenerator(_ErrorGenerator):
         return dist.rvs(1).reshape((-1,))
 
 
-
-
 ###############################################################################################
 # Random Data Generators
 ###############################################################################################
 
-#TODO: Add more methods here, for example visualization
+# TODO: Add more methods here, for example visualization
 
 class _RandomDataGenerator:
 
@@ -157,13 +152,13 @@ class DGP:
         self.exponential = exponential
 
     def generate(self, n):
-        X = self.data_generator(n)
-        u = self.error_generator(X)
-        y = X @ self.betas + u
+        x = self.data_generator(n)
+        u = self.error_generator(x)
+        y = x @ self.betas + u
 
         if self.exponential:
             y = np.exp(y)
-        return X, y, u
+        return x, y, u
 
 
 class RCT(DGP):
@@ -190,5 +185,3 @@ class RCT(DGP):
             betas = np.concatenate(([treatment_effect], betas))
 
         super().__init__(data_generator, betas, error_generator, exponential)
-
-
