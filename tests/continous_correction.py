@@ -128,7 +128,7 @@ df = pd.DataFrame(entries, columns=["Model", "MSE", "R2"])
 df.to_latex()
 
 
-# PLOT
+# PLOT RESULTS
 
 fig, ax = plt.subplots(2,2, sharey=True, sharex=True)
 for axis in ax.flatten():
