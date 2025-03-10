@@ -51,9 +51,8 @@ class NormalErrorGenerator(_ErrorGenerator):
         if len(cov) != n or len(cov[0]) != n:
             raise ValueError(f"Covariance matrix has shape {np.shape(cov)} but expected ({n}, {n})")
 
-        dist = stats.multivariate_normal(mean=means, cov=cov)
-
-        return dist.rvs(1).reshape((-1,))
+        rng = np.random.default_rng()
+        return rng.multivariate_normal(means, cov, method='cholesky')
 
 
 ###############################################################################################
@@ -115,6 +114,19 @@ class BinaryDataGenerator(_RandomDataGenerator):
         return self.n_features
 
 
+class ConstantGenerator(_RandomDataGenerator):
+
+    def __init__(self, c):
+        super().__init__()
+        self.c = c
+
+    def generate(self, n):
+        return np.array([self.c for _ in range(n)]).reshape(-1, 1)
+
+    def get_feature_space_size(self):
+        return 1
+
+
 class DependentBinaryDataGenerator(_RandomDataGenerator):
     # To be implemented if needed
     pass
@@ -152,6 +164,11 @@ class DGP:
         self.exponential = exponential
 
     def generate(self, n):
+        """
+        Generates data from the DGP
+        :param n: Number of data points
+        :return: x: Regressor Matrix, y: Response Vector, u: Error Vector
+        """
         x = self.data_generator(n)
         u = self.error_generator(x)
         y = x @ self.betas + u
@@ -160,10 +177,10 @@ class DGP:
             y = np.exp(y)
         return x, y, u
 
-
+# TODO: Add handling of datagenerator len being different from betas
 class RCT(DGP):
 
-    def __init__(self, treatment_effect, p_treated, data_generator=None, betas=None,
+    def __init__(self, treatment_effect, p_treated, data_generator=ConstantGenerator, betas=None,
                  error_generator=NormalErrorGenerator(), exponential=False):
 
         if data_generator is None:
@@ -172,7 +189,7 @@ class RCT(DGP):
 
         if data_generator is not None:
             if betas is None:
-                raise ValueError('Data generator provided without betas')
+                betas = np.array([1])
 
         treatment_generator = BinaryDataGenerator(1, p_treated)
 

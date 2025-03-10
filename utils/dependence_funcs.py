@@ -1,3 +1,10 @@
+#################################################################################
+# This file contains functions that are used to generate dependence functions.
+# Author: Meet Shah
+#################################################################################
+
+
+
 import numpy as np
 
 
@@ -15,6 +22,4 @@ def constant_variance(c):
 
 
 def independent_absolute(X):
-    assert len(X[0]) == 1
-
     return np.diag(np.abs(X[:, 0]))
