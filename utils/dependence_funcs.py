@@ -23,3 +23,6 @@ def constant_variance(c):
 
 def independent_absolute(X):
     return np.diag(np.abs(X[:, 0]))
+
+def independent_squared(X):
+    return np.diag(X[:, 0]**2)

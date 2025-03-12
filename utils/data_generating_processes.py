@@ -55,6 +55,28 @@ class NormalErrorGenerator(_ErrorGenerator):
         return rng.multivariate_normal(means, cov, method='cholesky')
 
 
+class IndependentNormErrorGenerator(_ErrorGenerator):
+
+    def __init__(self, mean_fn=constant_mean(0), var_fn=constant_variance(1)):
+        super().__init__()
+        self.mean_fn = mean_fn
+        self.var_fn = var_fn
+
+    def generate(self, x):
+        n = len(x)
+        means = self.mean_fn(x)
+        var = np.diagonal(self.var_fn(x))
+
+        if len(means) != n:
+            raise ValueError(f"Mean function returns vector of length {len(means)} but expected {n}")
+
+        if len(var) != n:
+            raise ValueError(f"Variance matrix has shape {np.shape(var)} but expected ({n})")
+
+        return np.random.normal(means, np.sqrt(var))
+
+
+
 ###############################################################################################
 # Random Data Generators
 ###############################################################################################
