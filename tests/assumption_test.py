@@ -20,8 +20,9 @@ def test_model(dgp, n):
     model_ols = sm.OLS(resids, test_x)
     results_ols = model_ols.fit()
     r_mat = np.eye(len(x_poly[0]) + 1)
-    r_mat = r_mat[0:len(x_poly[0]), :]
-    wald_test = results_ols.f_test(r_mat)
+    q = np.zeros(len(x_poly[0]) + 1)
+    q[-1] = 1
+    wald_test = results_ols.f_test((r_mat,q))
 
     return wald_test.pvalue, np.mean(np.exp(u))
 
