@@ -75,6 +75,25 @@ class IndependentNormErrorGenerator(_ErrorGenerator):
 
         return np.random.normal(means, np.sqrt(var))
 
+class IndependentLogNormErrorGenerator(_ErrorGenerator):
+
+    def __init__(self, mean_fn=constant_mean(0), var_fn=constant_variance(1)):
+        super().__init__()
+        self.mean_fn = mean_fn
+        self.var_fn = var_fn
+
+    def generate(self, x):
+        n = len(x)
+        means = self.mean_fn(x)
+        var = np.diagonal(self.var_fn(x))
+
+        if len(means) != n:
+            raise ValueError(f"Mean function returns vector of length {len(means)} but expected {n}")
+
+        if len(var) != n:
+            raise ValueError(f"Variance matrix has shape {np.shape(var)} but expected ({n})")
+
+        return np.random.lognormal(means, np.sqrt(var))
 
 
 ###############################################################################################
@@ -197,7 +216,7 @@ class DGP:
 
         if self.exponential:
             y = np.exp(y)
-        return x, y, u
+        return y, x, u
 
 # TODO: Add handling of datagenerator len being different from betas
 class RCT(DGP):

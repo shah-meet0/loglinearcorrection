@@ -25,7 +25,7 @@ betas = np.array([2, 1])
 
 dgp = DGP(combined_generator, betas, error_generator, exponential=True)
 
-x,y,u = dgp.generate(10000)
+y,x,u = dgp.generate(10000)
 
 # # Model dependent percentage changes
 #
