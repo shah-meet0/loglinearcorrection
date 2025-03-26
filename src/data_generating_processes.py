@@ -6,7 +6,7 @@
 
 import numpy as np
 import scipy.stats as stats
-from utils.dependence_funcs import constant_mean, constant_variance
+from .dependence_funcs import constant_mean, constant_variance
 
 ###############################################################################################
 # Error Generators
