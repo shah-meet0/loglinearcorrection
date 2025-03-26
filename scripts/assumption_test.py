@@ -47,7 +47,7 @@ dgp_ppml = DGP(combined_generator, betas, error_ppml, exponential=True)
 dgp_ols = DGP(combined_generator, betas, error_ols, exponential=True)
 
 n_sim = 1000
-n_data = 1000
+n_data = 50000
 results_ppml = []
 results_ols = []
 
@@ -60,5 +60,5 @@ for i in range(n_sim):
 results_ols = np.array(results_ols)
 results_ppml = np.array(results_ppml)
 
-print(f"OLS: {np.mean(results_ols[:,0] < 0.05)}")
-print(f"PPML: {np.mean(results_ppml[:,0] < 0.05)}")
+print(f"OLS specification, proportion tests significantly rejecting: {np.mean(results_ols[:,0] < 0.05)}")
+print(f"PPML specification, proportion tests significantly rejecting: {np.mean(results_ppml[:,0] < 0.05)}")
