@@ -1,5 +1,5 @@
-from utils.data_generating_processes import DGP, MVNDataGenerator, ConstantGenerator, CombinedDataGenerator, IndependentNormErrorGenerator
-from utils.dependence_funcs import independent_absolute, constant_mean, independent_squared, independent_absolute_mean
+from loglinearcorrection.data_generating_processes import DGP, MVNDataGenerator, ConstantGenerator, CombinedDataGenerator, IndependentNormErrorGenerator
+from loglinearcorrection.dependence_funcs import independent_absolute, constant_mean, independent_squared, independent_absolute_mean
 import statsmodels.api as sm
 from sklearn.preprocessing import PolynomialFeatures
 import numpy as np
