@@ -4,6 +4,8 @@ import statsmodels.api as sm
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+import matplotlib
+
 
 # THIS MODULE IS FOR PRELIMINARY TESTING OF THE PPML Assumption
 def consistency(dgp, n):
@@ -12,7 +14,7 @@ def consistency(dgp, n):
     results_ppml = model_ppml.fit()
     yhat = model_ppml.predict(results_ppml.params, x)
     resids = y/yhat
-    return np.mean(resids)
+    return np.mean(resids), results_ppml.params[0]
 
 
 
@@ -35,7 +37,7 @@ betas = np.array([0.5, 1])
 dgp_ppml = DGP(combined_generator, betas, error_ppml, exponential=True)
 dgp_ols = DGP(combined_generator, betas, error_ols, exponential=True)
 
-n_sim = np.linspace(1000, 100000, 1000).astype(int)
+n_sim = np.linspace(50, 10000, 1000).astype(int)
 results_ppml = []
 results_ols = []
 
@@ -48,13 +50,25 @@ results_ols = np.array(results_ols)
 results_ppml = np.array(results_ppml)
 
 
-fig, ax = plt.subplots()
-sns.lineplot(x=n_sim[0:len(results_ols)], y=results_ols, ax=ax, label=r'$\mathbb{E}[e^u|X] \neq 1$')
-sns.lineplot(x=n_sim[0:len(results_ppml)], y=results_ppml, ax=ax, label=r'$\mathbb{E}[e^u|X] = 1$')
-ax.set_xlabel('Sample Size n')
-ax.set_ylabel(r'$\dfrac{1}{n}\sum_i^n \dfrac{y_i}{\hat{y}_i}$', rotation=0, labelpad=8)
-ax.hlines(1, 100, 100000, color='red', linestyle='--', label='1')
-ax.set_title('Convergence of test statistic')
-ax.yaxis.set_label_coords(-0.1, 0.5)
-ax.set_ylim(0, 2.5)
-plt.show()
+
+
+fig, ax = plt.subplots(2,1, figsize=(12, 8))
+sns.lineplot(x=n_sim[0:len(results_ols)], y=results_ols[:,0], ax=ax[0], label=r'$\mathbb{E}[e^u|X] \neq 1$')
+sns.lineplot(x=n_sim[0:len(results_ppml)], y=results_ppml[:,0], ax=ax[0], label=r'$\mathbb{E}[e^u|X] = 1$')
+ax[0].set_xlabel('')
+ax[0].set_ylabel(r'$\frac{1}{n}\sum_i^n \frac{y_i}{\hat{y}_i}$', rotation=0, labelpad=8, fontsize=15)
+ax[0].hlines(1, n_sim[0], n_sim[-1], color='red', linestyle='--', label='1')
+ax[0].set_title('Test Statistic')
+ax[0].yaxis.set_label_coords(-0.1, 0.5)
+ax[0].set_ylim(0.5, 2.5)
+
+sns.lineplot(x=n_sim[0:len(results_ols)], y=results_ols[:,1] - 0.5, ax=ax[1], label=r'$\mathbb{E}[e^u|X] \neq 1$')
+sns.lineplot(x=n_sim[0:len(results_ppml)], y=results_ppml[:,1] - 0.5, ax=ax[1], label=r'$\mathbb{E}[e^u|X] = 1$')
+ax[1].set_xlabel('Sample size n')
+ax[1].set_ylabel(r'$\hat{\beta} - \beta$', rotation=0, labelpad=8, fontsize=15)
+ax[1].hlines(0, n_sim[0], n_sim[-1], color='red', linestyle='--', label='0')
+ax[1].set_title('Estimated Coefficient')
+ax[1].yaxis.set_label_coords(-0.1, 0.5)
+ax[1].set_ylim(-1, 1)
+
+plt.savefig('./figures/convergence_test_coefficient.pdf', dpi=1000)
