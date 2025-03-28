@@ -65,15 +65,15 @@ class IndependentNormErrorGenerator(_ErrorGenerator):
     def generate(self, x):
         n = len(x)
         means = self.mean_fn(x)
-        var = np.diagonal(self.var_fn(x))
+        var = self.var_fn(x)
 
         if len(means) != n:
             raise ValueError(f"Mean function returns vector of length {len(means)} but expected {n}")
 
         if len(var) != n:
-            raise ValueError(f"Variance matrix has shape {np.shape(var)} but expected ({n})")
+            raise ValueError(f"Variance vector has shape {np.shape(var)} but expected ({n})")
 
-        return np.random.normal(means, np.sqrt(var))
+        return means + np.sqrt(var) * np.random.randn(n)
 
 class IndependentLogNormErrorGenerator(_ErrorGenerator):
 

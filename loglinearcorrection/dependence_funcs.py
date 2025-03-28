@@ -20,10 +20,9 @@ def constant_variance(c):
         return c * np.eye(len(x))
     return f
 
-def independent_absolute_mean(X):
-    return np.abs(X[:, 0])
 def independent_absolute(X):
-    return np.diag(np.abs(X[:, 0]))
+    return np.abs(X[:, 0])
+
 
 def independent_squared(X):
     return np.diag(X[:, 0]**2)
