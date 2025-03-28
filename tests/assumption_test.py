@@ -35,7 +35,7 @@ betas = np.array([0.5, 1])
 dgp_ppml = DGP(combined_generator, betas, error_ppml, exponential=True)
 dgp_ols = DGP(combined_generator, betas, error_ols, exponential=True)
 
-n_sim = np.linspace(100, 100000, 10000).astype(int)
+n_sim = np.linspace(1000, 100000, 1000).astype(int)
 results_ppml = []
 results_ols = []
 
@@ -44,15 +44,17 @@ for n in n_sim:
     results_ppml.append(consistency(dgp_ppml, n))
     results_ols.append(consistency(dgp_ols, n))
 
-results_ols = np.array(results_ols) - 1
-results_ppml = np.array(results_ppml) - 1
+results_ols = np.array(results_ols)
+results_ppml = np.array(results_ppml)
 
 
 fig, ax = plt.subplots()
-sns.lineplot(x=n_sim, y=results_ols, ax=ax, label=r'$\mathbb{E}[e^u|X] \neq 1$')
-sns.lineplot(x=n_sim, y=results_ppml, ax=ax, label=r'$\mathbb{E}[e^u|X] = 1$')
+sns.lineplot(x=n_sim[0:len(results_ols)], y=results_ols, ax=ax, label=r'$\mathbb{E}[e^u|X] \neq 1$')
+sns.lineplot(x=n_sim[0:len(results_ppml)], y=results_ppml, ax=ax, label=r'$\mathbb{E}[e^u|X] = 1$')
 ax.set_xlabel('Sample Size n')
-ax.set_ylabel(r'$\dfrac{1}{n}\sum_i^n \dfrac{y_i}{\hat{y}_i} - 1$')
-ax.hlines(1, 100, 30000, color='red', linestyle='--', label='1')
+ax.set_ylabel(r'$\dfrac{1}{n}\sum_i^n \dfrac{y_i}{\hat{y}_i}$', rotation=0, labelpad=8)
+ax.hlines(1, 100, 100000, color='red', linestyle='--', label='1')
 ax.set_title('Convergence of test statistic')
+ax.yaxis.set_label_coords(-0.1, 0.5)
+ax.set_ylim(0, 2.5)
 plt.show()

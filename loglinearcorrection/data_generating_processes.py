@@ -93,7 +93,7 @@ class IndependentLogNormErrorGenerator(_ErrorGenerator):
         if len(var) != n:
             raise ValueError(f"Variance matrix has shape {np.shape(var)} but expected ({n})")
 
-        return np.random.lognormal(means, np.sqrt(var))
+        return np.exp(means + np.sqrt(var) * np.random.randn(n))
 
 
 ###############################################################################################
