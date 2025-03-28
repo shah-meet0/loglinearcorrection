@@ -4,7 +4,7 @@ from sklearn.compose import ColumnTransformer
 import statsmodels.api as sm
 import numpy as np
 import seaborn as sns
-data = pd.read_csv('./data/plfs_2017.csv')
+data = pd.read_csv('../raw-data/plfs_2017.csv')
 data['Age2'] = data['Age']**2
 
 # Drop rows with missing values
