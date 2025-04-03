@@ -25,4 +25,4 @@ def independent_absolute(X):
 
 
 def independent_squared(X):
-    return np.diag(X[:, 0]**2)
+    return X[:, 0] ** 2
