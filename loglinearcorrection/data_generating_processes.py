@@ -6,7 +6,7 @@
 
 import numpy as np
 import scipy.stats as stats
-from .dependence_funcs import constant_mean, constant_variance
+from .dependence_funcs import constant_mean, constant_variance, constant_variance_ind
 
 ###############################################################################################
 # Error Generators
@@ -57,7 +57,7 @@ class NormalErrorGenerator(_ErrorGenerator):
 
 class IndependentNormErrorGenerator(_ErrorGenerator):
 
-    def __init__(self, mean_fn=constant_mean(0), var_fn=constant_variance(1)):
+    def __init__(self, mean_fn=constant_mean(0), var_fn=constant_variance_ind(1)):
         super().__init__()
         self.mean_fn = mean_fn
         self.var_fn = var_fn

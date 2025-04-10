@@ -1,8 +1,9 @@
 from loglinearcorrection.data_generating_processes import DGP, MVNDataGenerator, ConstantGenerator, CombinedDataGenerator, IndependentNormErrorGenerator
-from loglinearcorrection.dependence_funcs import independent_absolute, constant_mean, independent_squared, independent_absolute_mean
+from loglinearcorrection.dependence_funcs import independent_absolute, constant_mean, independent_squared
 import statsmodels.api as sm
 from sklearn.preprocessing import PolynomialFeatures
 import numpy as np
+from scripts.ppml_consistency import AssumptionTest
 
 
 # Testing a model for appropriate model specification
@@ -29,7 +30,7 @@ def test_model(dgp, n):
 
 # Error Generator such that E[e^u|X] = 1
 
-error_ppml = IndependentNormErrorGenerator(mean_fn=lambda X: -1 * independent_absolute_mean(X),
+error_ppml = IndependentNormErrorGenerator(mean_fn=lambda X: -1 * independent_absolute(X),
                                            var_fn=lambda X: 2 * independent_absolute(X))
 
 # Error Generator such that E[u|X] = 0
@@ -41,7 +42,7 @@ error_ols = IndependentNormErrorGenerator(mean_fn=constant_mean(0), var_fn=lambd
 constant_generator = ConstantGenerator(1)
 x_generator = MVNDataGenerator(means=[0], sigma=[[1]])
 combined_generator = CombinedDataGenerator([x_generator, constant_generator])
-betas = np.array([2, 1])
+betas = np.array([0.5, 1])
 
 dgp_ppml = DGP(combined_generator, betas, error_ppml, exponential=True)
 dgp_ols = DGP(combined_generator, betas, error_ols, exponential=True)
@@ -62,3 +63,6 @@ results_ppml = np.array(results_ppml)
 
 print(f"OLS specification, proportion tests significantly rejecting: {np.mean(results_ols[:,0] < 0.05)}")
 print(f"PPML specification, proportion tests significantly rejecting: {np.mean(results_ppml[:,0] < 0.05)}")
+
+
+

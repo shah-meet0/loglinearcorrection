@@ -20,6 +20,11 @@ def constant_variance(c):
         return c * np.eye(len(x))
     return f
 
+def constant_variance_ind(c):
+    def f(x):
+        return c * np.ones(len(x))
+    return f
+
 def independent_absolute(X):
     return np.abs(X[:, 0])
 

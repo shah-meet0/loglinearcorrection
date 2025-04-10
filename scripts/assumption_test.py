@@ -25,7 +25,6 @@ def consistency_2(dgp, n):
     return np.mean(resids), results_ols.params[0]
 
 
-
 # Error Generator such that E[e^u|X] = 1
 
 error_ppml = IndependentNormErrorGenerator(mean_fn=lambda X: -1 * independent_absolute(X),
