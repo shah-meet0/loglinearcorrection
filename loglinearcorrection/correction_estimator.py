@@ -8,15 +8,18 @@ import tensorflow as tf
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
+
+
 class CorrectedEstimator:
 
-    def __init__(self, y, X, correction_model_type='nn', interest = 0):
+    def __init__(self, y, X, correction_model_type='nn', interest = 0, log_x=False):
         self.X = X
         self.y = y
         self.correction_model_type = correction_model_type.lower()
         if self.correction_model_type not in ['ols', 'nn']:
             raise ValueError("correction_model must be either 'ols' or 'nn'")
         self.x_index = interest
+        self.log_x = log_x
 
     def fit(self, params_dict = None, **kwargs):
 
@@ -24,7 +27,11 @@ class CorrectedEstimator:
             print('Empty params_dict, using default values')
             params_dict = {}
 
-        ols_results = sm.OLS(np.log(self.y), self.X).fit(**kwargs)
+        X_ols = self.X.copy()
+        if self.log_x:
+            X_ols[:, self.x_index] = np.log(X_ols[:, self.x_index])
+
+        ols_results = sm.OLS(np.log(self.y), X_ols).fit(**kwargs)
         print(ols_results.summary())
         print('Estimating correction term...please wait')
 
@@ -36,7 +43,10 @@ class CorrectedEstimator:
             correction_model = self._fit_nn_correction(ols_results, params_dict)
 
         print('Correction term estimated')
-        return CorrectedEstimatorResults(self, ols_results, correction_model)
+        if not self.log_x:
+            return CorrectedEstimatorResultsLogLinear(self, ols_results, correction_model)
+        else:
+            return CorrectedEstimatorResultsLogLog(self, ols_results, correction_model)
 
     def _fit_ols_correction(self, ols_results, params_dict):
         poly = PolynomialFeatures(degree=params_dict.get('degree', 3), include_bias=False)
@@ -92,12 +102,11 @@ class CorrectedEstimator:
 
         return model
 
-
-
-
-
-
 class CorrectedEstimatorResults:
+
+    pass
+
+class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
 
     def __init__(self, model, ols_results, correction_model):
         self.model = model
@@ -128,7 +137,36 @@ class CorrectedEstimatorResults:
         ppml_mod = sm.GLM(self.model.y, self.model.X, family=sm.families.Poisson()).fit(cov_type='HC3')
         return AssumptionTest(ppml_mod).test_direct()
 
+class CorrectedEstimatorResultsLogLog(CorrectedEstimatorResults):
 
+    def __init__(self, model, ols_results, correction_model):
+        self.model = model
+        self.correction_model = correction_model
+        self.index = model.x_index
+        self.betahat = ols_results.params[self.index]
+        self.e = self.correction_model.elasticity(model.X, self.index)
+
+    def average_elasticity(self):
+        return self.betahat + np.mean(self.e)
+
+    def plot_dist_elasticity(self):
+        fig, ax = plt.subplots()
+        sns.kdeplot(self.betahat + self.e, ax=ax)
+        ax.vlines(self.betahat,ymin=0, ymax=1, color='red', linestyle='--', label='OLS Estimate', transform=ax.get_xaxis_transform())
+        ax.vlines(self.average_elasticity(), ymin=0, ymax=1, color='blue', linestyle='--', label='Corrected Estimate', transform=ax.get_xaxis_transform())
+        ax.set_title('Distribution of Elasticity')
+        ax.set_xlabel('Elasticity')
+        ax.set_ylabel('Density')
+        ax.legend()
+        return fig, ax
+
+    def semi_elasticiy_at_average(self):
+        X_mean = np.mean(self.model.X, axis=0)
+        return self.betahat + self.correction_model.semi_elasticity(X_mean.reshape(1, -1), self.index)[0]
+
+    def test_ppml(self):
+        ppml_mod = sm.GLM(self.model.y, self.model.X, family=sm.families.Poisson()).fit(cov_type='HC3')
+        return AssumptionTest(ppml_mod).test_direct()
 
 
 class CorrectionModel:
@@ -140,6 +178,9 @@ class CorrectionModel:
         pass
 
     def semi_elasticity(self, X, index):
+        pass
+
+    def elasticity(self, X, index):
         pass
 
 class OLSCorrectionModel(CorrectionModel):
@@ -166,6 +207,9 @@ class OLSCorrectionModel(CorrectionModel):
         eu_old = self.predict(X)
         return ((eu_new - eu_old) / 1e-6)/ eu_old
 
+    def elasticity(self, X, index):
+        return self.semi_elasticity(X, index) * X[:, index].reshape(-1,)
+
 class NNCorrectionModel(CorrectionModel):
 
     def __init__(self, model):
@@ -191,3 +235,13 @@ class NNCorrectionModel(CorrectionModel):
             euhat = self.predict(X_used)
         grads = tape.gradient(euhat, X_used)
         return grads[:, index].numpy() / euhat.numpy().reshape(-1,)
+
+    def elasticity(self, X, index):
+        X_used = tf.convert_to_tensor(X, dtype=tf.float32)
+        X_used = tf.Variable(X_used)
+        with tf.GradientTape() as tape:
+            tape.watch(X_used)
+            euhat = self.predict(X_used)
+        grads = tape.gradient(euhat, X_used)
+        return grads[:, index].numpy() / euhat.numpy().reshape(-1,) * X_used.numpy()[:, index].reshape(-1,)
+    
