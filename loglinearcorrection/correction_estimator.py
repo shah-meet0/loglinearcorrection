@@ -27,12 +27,8 @@ class CorrectedEstimator:
             print('Empty params_dict, using default values')
             params_dict = {}
 
-        X_ols = self.X.copy()
-        if self.log_x:
-            X_ols[:, self.x_index] = np.log(X_ols[:, self.x_index])
-
-        ols_results = sm.OLS(np.log(self.y), X_ols).fit(**kwargs)
-        print(ols_results.summary())
+        ols_results = sm.OLS(np.log(self.y), self.X).fit(**kwargs)
+        print(f'OLS model fitted, estimated betahat: {ols_results.params[self.x_index]:.4f}')
         print('Estimating correction term...please wait')
 
         if self.correction_model_type == 'ols':
@@ -49,8 +45,11 @@ class CorrectedEstimator:
             return CorrectedEstimatorResultsLogLog(self, ols_results, correction_model)
 
     def _fit_ols_correction(self, ols_results, params_dict):
+        x_ols_correction = self.X.copy()
+        if self.log_x:
+            x_ols_correction[:, self.x_index] = np.exp(x_ols_correction[:, self.x_index])
         poly = PolynomialFeatures(degree=params_dict.get('degree', 3), include_bias=False)
-        X_poly = poly.fit_transform(self.X)
+        X_poly = poly.fit_transform(x_ols_correction)
         eu = np.exp(ols_results.resid)
         correction_model = sm.OLS(eu, X_poly).fit()
         return OLSCorrectionModel(correction_model, poly)
@@ -61,12 +60,16 @@ class CorrectedEstimator:
         batch_size = params_dict.get('batch_size', 64)
         epochs = params_dict.get('epochs', 100)
         patience = params_dict.get('patience', 10)
+        verbose = params_dict.get('verbose', 1)
 
         eu = tf.convert_to_tensor(np.exp(ols_results.resid))
-        X_tensor = tf.convert_to_tensor(self.X)
+        X_nn = self.X.copy()
+        if self.log_x:
+            X_nn[:, self.x_index] = np.exp(X_nn[:, self.x_index])
+        X_tensor = tf.convert_to_tensor(X_nn)
 
         nn_model.fit(x=X_tensor, y=eu, validation_split=validation_split, batch_size=batch_size, epochs=epochs,
-                     callbacks= [tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)], verbose=1)
+                     callbacks= [tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)], verbose=verbose)
         return NNCorrectionModel(nn_model)
 
 
@@ -102,17 +105,27 @@ class CorrectedEstimator:
 
         return model
 
+
 class CorrectedEstimatorResults:
-
-    pass
-
-class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
 
     def __init__(self, model, ols_results, correction_model):
         self.model = model
         self.correction_model = correction_model
         self.index = model.x_index
+        self.ols_results = ols_results
         self.betahat = ols_results.params[self.index]
+
+    def print_ols_results(self):
+        print(self.ols_results.summary())
+
+    def get_ols_results(self):
+        return self.ols_results
+
+
+class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
+
+    def __init__(self, model, ols_results, correction_model):
+        super().__init__(model, ols_results, correction_model)
         self.se = self.correction_model.semi_elasticity(model.X, self.index)
 
     def average_semi_elasticity(self):
@@ -129,7 +142,7 @@ class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
         ax.legend()
         return fig, ax
 
-    def semi_elasticiy_at_average(self):
+    def semi_elasticity_at_average(self):
         X_mean = np.mean(self.model.X, axis=0)
         return self.betahat + self.correction_model.semi_elasticity(X_mean.reshape(1, -1), self.index)[0]
 
@@ -137,13 +150,11 @@ class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
         ppml_mod = sm.GLM(self.model.y, self.model.X, family=sm.families.Poisson()).fit(cov_type='HC3')
         return AssumptionTest(ppml_mod).test_direct()
 
+
 class CorrectedEstimatorResultsLogLog(CorrectedEstimatorResults):
 
     def __init__(self, model, ols_results, correction_model):
-        self.model = model
-        self.correction_model = correction_model
-        self.index = model.x_index
-        self.betahat = ols_results.params[self.index]
+        super().__init__(model, ols_results, correction_model)
         self.e = self.correction_model.elasticity(model.X, self.index)
 
     def average_elasticity(self):
@@ -160,9 +171,9 @@ class CorrectedEstimatorResultsLogLog(CorrectedEstimatorResults):
         ax.legend()
         return fig, ax
 
-    def semi_elasticiy_at_average(self):
+    def elasticity_at_average(self):
         X_mean = np.mean(self.model.X, axis=0)
-        return self.betahat + self.correction_model.semi_elasticity(X_mean.reshape(1, -1), self.index)[0]
+        return self.betahat + self.correction_model.elasticity(X_mean.reshape(1, -1), self.index)[0]
 
     def test_ppml(self):
         ppml_mod = sm.GLM(self.model.y, self.model.X, family=sm.families.Poisson()).fit(cov_type='HC3')
@@ -208,7 +219,9 @@ class OLSCorrectionModel(CorrectionModel):
         return ((eu_new - eu_old) / 1e-6)/ eu_old
 
     def elasticity(self, X, index):
-        return self.semi_elasticity(X, index) * X[:, index].reshape(-1,)
+        appropriate_x = X.copy()
+        appropriate_x[:, index] = np.exp(appropriate_x[:, index])
+        return self.semi_elasticity(appropriate_x, index) * appropriate_x[:, index].reshape(-1,)
 
 class NNCorrectionModel(CorrectionModel):
 
@@ -237,7 +250,9 @@ class NNCorrectionModel(CorrectionModel):
         return grads[:, index].numpy() / euhat.numpy().reshape(-1,)
 
     def elasticity(self, X, index):
-        X_used = tf.convert_to_tensor(X, dtype=tf.float32)
+        X_used = X.copy()
+        X_used[:, index] = np.exp(X_used[:, index])
+        X_used = tf.convert_to_tensor(X_used, dtype=tf.float32)
         X_used = tf.Variable(X_used)
         with tf.GradientTape() as tape:
             tape.watch(X_used)
