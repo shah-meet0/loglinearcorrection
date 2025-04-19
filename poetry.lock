@@ -410,15 +410,15 @@ woff = ["brotli (>=1.0.1)", "brotlicffi (>=0.8.0)", "zopfli (>=0.1.4)"]
 
 [[package]]
 name = "hypothesis"
-version = "6.131.1"
+version = "6.131.3"
 description = "A library for property-based testing"
 optional = false
 python-versions = ">=3.9"
 groups = ["dev"]
 markers = "python_version == \"3.11\" or python_version >= \"3.12\""
 files = [
-    {file = "hypothesis-6.131.1-py3-none-any.whl", hash = "sha256:a8be5428c8c09d51e759f4ac72b7a7ef5352d46b1643527995e93efdccb8ba2e"},
-    {file = "hypothesis-6.131.1.tar.gz", hash = "sha256:36e0a14dc4ee0f99ea18f9542e987920e7bf67ff39b37e14d53055249c85b41d"},
+    {file = "hypothesis-6.131.3-py3-none-any.whl", hash = "sha256:803337d49b317472e5f7a85c112090e84c83e4f161c09e2aad389e6701ed1998"},
+    {file = "hypothesis-6.131.3.tar.gz", hash = "sha256:918ead92a9cdebbb62baa33a5ad19ff32f73d67f02c7255175c0c3322da37c2d"},
 ]
 
 [package.dependencies]
@@ -1314,6 +1314,27 @@ socks = ["PySocks (>=1.5.6,!=1.5.7)"]
 use-chardet-on-py3 = ["chardet (>=3.0.2,<6)"]
 
 [[package]]
+name = "resample"
+version = "1.10.1"
+description = "Resampling-based inference in Python"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+markers = "python_version == \"3.11\" or python_version >= \"3.12\""
+files = [
+    {file = "resample-1.10.1-py3-none-any.whl", hash = "sha256:30d0cc159230a66a3880dc9083308590c8f0e8403e25b9b9f238c074475fe88f"},
+    {file = "resample-1.10.1.tar.gz", hash = "sha256:62ddfc1966ca7fa3bf506382f58b3801deaa6de167b65648b7c58b431c551b5d"},
+]
+
+[package.dependencies]
+numpy = ">=1.21"
+scipy = ">=1.10"
+
+[package.extras]
+doc = ["ipython", "nbsphinx", "sphinx-rtd-theme"]
+test = ["coverage[toml]", "pytest", "pytest-cov"]
+
+[[package]]
 name = "roman-numerals-py"
 version = "3.1.0"
 description = "Manipulate well-formed Roman numerals"
@@ -1821,4 +1842,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.11"
-content-hash = "4c8bf66f95fee0972a8b9bc1e4d8c5478892797eab734fce8c46b23d9c179975"
+content-hash = "2b8341e99d78aa8ffaa1b6aa1f4a57d172687ebde997a8e373616031133c3cc1"

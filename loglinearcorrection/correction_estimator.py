@@ -1,7 +1,7 @@
 # This script allows for using the log-linear correction estimator for OLS models, in one command.
 
 
-from scripts.ppml_consistency import AssumptionTest
+from .ppml_consistency import AssumptionTest
 import statsmodels.api as sm
 from sklearn.preprocessing import PolynomialFeatures
 import tensorflow as tf
