@@ -40,7 +40,7 @@ class CorrectedEstimator:
         self.x_index = interest
         self.log_x = log_x
 
-    def fit(self, params_dict=None, **kwargs):
+    def fit(self, params_dict=None, weights=1.0, **kwargs):
         """Fit the corrected estimator model.
         
         This method first fits a standard OLS model on log-transformed data, then estimates
@@ -55,7 +55,7 @@ class CorrectedEstimator:
             print('Empty params_dict, using default values')
             params_dict = {}
 
-        ols_results = sm.OLS(np.log(self.y), self.X).fit(**kwargs)
+        ols_results = sm.WLS(np.log(self.y), self.X, weights=weights).fit(**kwargs)
         print(f'OLS model fitted, estimated betahat: {ols_results.params[self.x_index]:.4f}')
         print('Estimating correction term...please wait')
 
