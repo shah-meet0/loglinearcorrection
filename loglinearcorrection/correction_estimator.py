@@ -4,7 +4,6 @@
 from .ppml_consistency import AssumptionTest
 import statsmodels.api as sm
 from sklearn.preprocessing import PolynomialFeatures
-import tensorflow as tf
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -101,6 +100,7 @@ class CorrectedEstimator:
         :return: Fitted neural network correction model
         :rtype: NNCorrectionModel
         """
+        import tensorflow as tf
         nn_model = self.make_nn(params_dict)
         validation_split = params_dict.get('validation_split', 0.2)
         batch_size = params_dict.get('batch_size', 64)
@@ -127,6 +127,8 @@ class CorrectedEstimator:
         :rtype: tf.keras.Sequential
         :raises ValueError: If num_units is neither an integer nor a list of proper length
         """
+        import tensorflow as tf
+
         num_layers = params_dict.get('num_layers', 3)
         activation = params_dict.get('activation', 'relu')
         num_units = params_dict.get('num_units', 64)
@@ -481,6 +483,8 @@ class NNCorrectionModel(CorrectionModel):
         :return: Marginal effects
         :rtype: numpy.ndarray
         """
+        import tensorflow as tf
+
         X_used = tf.convert_to_tensor(X, dtype=tf.float32)
         X_used = tf.Variable(X_used)
         with tf.GradientTape() as tape:
@@ -499,6 +503,8 @@ class NNCorrectionModel(CorrectionModel):
         :return: Semi-elasticities
         :rtype: numpy.ndarray
         """
+        import tensorflow as tf
+
         X_used = tf.convert_to_tensor(X, dtype=tf.float32)
         X_used = tf.Variable(X_used)
         with tf.GradientTape() as tape:
@@ -517,6 +523,8 @@ class NNCorrectionModel(CorrectionModel):
         :return: Elasticities
         :rtype: numpy.ndarray
         """
+        import tensorflow as tf
+
         X_used = X.copy()
         X_used[:, index] = np.exp(X_used[:, index])
         X_used = tf.convert_to_tensor(X_used, dtype=tf.float32)
