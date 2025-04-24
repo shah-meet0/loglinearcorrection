@@ -23,10 +23,12 @@ y, x, u = dgp.generate(n_data)
 
 
 model = CorrectedEstimator(y, x, correction_model_type='nn', interest=0)
-res = model.fit()
+res = model.fit({'degree':10})
 res.plot_dist_semi_elasticity()
 res.average_semi_elasticity()
 res.semi_elasticity_at_average()
+res.plot_eu_grad()
+res.plot_eu()
 print(res.test_ppml())
 
 # FOR ELASTICITIES
@@ -40,5 +42,7 @@ res.plot_dist_elasticity()
 res.average_elasticity()
 res.elasticity_at_average()
 ols_results = res.get_ols_results()
+res.plot_eu()
+res.plot_eu_grad()
 res.print_ols_results()
 print(res.test_ppml())

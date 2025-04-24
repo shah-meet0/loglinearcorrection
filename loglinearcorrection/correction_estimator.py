@@ -51,7 +51,6 @@ class CorrectedEstimator:
         :type params_dict: dict, optional
         :param kwargs: Additional arguments to pass to the OLS fit method
         :return: Fitted model results object (either CorrectedEstimatorResultsLogLinear or CorrectedEstimatorResultsLogLog)
-        :rtype: CorrectedEstimatorResults
         """
         if params_dict is None:
             print('Empty params_dict, using default values')
@@ -190,6 +189,8 @@ class CorrectedEstimatorResults:
         return self.ols_results
 
 
+
+
 class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
     """Results for log-linear model with correction.
     
@@ -242,6 +243,48 @@ class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
         """
         X_mean = np.mean(self.model.X, axis=0)
         return self.betahat + self.correction_model.semi_elasticity(X_mean.reshape(1, -1), self.index)[0]
+
+    def plot_eu(self):
+        """Plot the distribution of the correction term at average regressor values.
+
+        :return: Figure and axis objects for the plot
+        :rtype: tuple(matplotlib.figure.Figure, matplotlib.axes.Axes)
+        """
+        fig, ax = plt.subplots()
+        x_indexed = self.model.X[:, self.index].copy()
+        xmin = np.quantile(x_indexed, 0.1)
+        xmax = np.quantile(x_indexed, 0.9)
+        x_to_use = np.linspace(xmin, xmax, 1000)
+        others_to_use = self.model.X.mean(axis=0)
+        X_plot = np.tile(others_to_use, (len(x_to_use), 1))
+        X_plot[:, self.index] = x_to_use
+
+        eu = self.correction_model.predict(X_plot)
+        sns.scatterplot(x=x_to_use, y=eu, ax=ax)
+        ax.set_title(r'$E[e^u|X]$')
+        ax.set_xlabel('Regressor of Interest')
+        return fig, ax
+
+    def plot_eu_grad(self):
+        """Plot the gradient of the correction term with respect to the regressor of interest.
+        :return: Figure and axis objects for the plot
+        :rtype: tuple(matplotlib.figure.Figure, matplotlib.axes.Axes)
+        """
+        fig, ax = plt.subplots()
+        x_indexed = self.model.X[:, self.index].copy()
+        xmin = np.quantile(x_indexed, 0.1)
+        xmax = np.quantile(x_indexed, 0.9)
+        x_to_use = np.linspace(xmin, xmax, 1000)
+        others_to_use = self.model.X.mean(axis=0)
+        X_plot = np.tile(others_to_use, (len(x_to_use), 1))
+        X_plot[:, self.index] = x_to_use
+
+        eu_grad = self.correction_model.marginal_effects(X_plot, self.index)
+        sns.scatterplot(x=x_to_use, y=eu_grad, ax=ax)
+        ax.set_title(r'$\dfrac{dE[e^u|X]}{dx}$')
+        ax.set_xlabel('Regressor of Interest')
+        ax.set_ylabel('Gradient')
+        return fig, ax
 
     def test_ppml(self):
         """Test the consistency of PPML estimation.
@@ -297,6 +340,7 @@ class CorrectedEstimatorResultsLogLog(CorrectedEstimatorResults):
         ax.legend()
         return fig, ax
 
+
     def elasticity_at_average(self):
         """Calculate the elasticity at the average values of regressors.
         
@@ -305,6 +349,48 @@ class CorrectedEstimatorResultsLogLog(CorrectedEstimatorResults):
         """
         X_mean = np.mean(self.model.X, axis=0)
         return self.betahat + self.correction_model.elasticity(X_mean.reshape(1, -1), self.index)[0]
+
+    def plot_eu(self):
+        """Plot the distribution of the correction term at average regressor values.
+
+        :return: Figure and axis objects for the plot
+        :rtype: tuple(matplotlib.figure.Figure, matplotlib.axes.Axes)
+        """
+        fig, ax = plt.subplots()
+        x_indexed = self.model.X[:, self.index].copy()
+        xmin = np.exp(np.quantile(x_indexed, 0.1))
+        xmax = np.exp(np.quantile(x_indexed, 0.9))
+        x_to_use = np.linspace(xmin, xmax, 1000)
+        others_to_use = self.model.X.mean(axis=0)
+        X_plot = np.tile(others_to_use, (len(x_to_use), 1))
+        X_plot[:, self.index] = x_to_use
+
+        eu = self.correction_model.predict(X_plot)
+        sns.scatterplot(x=x_to_use, y=eu, ax=ax)
+        ax.set_title(r'$E[e^u|X]$')
+        ax.set_xlabel('Regressor of Interest')
+        return fig, ax
+
+    def plot_eu_grad(self):
+        """Plot the gradient of the correction term with respect to the regressor of interest.
+        :return: Figure and axis objects for the plot
+        :rtype: tuple(matplotlib.figure.Figure, matplotlib.axes.Axes)
+        """
+        fig, ax = plt.subplots()
+        x_indexed = self.model.X[:, self.index].copy()
+        xmin = np.exp(np.quantile(x_indexed, 0.1))
+        xmax = np.exp(np.quantile(x_indexed, 0.9))
+        x_to_use = np.linspace(xmin, xmax, 1000)
+        others_to_use = self.model.X.mean(axis=0)
+        X_plot = np.tile(others_to_use, (len(x_to_use), 1))
+        X_plot[:, self.index] = x_to_use
+
+        eu_grad = self.correction_model.marginal_effects(X_plot, self.index)
+        sns.scatterplot(x=x_to_use, y=eu_grad, ax=ax)
+        ax.set_title(r'$\dfrac{dE[e^u|X]}{dx}$')
+        ax.set_xlabel('Regressor of Interest')
+        ax.set_ylabel('Gradient')
+        return fig, ax
 
     def test_ppml(self):
         """Test the consistency of PPML estimation.
@@ -469,7 +555,7 @@ class NNCorrectionModel(CorrectionModel):
         :return: Predicted correction term
         :rtype: tf.Tensor
         """
-        return self.model(X)
+        return tf.reshape(self.model(X), (-1,))
 
     def marginal_effects(self, X, index):
         """Calculate the marginal effects of a regressor using automatic differentiation.
