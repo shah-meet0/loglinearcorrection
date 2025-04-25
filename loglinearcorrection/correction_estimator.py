@@ -540,6 +540,7 @@ class NNCorrectionModel(CorrectionModel):
     This class implements a correction model using a neural network
     and automatic differentiation for marginal effects.
     """
+    import tensorflow as tf
 
     def __init__(self, model):
         """Initialize the neural network correction model.
@@ -557,7 +558,7 @@ class NNCorrectionModel(CorrectionModel):
         :return: Predicted correction term
         :rtype: tf.Tensor
         """
-        return tf.reshape(self.model(X), (-1,))
+        return self.tf.reshape(self.model(X), (-1,))
 
     def marginal_effects(self, X, index):
         """Calculate the marginal effects of a regressor using automatic differentiation.
@@ -569,11 +570,10 @@ class NNCorrectionModel(CorrectionModel):
         :return: Marginal effects
         :rtype: numpy.ndarray
         """
-        import tensorflow as tf
 
-        X_used = tf.convert_to_tensor(X, dtype=tf.float32)
-        X_used = tf.Variable(X_used)
-        with tf.GradientTape() as tape:
+        X_used = self.tf.convert_to_tensor(X, dtype=tf.float32)
+        X_used = self.tf.Variable(X_used)
+        with self.tf.GradientTape() as tape:
             tape.watch(X_used)
             euhat = self.predict(X_used)
         grads = tape.gradient(euhat, X_used)
@@ -589,11 +589,10 @@ class NNCorrectionModel(CorrectionModel):
         :return: Semi-elasticities
         :rtype: numpy.ndarray
         """
-        import tensorflow as tf
 
-        X_used = tf.convert_to_tensor(X, dtype=tf.float32)
-        X_used = tf.Variable(X_used)
-        with tf.GradientTape() as tape:
+        X_used = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
+        X_used = self.tf.Variable(X_used)
+        with self.tf.GradientTape() as tape:
             tape.watch(X_used)
             euhat = self.predict(X_used)
         grads = tape.gradient(euhat, X_used)
@@ -609,13 +608,12 @@ class NNCorrectionModel(CorrectionModel):
         :return: Elasticities
         :rtype: numpy.ndarray
         """
-        import tensorflow as tf
 
         X_used = X.copy()
         X_used[:, index] = np.exp(X_used[:, index])
-        X_used = tf.convert_to_tensor(X_used, dtype=tf.float32)
-        X_used = tf.Variable(X_used)
-        with tf.GradientTape() as tape:
+        X_used = self.tf.convert_to_tensor(X_used, dtype=tf.float32)
+        X_used = self.tf.Variable(X_used)
+        with self.tf.GradientTape() as tape:
             tape.watch(X_used)
             euhat = self.predict(X_used)
         grads = tape.gradient(euhat, X_used)
