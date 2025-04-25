@@ -23,7 +23,7 @@ y, x, u = dgp.generate(n_data)
 
 
 model = CorrectedEstimator(y, x, correction_model_type='nn', interest=0)
-res = model.fit({'degree':10})
+res = model.fit()
 res.plot_dist_semi_elasticity()
 res.average_semi_elasticity()
 res.semi_elasticity_at_average()
