@@ -571,7 +571,7 @@ class NNCorrectionModel(CorrectionModel):
         :rtype: numpy.ndarray
         """
 
-        X_used = self.tf.convert_to_tensor(X, dtype=tf.float32)
+        X_used = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
         X_used = self.tf.Variable(X_used)
         with self.tf.GradientTape() as tape:
             tape.watch(X_used)
@@ -611,7 +611,7 @@ class NNCorrectionModel(CorrectionModel):
 
         X_used = X.copy()
         X_used[:, index] = np.exp(X_used[:, index])
-        X_used = self.tf.convert_to_tensor(X_used, dtype=tf.float32)
+        X_used = self.tf.convert_to_tensor(X_used, dtype=self.tf.float32)
         X_used = self.tf.Variable(X_used)
         with self.tf.GradientTape() as tape:
             tape.watch(X_used)
