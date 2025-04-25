@@ -107,7 +107,12 @@ class CorrectedEstimator:
         patience = params_dict.get('patience', 10)
         verbose = params_dict.get('verbose', 1)
 
-        eu = tf.convert_to_tensor(np.exp(ols_results.resid))
+        residuals_normalized = (ols_results.resid - np.mean(ols_results.resid)) / np.std(ols_results.resid)
+
+        residuals_clipped = np.clip(residuals_normalized, -60, 60)
+
+        eu = tf.convert_to_tensor(np.exp(residuals_clipped))
+
         X_nn = self.X.copy()
         if self.log_x:
             X_nn[:, self.x_index] = np.exp(X_nn[:, self.x_index])
@@ -115,7 +120,7 @@ class CorrectedEstimator:
 
         nn_model.fit(x=X_tensor, y=eu, validation_split=validation_split, batch_size=batch_size, epochs=epochs,
                      callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)], verbose=verbose)
-        return NNCorrectionModel(nn_model)
+        return NNCorrectionModel(nn_model, np.mean(ols_results.resid), np.std(ols_results.resid))
 
     def make_nn(self, params_dict):
         """Create a neural network model for estimating the correction term.
@@ -542,13 +547,15 @@ class NNCorrectionModel(CorrectionModel):
     """
     import tensorflow as tf
 
-    def __init__(self, model):
+    def __init__(self, model, mean, std):
         """Initialize the neural network correction model.
         
         :param model: Fitted neural network model for the correction term
         :type model: tf.keras.Model
         """
         self.model = model
+        self.mean = mean
+        self.std = std
 
     def predict(self, X):
         """Predict the correction term for given data.
@@ -594,7 +601,7 @@ class NNCorrectionModel(CorrectionModel):
         X_used = self.tf.Variable(X_used)
         with self.tf.GradientTape() as tape:
             tape.watch(X_used)
-            euhat = self.predict(X_used)
+            euhat = self.predict(X_used) * self.std + self.mean
         grads = tape.gradient(euhat, X_used)
         return grads[:, index].numpy() / euhat.numpy().reshape(-1,)
 

@@ -22,10 +22,12 @@ print(x)
 import pandas as pd
 
 # Read the CSV file
-file_path="/Users/ellenmunroe/Desktop/loglinear_repo/loglinearcorrection/replications/data/Acemoglu_Restrepo/Acemoglu_Restrepo_Table2_logDV_data.csv"
+file_path="../replications/data/Acemoglu_Restrepo/Acemoglu_Restrepo_Table2_logDV_data.csv"
 df = pd.read_csv(file_path)
 df = df.dropna()
 
+
+wgt = df['wage_earners_1990']
 print(df)
 
 # Extract the columns you want initially
@@ -62,7 +64,6 @@ y=Y_new
 yexp=np.exp(y)
 x=X_new
 
-wgt = df[['wage_earners_1990']]
 print(len(Y_new))
 print(x)
 print(len(wgt))
@@ -70,7 +71,6 @@ print(len(wgt))
 
 # Check that there are no NaN values left
 print("NaN in x:", x.isnull().sum().sum())
-print("NaN in y:", y.isnull().sum().sum())
 
 #########################
 # OLS:
@@ -92,13 +92,13 @@ print(x)
 # X needs to include intercept if needed
 # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
 
-model = CorrectedEstimator(yexp, x, correction_model_type='ols', interest=0)
-res = model.fit(params_dict={"degree":2}, weights=wgt)
-res.plot_dist_semi_elasticity()
+model = CorrectedEstimator(yexp, x, correction_model_type='nn', interest=0)
+res = model.fit(
+    # params_dict={'degree':2}, 
+    # weights=wgt
+)
 res.average_semi_elasticity()
 res.semi_elasticity_at_average()
-res.plot_eu_grad()
-res.plot_eu()
 print(res.test_ppml())
 
 
@@ -107,27 +107,27 @@ print(res.test_ppml())
 # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
 
 
-model = CorrectedEstimator(y, x, correction_model_type='ols', interest=0)
-res = model.fit({'degree':10})
-res.plot_dist_semi_elasticity()
-res.average_semi_elasticity()
-res.semi_elasticity_at_average()
-res.plot_eu_grad()
-res.plot_eu()
-print(res.test_ppml())
-
-# FOR ELASTICITIES
-# X needs to include intercept if needed
-# X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
-# In particular, X of interest should already be expressed as log(x)
-
-model = CorrectedEstimator(y, x, correction_model_type='nn', interest=0, log_x=True)
-res = model.fit()
-res.plot_dist_elasticity()
-res.average_elasticity()
-res.elasticity_at_average()
-ols_results = res.get_ols_results()
-res.plot_eu()
-res.plot_eu_grad()
-res.print_ols_results()
-print(res.test_ppml())
+# model = CorrectedEstimator(y, x, correction_model_type='ols', interest=0)
+# res = model.fit({'degree':10})
+# res.plot_dist_semi_elasticity()
+# res.average_semi_elasticity()
+# res.semi_elasticity_at_average()
+# res.plot_eu_grad()
+# res.plot_eu()
+# print(res.test_ppml())
+# 
+# # FOR ELASTICITIES
+# # X needs to include intercept if needed
+# # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
+# # In particular, X of interest should already be expressed as log(x)
+# 
+# model = CorrectedEstimator(y, x, correction_model_type='nn', interest=0, log_x=True)
+# res = model.fit()
+# res.plot_dist_elasticity()
+# res.average_elasticity()
+# res.elasticity_at_average()
+# ols_results = res.get_ols_results()
+# res.plot_eu()
+# res.plot_eu_grad()
+# res.print_ols_results()
+# print(res.test_ppml())
