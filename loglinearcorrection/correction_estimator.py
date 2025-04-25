@@ -3,7 +3,7 @@
 
 from .ppml_consistency import AssumptionTest
 import statsmodels.api as sm
-from sklearn.preprocessing import PolynomialFeatures
+from sklearn.preprocessing import PolynomialFeatures, OneHotEncoder
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -17,7 +17,7 @@ class CorrectedEstimator:
     or neural networks.
     """
 
-    def __init__(self, y, X, correction_model_type='nn', interest=0, log_x=False):
+    def __init__(self, y, X, correction_model_type='nn', interest=0, log_x=False, fe=None):
         """Initialize the corrected estimator.
         
         :param y: Response variable (untransformed)
@@ -32,6 +32,17 @@ class CorrectedEstimator:
         :type log_x: bool, optional
         :raises ValueError: If correction_model_type is not 'ols' or 'nn'
         """
+
+        if fe is not None:
+            one_hot_encoder = OneHotEncoder(sparse_output=False, drop='first')
+            dummy_vars = one_hot_encoder.fit_transform(X[:,fe])
+            X = np.delete(X, fe, axis=1)
+            residual_maker = np.eye(len(dummy_vars)) - dummy_vars @ np.linalg.pinv(np.transpose(dummy_vars) @ dummy_vars) @ np.transpose(dummy_vars)
+            demeaned = residual_maker @ np.concatenate([X, y.reshape(-1,1)], axis=1)
+            X= demeaned[:,:-1]
+            y = demeaned[:,-1]
+            print('Care fe not fully implemented yet, please check the results')
+
         self.X = X
         self.y = y
         self.correction_model_type = correction_model_type.lower()
@@ -578,7 +589,7 @@ class NNCorrectionModel(CorrectionModel):
         :rtype: numpy.ndarray
         """
 
-        X_used = self.tf.convert_to_tensor(X, dtype=tf.float32)
+        X_used = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
         X_used = self.tf.Variable(X_used)
         with self.tf.GradientTape() as tape:
             tape.watch(X_used)
@@ -618,7 +629,7 @@ class NNCorrectionModel(CorrectionModel):
 
         X_used = X.copy()
         X_used[:, index] = np.exp(X_used[:, index])
-        X_used = self.tf.convert_to_tensor(X_used, dtype=tf.float32)
+        X_used = self.tf.convert_to_tensor(X_used, dtype=self.tf.float32)
         X_used = self.tf.Variable(X_used)
         with self.tf.GradientTape() as tape:
             tape.watch(X_used)
