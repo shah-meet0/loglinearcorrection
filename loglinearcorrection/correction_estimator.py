@@ -1,6 +1,6 @@
 # This script allows for using the log-linear correction estimator for OLS models, in one command.
 
-
+# TODO Multibinary correction, eg: Mincer
 from .ppml_consistency import AssumptionTest
 import statsmodels.api as sm
 from sklearn.preprocessing import PolynomialFeatures, OneHotEncoder
@@ -24,7 +24,7 @@ class CorrectedEstimator:
         :type y: numpy.ndarray
         :param X: Regressor matrix
         :type X: numpy.ndarray
-        :param correction_model_type: Type of model to use for estimating the correction term, either 'nn' (neural network) or 'ols' (polynomial regression), defaults to 'nn'
+        :param correction_model_type: Type of model to use for estimating the correction term, either 'nn' (neural network) or 'ols' (polynomial regression), or 'binary'. defaults to 'nn'
         :type correction_model_type: str, optional
         :param interest: Index of the regressor of interest in X, defaults to 0
         :type interest: int, optional
@@ -46,8 +46,8 @@ class CorrectedEstimator:
         self.X = X
         self.y = y
         self.correction_model_type = correction_model_type.lower()
-        if self.correction_model_type not in ['ols', 'nn']:
-            raise ValueError("correction_model must be either 'ols' or 'nn'")
+        if self.correction_model_type not in ['ols', 'nn', 'binary']:
+            raise ValueError("correction_model must be either 'ols' or 'nn' or 'binary'")
         self.x_index = interest
         self.log_x = log_x
 
@@ -74,10 +74,15 @@ class CorrectedEstimator:
             correction_model = self._fit_ols_correction(ols_results, params_dict)
         elif self.correction_model_type == 'nn':
             correction_model = self._fit_nn_correction(ols_results, params_dict)
+        elif self.correction_model_type == 'binary':
+            correction_model = self._fit_binary_correction(ols_results, params_dict)
 
         print('Correction term estimated')
         if not self.log_x:
-            return CorrectedEstimatorResultsLogLinear(self, ols_results, correction_model)
+            if self.correction_model_type == 'binary':
+                return CorrectedEstimatorResultsLogLinearBinary(self, ols_results, correction_model)
+            else:
+                return CorrectedEstimatorResultsLogLinearContinuous(self, ols_results, correction_model)
         else:
             return CorrectedEstimatorResultsLogLog(self, ols_results, correction_model)
 
@@ -127,6 +132,26 @@ class CorrectedEstimator:
         nn_model.fit(x=X_tensor, y=eu, validation_split=validation_split, batch_size=batch_size, epochs=epochs,
                      callbacks=[tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=patience, restore_best_weights=True)], verbose=verbose)
         return NNCorrectionModel(nn_model)
+
+    def _fit_binary_correction(self, ols_results, params_dict):
+        """Fit a binary correction model for the correction term.
+
+        :param ols_results: Results from the initial OLS model
+        :type ols_results: statsmodels.regression.linear_model.RegressionResults
+        :param params_dict: Dictionary with parameters for the binary correction model
+        :type params_dict: dict
+        :return: Fitted binary correction model
+        :rtype: BinaryCorrectionModel
+        """
+        # Placeholder for binary correction model fitting logic
+        eu = np.exp(ols_results.resid)
+        X_int = self.X.copy().iloc[:, self.x_index] #NOT IDEAL
+        eu_0 = np.mean(eu[X_int == 0])
+        eu_1 = np.mean(eu[X_int == 1])
+        return BinaryCorrectionModel(eu_0, eu_1)
+
+
+
 
     def make_nn(self, params_dict):
         """Create a neural network model for estimating the correction term.
@@ -202,9 +227,52 @@ class CorrectedEstimatorResults:
         return self.ols_results
 
 
+class CorrectedEstimatorResultsLogLinearBinary(CorrectedEstimatorResults):
+    """Results for log-linear model with binary correction.
 
+    This class extends CorrectedEstimatorResults with methods specific to
+    binary correction models, focusing on semi-elasticity estimation.
+    """
 
-class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
+    def __init__(self, model, ols_results, correction_model):
+        """Initialize the binary results object.
+
+        :param model: The CorrectedEstimator model
+        :type model: CorrectedEstimator
+        :param ols_results: Results from the initial OLS model
+        :type ols_results: statsmodels.regression.linear_model.RegressionResults
+        :param correction_model: The fitted correction model
+        :type correction_model: BinaryCorrectionModel
+        """
+        super().__init__(model, ols_results, correction_model)
+
+    def corrected_percentage_change(self):
+        """Calculate the corrected percentage change.
+
+        :return: Corrected percentage change
+        :rtype: float
+        """
+        correction = np.exp(self.correction_model.eu_1)/np.exp(self.correction_model.eu_0)
+        return np.exp(self.betahat) * correction - 1
+
+    def bias(self):
+        """Calculate the bias in the OLS estimate.
+
+        :return: Bias in the OLS estimate
+        :rtype: float
+        """
+        return (np.exp(self.betahat) - 1) - self.corrected_percentage_change()
+
+    def test_ppml(self):
+        """Test the consistency of PPML estimation.
+
+        :return: Results of the PPML consistency test
+        :rtype: dict
+        """
+        ppml_mod = sm.GLM(self.model.y, self.model.X, family=sm.families.Poisson()).fit(cov_type='HC3')
+        return AssumptionTest(ppml_mod).test_direct()
+
+class CorrectedEstimatorResultsLogLinearContinuous(CorrectedEstimatorResults):
     """Results for log-linear model with correction.
     
     This class extends CorrectedEstimatorResults with methods specific to
@@ -223,6 +291,7 @@ class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
         """
         super().__init__(model, ols_results, correction_model)
         self.se = self.correction_model.semi_elasticity(model.X, self.index)
+
 
     def average_semi_elasticity(self):
         """Calculate the average semi-elasticity with correction.
@@ -256,6 +325,10 @@ class CorrectedEstimatorResultsLogLinear(CorrectedEstimatorResults):
         """
         X_mean = np.mean(self.model.X, axis=0)
         return self.betahat + self.correction_model.semi_elasticity(X_mean.reshape(1, -1), self.index)[0]
+
+    def average_percentage_change(self):
+        pass
+
 
     def plot_eu(self):
         """Plot the distribution of the correction term at average regressor values.
@@ -629,3 +702,42 @@ class NNCorrectionModel(CorrectionModel):
             euhat = self.predict(X_used)
         grads = tape.gradient(euhat, X_used)
         return grads[:, index].numpy() / euhat.numpy().reshape(-1,) * X_used.numpy()[:, index].reshape(-1,)
+
+class BinaryCorrectionModel(CorrectionModel):
+    """Binary correction model.
+
+    This class implements a correction model for binary variables.
+    """
+
+    def __init__(self, eu_0, eu_1):
+        """Initialize the binary correction model.
+
+        :param eu_0: Expected value of the correction term when regressor is 0
+        :type eu_0: float
+        :param eu_1: Expected value of the correction term when regressor is 1
+        :type eu_1: float
+        """
+        self.eu_0 = eu_0
+        self.eu_1 = eu_1
+
+    def predict(self, X, index=0):
+        """Predict the correction term for given data.
+
+        :param X: Regressor matrix
+        :type X: numpy.ndarray
+        :param index: Index of the regressor of interest, defaults to 0
+        :return: Predicted correction term
+        :rtype: numpy.ndarray
+        """
+        return np.where(X[:, index] == 0, self.eu_0, self.eu_1)
+
+    def marginal_effects(self, X, index):
+        raise NotImplementedError("Marginal effects not implemented for binary correction model.")
+
+    def semi_elasticity(self, X, index):
+        raise NotImplementedError("Semi-elasticity not implemented for binary correction model.")
+
+    def elasticity(self, X, index):
+        raise NotImplementedError("Elasticity not implemented for binary correction model.")
+
+

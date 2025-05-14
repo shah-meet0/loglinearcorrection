@@ -61,7 +61,7 @@ class AssumptionTestResults:
         self.reject = reject
 
     def __str__(self):
-        return f"Test Statistic: {self.test_stat}, P-value: {self.p_value}, Reject Null: {self.reject}"
+        return f"Null Hypothesis: PPML is consistent \n Test Statistic: {self.test_stat}, P-value: {self.p_value}, Reject Null: {self.reject}"
 
 
 
