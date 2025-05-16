@@ -80,12 +80,10 @@ print(x)
 # X needs to include intercept if needed
 # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
 
-model = CorrectedEstimator(yexp, x, correction_model_type='nn', interest=0)
+model = CorrectedEstimator(yexp, x, correction_model_type='binary', interest=0)
 res = model.fit(params_dict={"degree":3})
 
-res.average_semi_elasticity()
-res.plot_eu_grad()
-res.plot_eu()
+res.corrected_percentage_change()
 print(res.test_ppml())
 
 print("hello")
