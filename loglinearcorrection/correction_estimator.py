@@ -98,7 +98,7 @@ class CorrectedEstimator:
         """
         x_ols_correction = self.X.copy()
         if self.log_x:
-            x_ols_correction[:, self.x_index] = np.exp(x_ols_correction[:, self.x_index])
+            x_ols_correction.iloc[:, self.x_index] = np.exp(x_ols_correction.iloc[:, self.x_index])
         poly = PolynomialFeatures(degree=params_dict.get('degree', 3), include_bias=False)
         X_poly = poly.fit_transform(x_ols_correction)
         eu = np.exp(ols_results.resid)
@@ -619,8 +619,8 @@ class OLSCorrectionModel(CorrectionModel):
         :rtype: numpy.ndarray
         """
         appropriate_x = X.copy()
-        appropriate_x[:, index] = np.exp(appropriate_x[:, index])
-        return self.semi_elasticity(appropriate_x, index) * appropriate_x[:, index].reshape(-1,)
+        appropriate_x.iloc[:, index] = np.exp(appropriate_x.iloc[:, index])
+        return self.semi_elasticity(appropriate_x, index) * appropriate_x.iloc[:, index]#.reshape(-1,)
 
 
 class NNCorrectionModel(CorrectionModel):
