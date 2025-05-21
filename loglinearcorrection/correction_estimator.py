@@ -624,7 +624,7 @@ class NNCorrectionModel(CorrectionModel):
     This class implements a correction model using a neural network
     and automatic differentiation for marginal effects.
     """
-    import tensorflow as tf
+
 
     def __init__(self, model):
         """Initialize the neural network correction model.
@@ -632,6 +632,8 @@ class NNCorrectionModel(CorrectionModel):
         :param model: Fitted neural network model for the correction term
         :type model: tf.keras.Model
         """
+        import tensorflow as tf
+        self.tf = tf
         self.model = model
 
     def predict(self, X):
