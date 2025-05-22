@@ -67,6 +67,7 @@ class CorrectedEstimator:
             params_dict = {}
 
         ols_results = sm.WLS(np.log(self.y), self.X, weights=weights).fit(**kwargs)
+        print(f'min resid: {np.min(ols_results.resid)}, max resid: {np.max(ols_results.resid)}, mean resid: {np.mean(ols_results.resid)}, std resid: {np.std(ols_results.resid)}')
         print(f'OLS model fitted, estimated betahat: {ols_results.params[self.x_index]:.4f}')
         print('Estimating correction term...please wait')
 
@@ -98,11 +99,14 @@ class CorrectedEstimator:
         """
         x_ols_correction = self.X.copy()
         if self.log_x:
-            x_ols_correction.iloc[:, self.x_index] = np.exp(x_ols_correction.iloc[:, self.x_index])
+            x_ols_correction[:, self.x_index] = np.exp(x_ols_correction[:, self.x_index])
         poly = PolynomialFeatures(degree=params_dict.get('degree', 3), include_bias=False)
         X_poly = poly.fit_transform(x_ols_correction)
         eu = np.exp(ols_results.resid)
+        print(f'eu min: {np.min(eu)}, eu max: {np.max(eu)}, eu mean: {np.mean(eu)}, eu std: {np.std(eu)}')
+        print(f'X poly shape: {X_poly.shape}, condition number: {np.linalg.cond(X_poly)}')
         correction_model = sm.OLS(eu, X_poly).fit()
+        print(correction_model.summary())
         return OLSCorrectionModel(correction_model, poly)
 
     def _fit_nn_correction(self, ols_results, params_dict):
@@ -150,7 +154,7 @@ class CorrectedEstimator:
         """
         # Placeholder for binary correction model fitting logic
         eu = np.exp(ols_results.resid)
-        X_int = self.X.copy().iloc[:, self.x_index] #NOT IDEAL
+        X_int = self.X.copy()[:, self.x_index] #NOT IDEAL
         eu_0 = np.mean(eu[X_int == 0])
         eu_1 = np.mean(eu[X_int == 1])
         return BinaryCorrectionModel(eu_0, eu_1)
@@ -605,8 +609,19 @@ class OLSCorrectionModel(CorrectionModel):
         delta = np.zeros(X.shape)
         delta[:, index] = 1e-6
         eu_new = self.predict(X + delta)
+
+        # Add a small epsilon for numerical stability
         eu_old = self.predict(X)
-        return ((eu_new - eu_old) / 1e-6) / eu_old
+        print(f'number eu old <1e5: {np.sum(eu_old < 1e-5)}')
+        epsilon = 1e-6 # A very small positive number
+        numerator = (eu_new - eu_old) / 1e-6
+        print(f'numerator: min: {np.min(numerator)}, max:{np.max(numerator)}, mean: {np.mean(numerator)}')
+        denominator = np.maximum(eu_old, epsilon)
+        correction_terms = ((eu_new - eu_old) / 1e-6) / denominator
+
+        print(f'corrections: min: {np.min(correction_terms)}, max:{np.max(correction_terms)}, mean: {np.mean(correction_terms)}')
+
+        return  correction_terms
 
     def elasticity(self, X, index):
         """Calculate the elasticity of a regressor.
@@ -619,8 +634,8 @@ class OLSCorrectionModel(CorrectionModel):
         :rtype: numpy.ndarray
         """
         appropriate_x = X.copy()
-        appropriate_x.iloc[:, index] = np.exp(appropriate_x.iloc[:, index])
-        return self.semi_elasticity(appropriate_x, index) * appropriate_x.iloc[:, index]#.reshape(-1,)
+        appropriate_x[:, index] = np.exp(appropriate_x[:, index])
+        return self.semi_elasticity(appropriate_x, index) * appropriate_x[:, index]#.reshape(-1,)
 
 
 class NNCorrectionModel(CorrectionModel):
