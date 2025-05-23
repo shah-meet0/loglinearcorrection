@@ -3,7 +3,7 @@ import pandas as pd
 from statsmodels.base.model import Model, Results
 from statsmodels.nonparametric.kernel_regression import KernelReg
 from statsmodels.nonparametric.kernel_density import KDEMultivariate
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import PolynomialFeatures, OneHotEncoder
 import warnings
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -32,7 +32,7 @@ class DoublyRobustElasticityEstimator(Model):
         Can be a single bool for all variables or a list matching interest. Defaults to False.
     estimator_type : str, optional
         Type of estimator to use for the nonparametric component: 
-        'kernel' (local linear kernel regression), 'nn' (neural network), or 'binary'
+        'kernel' (local linear kernel regression), 'nn' (neural network), 'ols' (OLS), or 'binary'
         Defaults to 'kernel'
     elasticity : bool, optional
         Whether to estimate elasticities (True) or semi-elasticities (False), defaults to False
@@ -227,7 +227,7 @@ class DoublyRobustElasticityEstimator(Model):
         return self._endog_name
         
     def fit(self, weights=None, method='ols', bootstrap=False, bootstrap_reps=500, 
-             bootstrap_method='pairs', **kwargs):
+        bootstrap_method='pairs', **kwargs):
         """Fit the doubly robust estimator.
         
         Parameters
@@ -251,6 +251,9 @@ class DoublyRobustElasticityEstimator(Model):
         DoublyRobustElasticityEstimatorResults
             Fitted model results object
         """
+
+        kwargs.setdefault("cov_type", 'HC3')
+
         # Step 1: Fit the parametric model (OLS)
         if method == 'ols':
             if weights is None:
@@ -284,6 +287,8 @@ class DoublyRobustElasticityEstimator(Model):
             nonparam_model = self._fit_kernel_model(exp_residuals)
         elif self.estimator_type == 'nn':
             nonparam_model = self._fit_nn_model(exp_residuals)
+        elif self.estimator_type == 'ols':  # Add this option
+            nonparam_model = self._fit_ols_model(exp_residuals)
         elif self.estimator_type == 'binary':
             # For binary estimator, check if any variables of interest are binary
             binary_interest = False
@@ -294,11 +299,11 @@ class DoublyRobustElasticityEstimator(Model):
                     
             if not binary_interest:
                 warnings.warn("Binary estimator requested but no variables of interest are binary. "
-                             "Consider using 'kernel' or 'nn' estimator instead.")
+                             "Consider using 'kernel', 'nn', or 'ols' estimator instead.")
             nonparam_model = self._fit_binary_model(exp_residuals)
         else:
             raise ValueError(f"Estimator type '{self.estimator_type}' not supported. "
-                            f"Use 'kernel', 'nn', or 'binary'.")
+                            f"Use 'kernel', 'nn', 'ols', or 'binary'.")
         
         # Step 4: Fit the density estimator if using neural network density estimation
         if self.density_estimator == 'nn':
@@ -442,6 +447,39 @@ class DoublyRobustElasticityEstimator(Model):
         # Create a binary regression model that handles multiple variables
         return MultiBinaryRegressionModel(binary_models, min_exp_residual, 
                                          self.binary_vars, self.ordinal_vars)
+
+    def _fit_ols_model(self, exp_residuals):
+        """Fit a polynomial OLS model for E[exp(u)|X].
+        
+        Parameters
+        ----------
+        exp_residuals : array-like
+            Exponentiated residuals from the parametric model
+            
+        Returns
+        -------
+        OLSRegressionModel
+            Fitted OLS regression model
+        """
+        # Get polynomial degree from parameters (default is 3)
+        degree = self.kernel_params.get('degree', 3)
+        
+        # Normalize exponentiated residuals for numerical stability
+        min_exp_residual = np.min(exp_residuals)
+        normalized_exp_residuals = exp_residuals / min_exp_residual
+        
+        # Create polynomial features
+        poly = PolynomialFeatures(degree=degree, include_bias=False)
+        X_poly = poly.fit_transform(self.exog)
+        
+        # Fit OLS model on polynomial features
+        ols_model = sm.OLS(normalized_exp_residuals, X_poly).fit()
+        
+        print(f'OLS correction model fitted with polynomial degree {degree}')
+        print(f'R-squared: {ols_model.rsquared:.4f}')
+        
+        return OLSRegressionModel(ols_model, poly, min_exp_residual, 
+                                 self.binary_vars, self.ordinal_vars)
     
     def _create_nn_model(self, nn_params):
         """Create a neural network model based on the provided parameters."""
@@ -621,7 +659,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 # Fit the bootstrapped model
                 bs_results = bs_model.fit(weights=weights, bootstrap=False, **kwargs)
                 
-            elif bootstrap_method == 'residuals':
+            elif bootstrap_method == 'residuals': #DO NOT USE - WILL BE REMOVED 
                 # Get fitted values from OLS model
                 fitted_values = np.exp(self.ols_results.fittedvalues)
                 
@@ -667,10 +705,22 @@ class DoublyRobustElasticityEstimatorResults(Results):
                     var_pos = bs_results.interest.index(var_idx)
                     beta_hat = bs_results.beta_hat[var_pos]
                 
+                original_X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
+
                 bootstrap_estimates_dict[var_idx][i, 0] = beta_hat  # OLS estimate
                 bootstrap_estimates_dict[var_idx][i, 1] = np.mean(bs_results.correction[var_idx])  # Average correction
-                bootstrap_estimates_dict[var_idx][i, 2] = np.mean(bs_results.estimator_values[var_idx])  # Average estimate
-                bootstrap_estimates_dict[var_idx][i, 3] = bs_results.estimate_at_average(var_idx)  # Estimate at average X
+                # Average estimate
+                original_estimator_values = bs_results.calculate_estimator_at_points(
+                    self.model.exog, var_idx  # Use original X, not bootstrap X
+                )
+                bootstrap_estimates_dict[var_idx][i, 2] = np.mean(original_estimator_values)
+
+                bootstrap_estimates_dict[var_idx][i, 3] = bs_results.estimate_at_point(
+                    original_X_mean, var_idx  # Use original average, not bootstrap average
+                )
+
+                print(f"Bootstrap estimate at average: {bootstrap_estimates_dict[var_idx][i,3]}")
+                print(f"Bootstrap average elasticity estimate: {bootstrap_estimates_dict[var_idx][i,2]}")
         
         self.bootstrap = True
         self.bootstrap_reps = bootstrap_reps
@@ -932,21 +982,49 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
         return np.array([estimate - z_value * std_err, estimate + z_value * std_err])
     
-    def estimate_at_point(self, point):
+
+    def estimate_at_point(self, point, variable_idx=None):
         """Calculate the estimator at a specific point."""
+        # Handle variable selection (new parameter)
+        if variable_idx is None:
+            variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
+        
+        # Get proper beta coefficient and position
+        if self.all_variables:
+            i = list(self.interest).index(variable_idx) if isinstance(self.interest, list) else 0
+            beta_hat = self.beta_hat[variable_idx]
+        else:
+            i = self.interest.index(variable_idx) if isinstance(self.interest, list) else 0
+            beta_hat = self.beta_hat[i] if hasattr(self.beta_hat, '__getitem__') else self.beta_hat
+        
         m_at_point = self.nonparam_model.predict(point)[0]
-        m_prime_at_point = self.nonparam_model.derivative(point, self.interest)[0]
+        m_prime_at_point = self.nonparam_model.derivative(point, variable_idx)[0]  # Use variable_idx instead of self.interest
         correction = m_prime_at_point / m_at_point
         
-        if self.model.elasticity and self.model.log_x:
-            return self.beta_hat + correction
-        elif not self.model.elasticity and not self.model.log_x:
-            return self.beta_hat + correction
-        elif self.model.elasticity and not self.model.log_x:
-            return self.beta_hat + correction * point[0, self.interest]
-        else:  # not self.model.elasticity and self.model.log_x
-            return self.beta_hat + correction / point[0, self.interest]
-    
+        # Handle log_x indexing properly
+        log_x_val = self.model.log_x[i] if hasattr(self.model.log_x, '__getitem__') else self.model.log_x
+        
+        if self.model.elasticity and log_x_val:
+            return beta_hat + correction
+        elif not self.model.elasticity and not log_x_val:
+            return beta_hat + correction
+        elif self.model.elasticity and not log_x_val:
+            return beta_hat + correction * point[0, variable_idx]
+        else:  # not self.model.elasticity and log_x_val
+            return beta_hat + correction / point[0, variable_idx]
+
+    # Add this new method to the Results class (much cleaner - just calls estimate_at_point):
+    def calculate_estimator_at_points(self, X_points, variable_idx=None):
+        """Calculate estimator values at specific X points."""
+        estimator_values = np.zeros(len(X_points))
+        
+        for j, x_point in enumerate(X_points):
+            x_point = x_point.reshape(1, -1)
+            estimator_values[j] = self.estimate_at_point(x_point, variable_idx)
+        
+        return estimator_values
+
+
     def plot_distribution(self, variable_idx=None):
         """Plot the distribution of estimator values.
         
@@ -1407,6 +1485,107 @@ class MultiBinaryRegressionModel(RegressionModel):
 
 
 
+class OLSRegressionModel(RegressionModel):
+    """OLS regression model with polynomial features for nonparametric estimation.
+    
+    This class implements a polynomial OLS regression model for estimating
+    m(x) = E[exp(u)|X=x] and its gradient using numerical differentiation.
+    """
+    
+    def __init__(self, model, poly, scaling_factor, binary_vars, ordinal_vars):
+        """Initialize the OLS regression model.
+        
+        Parameters
+        ----------
+        model : statsmodels.regression.linear_model.RegressionResults
+            The fitted OLS model on polynomial features
+        poly : sklearn.preprocessing.PolynomialFeatures
+            The polynomial features transformer
+        scaling_factor : float
+            Scaling factor used to normalize the exponentiated residuals (min(exp_residuals))
+        binary_vars : array-like
+            Indices of binary variables
+        ordinal_vars : array-like
+            Indices of ordinal variables
+        """
+        super(OLSRegressionModel, self).__init__(binary_vars, ordinal_vars)
+        self.model = model
+        self.poly = poly
+        self.scaling_factor = scaling_factor
+        self.bandwidth = None  # Not applicable for OLS model
+    
+    def predict(self, X):
+        """Predict the expected value m(x) for given data."""
+        X_poly = self.poly.transform(X)
+        # Return predictions scaled back to original scale
+        return self.model.predict(X_poly) * self.scaling_factor
+    
+    def derivative(self, X, index):
+        """Calculate the derivative of m(x) with respect to a specific regressor."""
+        # For binary variables, use difference instead of derivative
+        if index in self.binary_vars:
+            X_0 = X.copy()
+            X_1 = X.copy()
+            X_0[:, index] = 0
+            X_1[:, index] = 1
+            m_0 = self.predict(X_0)
+            m_1 = self.predict(X_1)
+            return m_1 - m_0
+            
+        # For ordinal variables, use finite differences
+        elif index in self.ordinal_vars:
+            unique_values = np.sort(np.unique(X[:, index]))
+            
+            # If there's only one unique value, derivative is zero
+            if len(unique_values) <= 1:
+                return np.zeros(len(X))
+                
+            if len(X) == 1:  # If X is a single point
+                current_value = X[0, index]
+                idx = np.searchsorted(unique_values, current_value)
+                
+                # Handle edge cases
+                if len(unique_values) == 1:
+                    return np.array([0.0])
+                elif idx == 0:
+                    if len(unique_values) > 1:
+                        next_value = unique_values[1]
+                        X_next = X.copy()
+                        X_next[0, index] = next_value
+                        return (self.predict(X_next) - self.predict(X)) / (next_value - current_value)
+                    else:
+                        return np.array([0.0])
+                elif idx == len(unique_values) - 1:
+                    prev_value = unique_values[-2]
+                    X_prev = X.copy()
+                    X_prev[0, index] = prev_value
+                    return (self.predict(X) - self.predict(X_prev)) / (current_value - prev_value)
+                else:
+                    prev_value = unique_values[idx-1]
+                    next_value = unique_values[idx+1]
+                    X_prev = X.copy()
+                    X_next = X.copy()
+                    X_prev[0, index] = prev_value
+                    X_next[0, index] = next_value
+                    return (self.predict(X_next) - self.predict(X_prev)) / (next_value - prev_value)
+            else:
+                # For multiple points, calculate derivative at each point
+                derivatives = np.zeros(len(X))
+                for i in range(len(X)):
+                    x_i = X[i:i+1]
+                    derivatives[i] = self.derivative(x_i, index)[0]
+                return derivatives
+        
+        # For continuous variables, use numerical differentiation
+        else:
+            epsilon = 1e-6
+            X_plus = X.copy()
+            X_minus = X.copy()
+            X_plus[:, index] += epsilon
+            X_minus[:, index] -= epsilon
+            return (self.predict(X_plus) - self.predict(X_minus)) / (2 * epsilon)
+
+
 # Alias names for easier use
 DRE = DoublyRobustElasticityEstimator
 DREER = DoublyRobustElasticityEstimatorResults
@@ -1420,26 +1599,32 @@ if __name__ == "__main__":
     
     # Generate some sample data
     np.random.seed(666999)
-    n = 10000
+    n = 20000
     x1 = np.random.normal(0, 1, n)
-    x2 = (np.random.uniform(0, 1, n) > 0.5).astype(int)  # Binary variable
-    x3 = np.random.choice(np.arange(1, 6), n)  # Ordinal variable (1-5)
+    #x2 = (np.random.uniform(0, 1, n) > 0.5).astype(int)  # Binary variable
+    #x3 = np.random.choice(np.arange(1, 6), n)  # Ordinal variable (1-5)
     
     # Create a log-linear model with heteroskedasticity
-    log_y = 0.5 + 1.2 * x1 + 0.8 * x2 + 0.3 * x3 + + 0.5 * np.random.normal(0, 3* x1**2, n)
+    log_y = 0.5 + 1.2 * x1 + \
+        0.5 * np.random.normal(0, 3* x1**2, n)
+        # 0.8 * x2 + 0.3 * x3 + 
+
     y = np.exp(log_y)
     
     # Create a DataFrame
     df = pd.DataFrame({
         'y': y,
         'x1': x1,
-        'x2': x2,
-        'x3': x3
+        #'x2': x2,
+        #'x3': x3
     })
     
     # Fit standard OLS model
     import statsmodels.api as sm
-    X = sm.add_constant(df[['x1', 'x2', 'x3']])
+    X = sm.add_constant(df[[
+        'x1', 
+        #'x2', 'x3'
+    ]])
     ols_mod = sm.OLS(np.log(df['y']), X).fit()
     print("OLS results:")
     print(ols_mod.summary())
@@ -1448,11 +1633,14 @@ if __name__ == "__main__":
     print("\n1. Fitting with a specific variable of interest (x1):")
     dre1 = DRE(
         df['y'],
-        df[['x1', 'x2', 'x3']],
+        df[['x1', 
+            #'x2', 'x3'
+            ]],
         interest='x1',
-        estimator_type='kernel',
+        estimator_type='ols',
         elasticity=False,
-        density_estimator='kernel'
+        density_estimator='kernel',
+        kernel_params={'degree':4},
     )
     dre_results1 = dre1.fit()
     print(dre_results1.summary())
@@ -1488,15 +1676,17 @@ if __name__ == "__main__":
     print("\n4. Fitting with bootstrap standard errors:")
     dre4 = DRE(
         df['y'],
-        df[['x1', 'x2', 'x3']],
+        df[['x1', 
+            #'x2', 'x3'
+            ]],
         interest='x1',
-        estimator_type='nn',
+        estimator_type='ols',
         elasticity=False,
         density_estimator='kernel',
         kernel_params={'bw':'normal_reference'}
     )
     # Reduce bootstrap_reps for this example
-    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=20, bootstrap_method='pairs')
+    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=100, bootstrap_method='pairs')
     print(dre_results4.summary())
     
     # Plot distribution of estimates for a specific variable
