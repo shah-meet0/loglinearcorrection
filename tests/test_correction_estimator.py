@@ -13,6 +13,8 @@ from loglinearcorrection.correction_estimator import (
     OLSCorrectionModel, NNCorrectionModel, CorrectionModel
 )
 
+from loglinearcorrection.correction_estimator import DoublyRobustElasticityEstimator
+
 # Mocking AssumptionTest for testing
 class MockAssumptionTest:
     def __init__(self, model):
@@ -387,4 +389,45 @@ class TestIntegration:
         # Test PPML test
         ppml_results = results.test_ppml()
         assert isinstance(ppml_results, dict)
+
+    class TestDoublyRobustElasticityEstimator:
+        def test_compute_corrections_binary(self):
+            # Generate simple data with a binary regressor
+            np.random.seed(0)
+            n = 200
+            x = np.random.binomial(1, 0.5, size=n)
+            beta_0 = 0.7
+            beta_1 = 0.9
+            # u_i with some heteroskedasticity for realism
+            u = np.random.normal(0, 0.2 + 0.1 * x, n)
+            log_y = beta_0 + beta_1 * x + u
+            y = np.exp(log_y)
+            df = pd.DataFrame({'y': y, 'x': x})
+
+            # Fit your estimator (use 'binary' for nonparametric correction)
+            dre = DoublyRobustElasticityEstimator(
+                endog=df['y'],
+                exog=df[['x']],
+                interest='x',
+                estimator_type='binary',
+                elasticity=False
+            )
+            results = dre.fit()
+            # Pull out the values
+            beta_hat = results.beta_hat[0]  # Only one regressor
+            m0 = results.nonparam_model.predict(np.array([[0]]))[0]
+            m1 = results.nonparam_model.predict(np.array([[1]]))[0]
+            # Expected semi-elasticity for binary: e^{beta_hat} * m1/m0 - 1
+            expected = np.exp(beta_hat) * (m1 / m0) - 1
+
+            # The estimator_values for a binary variable should be constant at either value
+            est_x0 = results.estimator_values[0][x == 0]
+            est_x1 = results.estimator_values[0][x == 1]
+
+            # They should both be close to the expected formula
+            self.assertTrue(np.allclose(est_x0, expected, atol=1e-2))
+            self.assertTrue(np.allclose(est_x1, expected, atol=1e-2))
+
+            print(f"Estimated semi-elasticity (binary): {est_x0[0]:.5f}")
+            print(f"Expected value from formula: {expected:.5f}")
 

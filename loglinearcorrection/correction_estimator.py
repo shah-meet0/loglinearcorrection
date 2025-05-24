@@ -71,6 +71,10 @@ class DoublyRobustElasticityEstimator(Model):
                  elasticity=False, kernel_params=None, nn_params=None, 
                  density_estimator='kernel', density_params=None, fe=None):
         """Initialize the doubly robust estimator."""
+
+        # Initialize the base Model class
+        super(DoublyRobustElasticityEstimator, self).__init__(endog, exog)
+
         # Store the original data
         self.original_endog = endog
         self.original_exog = exog
@@ -92,9 +96,15 @@ class DoublyRobustElasticityEstimator(Model):
         
         # Process fixed effects if provided
         if fe is not None:
+            if isinstance(fe, list):
+                if isinstance(fe[0], str):
+                    self.fe_indices = self.original_exog.columns.get_indexer(['rail', 'distid'])
+                else:
+                    self.fe_indices = fe
             if isinstance(fe, int):
-                fe = [fe]
-            self.fe_indices = fe
+                self.fe_indices = [fe]
+            if isinstance(fe, str):
+                self.fe_indices = [self.original_exog.columns.get_loc(fe)]
             self._apply_fixed_effects()
         else:
             # If no fixed effects, just use the original data
@@ -160,13 +170,19 @@ class DoublyRobustElasticityEstimator(Model):
         # Automatically detect variable types
         self._detect_variable_types()
         
-        # Initialize the base Model class
-        super(DoublyRobustElasticityEstimator, self).__init__(endog, exog)
+
     
     def _apply_fixed_effects(self):
         """Apply fixed effects transformation to the data."""
         # Extract the fixed effects columns
-        fe_cols = self.original_exog[:, self.fe_indices]
+
+        if isinstance(self.original_exog, pd.DataFrame):
+            fe_cols = self.original_exog.iloc[:, self.fe_indices].values
+        else:
+            fe_cols = self.original_exog[:, self.fe_indices]
+
+        if fe_cols.ndim == 1:
+            fe_cols = fe_cols.reshape(-1, 1)
         
         # Create dummy variables for fixed effects
         one_hot_encoder = OneHotEncoder(sparse_output=False, drop='first')
@@ -177,12 +193,22 @@ class DoublyRobustElasticityEstimator(Model):
             np.transpose(dummy_vars) @ dummy_vars) @ np.transpose(dummy_vars)
         
         # Apply demeaning to both X and y
-        combined = np.column_stack([self.original_exog, self.original_endog.reshape(-1, 1)])
+        if isinstance(self.original_endog, pd.Series) or isinstance(self.original_endog, pd.DataFrame):
+            endog_to_use = np.log(self.original_endog.copy().values.reshape(-1, 1))
+        else:
+            endog_to_use = np.log(self.original_endog.copy().reshape(-1, 1))
+
+        if isinstance(self.original_exog, pd.DataFrame):
+            exog_to_use = self.original_exog.copy().values
+        else:
+            exog_to_use = self.original_exog.copy()
+
+        combined = np.column_stack([exog_to_use, endog_to_use])
         demeaned = residual_maker @ combined
         
         # Update X and y with demeaned values
         self.exog = np.delete(demeaned[:, :-1], self.fe_indices, axis=1)
-        self.endog = demeaned[:, -1]
+        self.endog = np.exp(demeaned[:, -1])
         
         # Update exog_names to remove fixed effect variables
         if hasattr(self, '_exog_names'):
@@ -427,6 +453,7 @@ class DoublyRobustElasticityEstimator(Model):
     
     def _fit_binary_model(self, exp_residuals):
         """Fit a binary model for E[exp(u)|X] when the regressor of interest is binary."""
+        #TODO: NEEDS TO BE CORRECTED FOR FE ESTIMATION
         # This method needs to handle multiple binary variables of interest
         # Normalize exponentiated residuals for numerical stability
         min_exp_residual = np.min(exp_residuals)
@@ -575,6 +602,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
     def _compute_corrections(self):
         """Compute correction terms for all data points in the sample."""
+        # TODO: Fix for percentage changes case so its e^beta1 * m1/m0 - 1
         # Get the values of m(x) for all observations
         self.m_hat = self.nonparam_model.predict(self.model.exog)
         
