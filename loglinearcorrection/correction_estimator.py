@@ -20,7 +20,7 @@ def _estimate_single_point_worker(args):
 
 
 class DoublyRobustElasticityEstimator(Model):
-    """Doubly robust estimator for elasticities and semi-elasticities in log-transformed models.
+    r"""Doubly robust estimator for elasticities and semi-elasticities in log-transformed models.
     
     This class implements a doubly robust estimator that corrects for the bias that occurs
     in log-transformed OLS models by estimating the conditional expectation of the
@@ -886,9 +886,26 @@ class DoublyRobustElasticityEstimatorResults(Results):
         else:  # not self.model.elasticity and self.model.log_x[i]
             return beta_hat + correction / X_mean[0, variable_idx]
     
-    def average_estimate(self):
-        """Calculate the average of the estimator across all observations."""
-        return np.mean(self.estimator_values)
+    def average_estimate(self, variable_idx=None):
+        """Calculate the average estimate for values of regressors.
+
+        Parameters
+        ----------
+        variable_idx : int or str, optional
+            Index or name of the variable to calculate for. If None, uses the first
+            variable of interest. Defaults to None.
+
+        Returns
+        -------
+        float
+            Estimator value at average X
+        """
+        if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
+        elif variable_idx is None:
+            variable_idx = self.interest[0]
+
+        return np.mean(self.estimator_values[variable_idx])
     
     def std_error_at_average(self):
         """Calculate the standard error of the estimator at average values."""
