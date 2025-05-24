@@ -1,18 +1,11 @@
 import pytest
+import pandas as pd
 import numpy as np
 import tensorflow as tf
 import statsmodels.api as sm
 from sklearn.preprocessing import PolynomialFeatures
 from hypothesis import given, strategies as st, settings
 from hypothesis.extra.numpy import arrays
-
-# Import the module to test
-from loglinearcorrection.correction_estimator import (
-    CorrectedEstimator, CorrectedEstimatorResults,
-    CorrectedEstimatorResultsLogLinear, CorrectedEstimatorResultsLogLog,
-    OLSCorrectionModel, NNCorrectionModel, CorrectionModel
-)
-
 from loglinearcorrection.correction_estimator import DoublyRobustElasticityEstimator
 
 # Mocking AssumptionTest for testing
@@ -55,379 +48,474 @@ def regression_data(draw, n_samples=100, n_features=3, min_value=0.1, max_value=
     
     return X, y, beta
 
-class TestCorrectedEstimator:
-    """Tests for CorrectedEstimator class."""
+class TestDoublyRobustElasticityEstimator:
+    """Test class for DoublyRobustElasticityEstimator - pytest compatible."""
     
-    def test_initialization(self):
-        """Test initialization of CorrectedEstimator."""
-        X = np.random.rand(100, 3)
-        y = np.random.rand(100) + 0.1  # Ensure positive
+    def test_compute_corrections_binary(self):
+        """Test binary regressor corrections using pytest class-based approach."""
+        # Generate simple data with a binary regressor
+        np.random.seed(0)
+        n = 200
+        x = np.random.binomial(1, 0.5, size=n)
+        beta_0 = 0.7
+        beta_1 = 0.9
+        # u_i with some heteroskedasticity for realism
+        u = np.random.normal(0, 0.2 + 0.1 * x, n)
+        log_y = beta_0 + beta_1 * x + u
+        y = np.exp(log_y)
+        df = pd.DataFrame({'y': y, 'x': x})
         
-        # Test with default parameters
-        model = CorrectedEstimator(y, X)
-        assert model.X is X
-        assert model.y is y
-        assert model.correction_model_type == 'nn'
-        assert model.x_index == 0
-        assert model.log_x is False
+        # Fit your estimator (use 'binary' for nonparametric correction)
+        dre = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x']],
+            interest='x',
+            estimator_type='binary',
+            elasticity=False
+        )
+        results = dre.fit()
         
-        # Test with custom parameters
-        model = CorrectedEstimator(y, X, correction_model_type='OLS', interest=1, log_x=True)
-        assert model.correction_model_type == 'ols'
-        assert model.x_index == 1
-        assert model.log_x is True
+        # Pull out the values
+        beta_hat = results.beta_hat[0]  # Only one regressor
+        m0 = results.nonparam_model.predict(np.array([[0]]))[0]
+        m1 = results.nonparam_model.predict(np.array([[1]]))[0]
         
-        # Test invalid correction_model_type
-        with pytest.raises(ValueError):
-            CorrectedEstimator(y, X, correction_model_type='invalid')
+        # Expected semi-elasticity for binary: e^{beta_hat} * m1/m0 - 1
+        expected = np.exp(beta_hat) * (m1 / m0) - 1
+        
+        # The estimator_values for a binary variable should be constant at either value
+        est_x0 = results.estimator_values[0][x == 0]
+        est_x1 = results.estimator_values[0][x == 1]
+        
+        # Pytest assertions with helpful error messages
+        assert np.allclose(est_x0, expected, atol=1e-2), (
+            f"est_x0 values not close to expected:\n"
+            f"  Mean est_x0: {np.mean(est_x0):.5f}\n"
+            f"  Expected: {expected:.5f}\n"
+            f"  Max difference: {np.max(np.abs(est_x0 - expected)):.5f}"
+        )
+        
+        assert np.allclose(est_x1, expected, atol=1e-2), (
+            f"est_x1 values not close to expected:\n"
+            f"  Mean est_x1: {np.mean(est_x1):.5f}\n"
+            f"  Expected: {expected:.5f}\n"
+            f"  Max difference: {np.max(np.abs(est_x1 - expected)):.5f}"
+        )
+        
+        print(f"Estimated semi-elasticity (binary): {est_x0[0]:.5f}")
+        print(f"Expected value from formula: {expected:.5f}")
     
-    @pytest.mark.parametrize("model_type", ['ols', 'nn'])
-    def test_fit_small_dataset(self, model_type):
-        """Test fitting on a small controlled dataset."""
-        # Create a simple dataset
+    def test_binary_corrections_consistency(self):
+        """Additional test to verify consistency of binary corrections."""
         np.random.seed(42)
-        X = np.random.rand(50, 2)
-        beta = np.array([1.5, -0.5])
-        noise = np.random.normal(1, 0.1, 50)
-        y = np.exp(X @ beta) * noise
+        n = 150
+        x = np.random.binomial(1, 0.6, size=n)
+        u = np.random.normal(0, 0.3, n)
+        log_y = 1.2 + 0.8 * x + u
+        y = np.exp(log_y)
+        df = pd.DataFrame({'y': y, 'x': x})
         
-        # Fit model
-        model = CorrectedEstimator(y, X, correction_model_type=model_type)
+        dre = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x']],
+            interest='x',
+            estimator_type='binary',
+            elasticity=False
+        )
+        results = dre.fit()
         
-        # Use minimal epochs for NN to speed up test
-        params = {'epochs': 5} if model_type == 'nn' else {'degree': 2}
-        results = model.fit(params_dict=params, disp=0)
+        # All estimator values for x=0 should be the same
+        est_x0 = results.estimator_values[0][x == 0]
+        est_x1 = results.estimator_values[0][x == 1]
         
-        # Check results type based on log_x parameter
-        assert isinstance(results, CorrectedEstimatorResultsLogLinear)
+        # Check consistency within groups
+        assert np.allclose(est_x0, est_x0[0], atol=1e-10), (
+            "All estimator values for x=0 should be identical"
+        )
+        assert np.allclose(est_x1, est_x1[0], atol=1e-10), (
+            "All estimator values for x=1 should be identical"
+        )
         
-        # Also test with log_x=True
-        model = CorrectedEstimator(y, X, correction_model_type=model_type, log_x=True)
-        results = model.fit(params_dict=params, disp=0)
-        assert isinstance(results, CorrectedEstimatorResultsLogLog)
-    
-    @given(data=regression_data(n_samples=50, n_features=2))
-    @settings(deadline=None, max_examples=3)  # Limit examples due to computational cost
-    def test_fit_property_based(self, data):
-        """Property-based test for fit method."""
-        X, y, _ = data
+        # Check that both groups have the same correction value
+        assert np.allclose(est_x0[0], est_x1[0], atol=1e-10), (
+            f"Binary correction should be the same for both groups: "
+            f"{est_x0[0]:.10f} vs {est_x1[0]:.10f}"
+        )
+
+    def test_bootstrap_only_supports_pairs_method(self):
+        """Test that only 'pairs' bootstrap method is supported, others raise ValueError."""
+        # Generate simple test data
+        np.random.seed(42)
+        n = 50
+        x = np.random.normal(0, 1, n)
+        y = np.exp(0.5 + 0.8 * x + np.random.normal(0, 0.2, n))
+        df = pd.DataFrame({'y': y, 'x': x})
         
-        # Test with OLS correction (faster than NN for property testing)
-        model = CorrectedEstimator(y, X, correction_model_type='ols')
-        params = {'degree': 2}  # Low degree for speed
+        # Create estimator
+        dre = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x']],
+            interest='x',
+            estimator_type='ols',
+            elasticity=False
+        )
         
+        # Test that 'residuals' bootstrap method raises ValueError
+        with pytest.raises(ValueError, match="Bootstrap method 'residuals' not supported"):
+            dre.fit(bootstrap=True, bootstrap_reps=5, bootstrap_method='residuals')
+        
+        # Test that 'pairs' bootstrap method still works
         try:
-            results = model.fit(params_dict=params, disp=0)
-            
-            # Basic checks
-            assert hasattr(results, 'model')
-            assert hasattr(results, 'ols_results')
-            assert hasattr(results, 'correction_model')
-            
-            # Check if betahat is extracted correctly
-            assert results.betahat == results.ols_results.params[0]
-            
+            results = dre.fit(bootstrap=True, bootstrap_reps=3, bootstrap_method='pairs')
+            assert results.bootstrap == True
+            assert results.bootstrap_reps == 3
+            print("✓ Bootstrap correctly supports only 'pairs' method")
         except Exception as e:
-            # Some combinations might cause numerical issues
-            # This is acceptable for property-based testing
-            pytest.skip(f"Skipped due to numerical issue: {str(e)}")
+            pytest.fail(f"'pairs' bootstrap should work but failed with: {e}")
     
-    def test_make_nn(self):
-        """Test neural network model creation."""
-        X = np.random.rand(100, 3)
-        y = np.random.rand(100) + 0.1
+    def test_binary_variables_use_exponential_formula(self):
+        """Test that binary variables use the correct e^{beta} * (m1/m0) - 1 formula."""
+        # Generate data with a binary regressor
+        np.random.seed(123)
+        n = 200
+        x_binary = np.random.binomial(1, 0.5, size=n)
+        beta_0 = 0.7
+        beta_1 = 1.2  # Coefficient for binary variable
         
-        model = CorrectedEstimator(y, X)
+        # Generate y with some heteroskedasticity
+        u = np.random.normal(0, 0.15 + 0.05 * x_binary, n)
+        log_y = beta_0 + beta_1 * x_binary + u
+        y = np.exp(log_y)
+        df = pd.DataFrame({'y': y, 'x': x_binary})
         
-        # Test with default parameters
-        nn = model.make_nn({})
-        assert isinstance(nn, tf.keras.Sequential)
-        assert len(nn.layers) == 5  # Input + 3 hidden + output
+        # Fit the estimator using binary model
+        dre = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x']],
+            interest='x',
+            estimator_type='binary',
+            elasticity=False
+        )
+        results = dre.fit()
         
-        # Test with custom parameters
-        params = {
-            'num_layers': 2,
-            'num_units': 32,
-            'activation': 'tanh',
-            'optimizer': 'sgd',
-            'loss': 'mae'
-        }
-        nn = model.make_nn(params)
-        assert len(nn.layers) == 4  # Input + 2 hidden + output
+        # Extract the components we need to verify the formula
+        beta_hat = results.beta_hat[0]  # OLS estimate
         
-        # Test with num_units as list
-        params = {
-            'num_layers': 2,
-            'num_units': [32, 16]
-        }
-        nn = model.make_nn(params)
-        assert nn.layers[1].units == 32
-        assert nn.layers[2].units == 16
+        # Get m0 and m1 directly from the nonparametric model
+        m0 = results.nonparam_model.predict(np.array([[0]]))[0]
+        m1 = results.nonparam_model.predict(np.array([[1]]))[0]
         
-        # Test with invalid num_units
-        params = {
-            'num_layers': 2,
-            'num_units': [32, 16, 8]  # Too long for num_layers
-        }
-        with pytest.raises(ValueError):
-            model.make_nn(params)
-
-class TestCorrectionModels:
-    """Tests for OLSCorrectionModel and NNCorrectionModel classes."""
+        # Calculate expected semi-elasticity using the correct formula
+        expected_semi_elasticity = np.exp(beta_hat) * (m1 / m0) - 1
+        
+        # Get actual estimates from the results
+        actual_estimates_x0 = results.estimator_values[0][x_binary == 0]
+        actual_estimates_x1 = results.estimator_values[0][x_binary == 1]
+        
+        # Test that all estimates equal the expected value (within tolerance)
+        assert np.allclose(actual_estimates_x0, expected_semi_elasticity, atol=1e-10), (
+            f"Binary estimates for x=0 don't match expected formula:\n"
+            f"  Expected: {expected_semi_elasticity:.10f}\n"
+            f"  Actual (mean): {np.mean(actual_estimates_x0):.10f}\n"
+            f"  Max difference: {np.max(np.abs(actual_estimates_x0 - expected_semi_elasticity)):.2e}"
+        )
+        
+        assert np.allclose(actual_estimates_x1, expected_semi_elasticity, atol=1e-10), (
+            f"Binary estimates for x=1 don't match expected formula:\n"
+            f"  Expected: {expected_semi_elasticity:.10f}\n"
+            f"  Actual (mean): {np.mean(actual_estimates_x1):.10f}\n"
+            f"  Max difference: {np.max(np.abs(actual_estimates_x1 - expected_semi_elasticity)):.2e}"
+        )
+        
+        # Test estimate_at_point for binary variables
+        point_0 = np.array([[0]])
+        point_1 = np.array([[1]])
+        
+        est_at_0 = results.estimate_at_point(point_0, 0)
+        est_at_1 = results.estimate_at_point(point_1, 0)
+        
+        assert np.isclose(est_at_0, expected_semi_elasticity, atol=1e-10), (
+            f"estimate_at_point for x=0 doesn't match expected: {est_at_0:.10f} vs {expected_semi_elasticity:.10f}"
+        )
+        
+        assert np.isclose(est_at_1, expected_semi_elasticity, atol=1e-10), (
+            f"estimate_at_point for x=1 doesn't match expected: {est_at_1:.10f} vs {expected_semi_elasticity:.10f}"
+        )
+        
+        # Verify it's NOT using the old incorrect formula (beta + correction)
+        old_incorrect_formula = beta_hat + (m1 - m0) / ((m0 + m1) / 2)  # Approximate old logic
+        assert not np.isclose(expected_semi_elasticity, old_incorrect_formula, atol=1e-3), (
+            "The formula appears to still be using the old incorrect logic"
+        )
+        
+        print(f"✓ Binary variables correctly use e^{{beta}} * (m1/m0) - 1 formula")
+        print(f"  Beta_hat: {beta_hat:.4f}")
+        print(f"  m0: {m0:.4f}, m1: {m1:.4f}")
+        print(f"  Expected semi-elasticity: {expected_semi_elasticity:.6f}")
+        print(f"  Actual estimate: {actual_estimates_x0[0]:.6f}")
     
-    def test_ols_correction_model(self):
-        """Test OLSCorrectionModel functionality."""
-        # Create simple test data
-        X = np.random.rand(50, 2)
-        y = np.exp(X @ np.array([1.0, -0.5])) * np.random.normal(1, 0.1, 50)
+    def test_binary_and_continuous_variables_handled_differently(self):
+        """Test to ensure binary and continuous variables use different estimation approaches."""
+        np.random.seed(456)
+        n = 100
         
-        # Create polynomial features
-        poly = PolynomialFeatures(degree=2, include_bias=False)
-        X_poly = poly.fit_transform(X)
+        # Create data with both binary and continuous variables
+        x_binary = np.random.binomial(1, 0.6, size=n)
+        x_continuous = np.random.normal(1, 0.5, n)
         
-        # Fit a simple OLS model
-        ols_model = sm.OLS(y, X_poly).fit()
+        u = np.random.normal(0, 0.2, n)
+        log_y = 0.5 + 1.0 * x_binary + 0.8 * x_continuous + u
+        y = np.exp(log_y)
         
-        # Create OLSCorrectionModel
-        correction_model = OLSCorrectionModel(ols_model, poly)
+        df = pd.DataFrame({'y': y, 'x_binary': x_binary, 'x_continuous': x_continuous})
         
-        # Test predict method
-        predictions = correction_model.predict(X)
-        assert predictions.shape == (len(X),)
+        # Test binary variable
+        dre_binary = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x_binary', 'x_continuous']],
+            interest='x_binary',
+            estimator_type='binary',
+            elasticity=False
+        )
+        results_binary = dre_binary.fit()
         
-        # Test marginal effects
-        me = correction_model.marginal_effects(X, 0)
-        assert me.shape == (len(X),)
+        # For binary variable, all estimates should be the same
+        binary_estimates = results_binary.estimator_values[0]
+        assert np.allclose(binary_estimates, binary_estimates[0], atol=1e-10), (
+            "All binary estimates should be identical but they vary"
+        )
         
-        # Test semi_elasticity
-        se = correction_model.semi_elasticity(X, 0)
-        assert se.shape == (len(X),)
+        # Test continuous variable  
+        dre_continuous = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x_binary', 'x_continuous']],
+            interest='x_continuous',
+            estimator_type='ols',
+            elasticity=False
+        )
+        results_continuous = dre_continuous.fit()
         
-        # Test elasticity
-        el = correction_model.elasticity(X, 0)
-        assert el.shape == (len(X),)
+        # For continuous variable, estimates should vary across observations
+        continuous_estimates = results_continuous.estimator_values[1]
+        assert not np.allclose(continuous_estimates, continuous_estimates[0], atol=1e-5), (
+            "Continuous estimates should vary across observations but they're all the same"
+        )
+        
+        print("✓ Binary and continuous variables handled with different approaches as expected")
     
-    def test_nn_correction_model(self):
-        """Test NNCorrectionModel functionality."""
-        # Create simple test data
-        X = np.random.rand(50, 2).astype(np.float32)
+    def test_estimate_at_average_delegates_to_estimate_at_point(self):
+        """Test that estimate_at_average uses estimate_at_point logic to avoid code duplication."""
+        # Generate test data
+        np.random.seed(789)
+        n = 80
+        x = np.random.normal(2, 0.8, n)
+        y = np.exp(1.2 + 0.9 * x + np.random.normal(0, 0.3, n))
+        df = pd.DataFrame({'y': y, 'x': x})
         
-        # Create a simple neural network
-        model = tf.keras.Sequential([
-            tf.keras.layers.Input(shape=(2,)),
-            tf.keras.layers.Dense(10, activation='relu'),
-            tf.keras.layers.Dense(1)
-        ])
+        # Create estimator
+        dre = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x']],
+            interest='x',
+            estimator_type='ols',
+            elasticity=False
+        )
+        results = dre.fit()
         
-        # Create NNCorrectionModel
-        correction_model = NNCorrectionModel(model)
+        # Calculate expected result using estimate_at_point
+        X_mean = np.mean(df[['x']].values, axis=0).reshape(1, -1)
+        expected_result = results.estimate_at_point(X_mean, 0)
         
-        # Test predict method
-        predictions = correction_model.predict(X)
-        assert predictions.shape == (len(X), 1)
+        # Calculate actual result using estimate_at_average
+        actual_result = results.estimate_at_average(0)
         
-        # Convert tensors to numpy for assertion
-        predictions_np = predictions.numpy()
-        assert predictions_np.shape == (len(X), 1)
+        # They should be exactly equal (no numerical tolerance needed)
+        assert actual_result == expected_result, (
+            f"estimate_at_average should equal estimate_at_point at mean X:\n"
+            f"  estimate_at_average: {actual_result:.10f}\n"
+            f"  estimate_at_point at mean: {expected_result:.10f}\n"
+            f"  Difference: {abs(actual_result - expected_result):.2e}"
+        )
         
-        # Test marginal effects
-        me = correction_model.marginal_effects(X, 0)
-        assert me.shape == (len(X),)
+        # Test with variable name instead of index
+        actual_result_by_name = results.estimate_at_average('x')
+        assert actual_result_by_name == expected_result, (
+            "estimate_at_average should work the same with variable name"
+        )
         
-        # Test semi_elasticity
-        se = correction_model.semi_elasticity(X, 0)
-        assert se.shape == (len(X),)
+        # Test with no argument (should use first variable of interest)
+        actual_result_default = results.estimate_at_average()
+        assert actual_result_default == expected_result, (
+            "estimate_at_average should work with default argument"
+        )
         
-        # Test elasticity
-        el = correction_model.elasticity(X, 0)
-        assert el.shape == (len(X),)
-
-class TestCorrectedEstimatorResults:
-    """Tests for CorrectedEstimatorResults classes."""
+        print(f"✓ estimate_at_average correctly delegates to estimate_at_point logic")
+        print(f"  Result: {actual_result:.6f}")
+        print(f"  X_mean: {X_mean[0, 0]:.4f}")
     
-    def setup_test_data(self):
-        """Set up test data and models for result tests."""
-        np.random.seed(42)
-        X = np.random.rand(50, 2)
-        beta = np.array([1.5, -0.5])
-        noise = np.random.normal(1, 0.1, 50)
-        y = np.exp(X @ beta) * noise
+    def test_estimate_at_average_consistent_with_binary_variables(self):
+        """Test delegation consistency with binary variables."""
+        np.random.seed(111)
+        n = 60
+        x_binary = np.random.binomial(1, 0.4, size=n)
+        y = np.exp(0.8 + 1.5 * x_binary + np.random.normal(0, 0.25, n))
+        df = pd.DataFrame({'y': y, 'x': x_binary})
         
-        # Create OLS results
-        ols_results = sm.OLS(np.log(y), X).fit()
+        dre = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x']],
+            interest='x',
+            estimator_type='binary',
+            elasticity=False
+        )
+        results = dre.fit()
         
-        # Create a simple neural network
-        nn_model = tf.keras.Sequential([
-            tf.keras.layers.Input(shape=(2,)),
-            tf.keras.layers.Dense(10, activation='relu'),
-            tf.keras.layers.Dense(1)
-        ])
+        # For binary variables, both methods should give the same result
+        X_mean = np.mean(df[['x']].values, axis=0).reshape(1, -1)
+        expected_result = results.estimate_at_point(X_mean, 0)
+        actual_result = results.estimate_at_average(0)
         
-        correction_model = NNCorrectionModel(nn_model)
+        assert actual_result == expected_result, (
+            f"estimate_at_average should equal estimate_at_point for binary variables:\n"
+            f"  estimate_at_average: {actual_result:.10f}\n"
+            f"  estimate_at_point: {expected_result:.10f}"
+        )
         
-        return X, y, ols_results, correction_model
+        print(f"✓ estimate_at_average delegation works correctly with binary variables")
     
-    def test_log_linear_results(self):
-        """Test CorrectedEstimatorResultsLogLinear functionality."""
-        X, y, ols_results, correction_model = self.setup_test_data()
+    def test_bootstrap_binary_formula_and_delegation_work_together(self):
+        """Integration test to ensure bootstrap method restriction, binary formula, and delegation work together."""
+        np.random.seed(999)
+        n = 100
         
-        # Create model
-        model = CorrectedEstimator(y, X)
+        # Create mixed data: binary and continuous
+        x_binary = np.random.binomial(1, 0.5, size=n)
+        x_continuous = np.random.normal(1.5, 0.6, n)
         
-        # Create results
-        results = CorrectedEstimatorResultsLogLinear(model, ols_results, correction_model)
+        u = np.random.normal(0, 0.2, n)
+        log_y = 0.6 + 1.1 * x_binary + 0.7 * x_continuous + u
+        y = np.exp(log_y)
         
-        # Test methods
-        assert isinstance(results.average_semi_elasticity(), float)
-        assert hasattr(results, 'se')
+        df = pd.DataFrame({'y': y, 'x_bin': x_binary, 'x_cont': x_continuous})
         
-        fig, ax = results.plot_dist_semi_elasticity()
-        assert fig is not None
-        assert ax is not None
+        # Test with binary variable
+        dre_binary = DoublyRobustElasticityEstimator(
+            endog=df['y'],
+            exog=df[['x_bin', 'x_cont']],
+            interest='x_bin',
+            estimator_type='binary',
+            elasticity=False
+        )
         
-        assert isinstance(results.semi_elasticity_at_average(), float)
+        # Should work with pairs bootstrap (bootstrap method restriction)
+        results_binary = dre_binary.fit(bootstrap=True, bootstrap_reps=3, bootstrap_method='pairs')
         
-        # Test PPML test
-        ppml_results = results.test_ppml()
-        assert 'test_statistic' in ppml_results
-        assert 'p_value' in ppml_results
-        assert 'conclusion' in ppml_results
+        # Should correctly handle binary formula (exponential formula)
+        binary_estimates = results_binary.estimator_values[0]
+        assert np.allclose(binary_estimates, binary_estimates[0], atol=1e-10), (
+            "Binary estimates should be constant"
+        )
+        
+        # estimate_at_average should use estimate_at_point (delegation)
+        X_mean = np.mean(df[['x_bin', 'x_cont']].values, axis=0).reshape(1, -1)
+        est_at_avg = results_binary.estimate_at_average('x_bin')
+        est_at_point = results_binary.estimate_at_point(X_mean, 0)
+        assert est_at_avg == est_at_point, "Delegation not working in integration test"
+        
+        # Should fail with residuals bootstrap (bootstrap method restriction)
+        with pytest.raises(ValueError, match="Bootstrap method 'residuals' not supported"):
+            dre_binary.fit(bootstrap=True, bootstrap_reps=2, bootstrap_method='residuals')
+        
+        print("✓ INTEGRATION: Bootstrap restriction, binary formula, and delegation all work together")
+
+
+def test_binary_formula_mathematical_verification():
+    """Verify that the binary formula is mathematically correct."""
+    # Create a controlled scenario where we know the true values
+    np.random.seed(12345)
+    n = 1000  # Large sample for accuracy
     
-    def test_log_log_results(self):
-        """Test CorrectedEstimatorResultsLogLog functionality."""
-        X, y, ols_results, correction_model = self.setup_test_data()
-        
-        # Create model with log_x=True
-        model = CorrectedEstimator(y, X, log_x=True)
-        
-        # Create results
-        results = CorrectedEstimatorResultsLogLog(model, ols_results, correction_model)
-        
-        # Test methods
-        assert isinstance(results.average_elasticity(), float)
-        assert hasattr(results, 'e')
-        
-        fig, ax = results.plot_dist_elasticity()
-        assert fig is not None
-        assert ax is not None
-        
-        assert isinstance(results.elasticity_at_average(), float)
-        
-        # Test PPML test
-        ppml_results = results.test_ppml()
-        assert 'test_statistic' in ppml_results
-        assert 'p_value' in ppml_results
-        assert 'conclusion' in ppml_results
+    # Simple binary case: x is 0 or 1
+    x = np.random.binomial(1, 0.5, size=n)
     
-    def test_base_results_methods(self):
-        """Test base CorrectedEstimatorResults methods."""
-        X, y, ols_results, correction_model = self.setup_test_data()
-        
-        # Create model
-        model = CorrectedEstimator(y, X)
-        
-        # Create results using the base class
-        results = CorrectedEstimatorResults(model, ols_results, correction_model)
-        
-        # Test methods
-        assert results.get_ols_results() is ols_results
-        
-        # Test print_ols_results (should not raise exception)
-        try:
-            results.print_ols_results()
-        except Exception as e:
-            pytest.fail(f"print_ols_results raised exception: {str(e)}")
-
-class TestIntegration:
-    """Integration tests for the full CorrectedEstimator workflow."""
+    # True parameters
+    true_beta_0 = 1.0
+    true_beta_1 = 0.8
     
-    @pytest.mark.parametrize("log_x", [False, True])
-    def test_simple_workflow(self, log_x):
-        """Test a complete simple workflow."""
-        np.random.seed(42)
-        X = np.random.rand(50, 2)
-        
-        # If log_x is True, transform the regressor of interest
-        if log_x:
-            X_for_dgp = X.copy()
-            X_for_dgp[:, 0] = np.exp(X[:, 0])
-        else:
-            X_for_dgp = X
-        
-        beta = np.array([1.0, -0.5])
-        noise = np.random.normal(1, 0.1, 50)
-        y = np.exp(X_for_dgp @ beta) * noise
-        
-        # Create model with OLS correction (faster for testing)
-        model = CorrectedEstimator(y, X, correction_model_type='ols', log_x=log_x)
-        
-        # Fit with minimal settings
-        params = {'degree': 2}
-        results = model.fit(params_dict=params, disp=0)
-        
-        # Check result type
-        if log_x:
-            assert isinstance(results, CorrectedEstimatorResultsLogLog)
-            corrected_estimate = results.average_elasticity()
-        else:
-            assert isinstance(results, CorrectedEstimatorResultsLogLinear)
-            corrected_estimate = results.average_semi_elasticity()
-        
-        # Basic checks on results
-        assert corrected_estimate != results.betahat  # Correction should change estimate
-        assert isinstance(corrected_estimate, float)
-        
-        # Test plotting
-        if log_x:
-            fig, ax = results.plot_dist_elasticity()
-        else:
-            fig, ax = results.plot_dist_semi_elasticity()
-        
-        assert fig is not None
-        assert ax is not None
-        
-        # Test PPML test
-        ppml_results = results.test_ppml()
-        assert isinstance(ppml_results, dict)
+    # Generate y with minimal noise for cleaner test
+    u = np.random.normal(0, 0.05, n)  # Very small noise
+    log_y = true_beta_0 + true_beta_1 * x + u
+    y = np.exp(log_y)
+    
+    # Theoretical values
+    # E[y|x=0] = exp(beta_0) * E[exp(u)|x=0]
+    # E[y|x=1] = exp(beta_0 + beta_1) * E[exp(u)|x=1]
+    # If E[exp(u)|x=0] ≈ E[exp(u)|x=1] ≈ c (due to small noise)
+    # Then semi-elasticity ≈ exp(beta_1) - 1
+    
+    df = pd.DataFrame({'y': y, 'x': x})
+    
+    dre = DoublyRobustElasticityEstimator(
+        endog=df['y'],
+        exog=df[['x']],
+        interest='x',
+        estimator_type='binary',
+        elasticity=False
+    )
+    results = dre.fit()
+    
+    # Get the estimated semi-elasticity
+    estimated_semi_elasticity = results.estimator_values[0][0]
+    
+    # Compare with theoretical expectation
+    # For small u, exp(u) ≈ 1 + u, so E[exp(u)] ≈ 1
+    # This means the semi-elasticity should be approximately exp(beta_1) - 1
+    theoretical_approx = np.exp(true_beta_1) - 1
+    
+    # Should be close to theoretical value
+    assert abs(estimated_semi_elasticity - theoretical_approx) < 0.05, (
+        f"Estimated semi-elasticity {estimated_semi_elasticity:.4f} too far from "
+        f"theoretical {theoretical_approx:.4f}"
+    )
+    
+    print(f"✓ Mathematical verification: Binary exponential formula is mathematically correct")
+    print(f"  True beta_1: {true_beta_1}")
+    print(f"  Theoretical semi-elasticity ≈ {theoretical_approx:.4f}")
+    print(f"  Estimated semi-elasticity: {estimated_semi_elasticity:.4f}")
 
-    class TestDoublyRobustElasticityEstimator:
-        def test_compute_corrections_binary(self):
-            # Generate simple data with a binary regressor
-            np.random.seed(0)
-            n = 200
-            x = np.random.binomial(1, 0.5, size=n)
-            beta_0 = 0.7
-            beta_1 = 0.9
-            # u_i with some heteroskedasticity for realism
-            u = np.random.normal(0, 0.2 + 0.1 * x, n)
-            log_y = beta_0 + beta_1 * x + u
-            y = np.exp(log_y)
-            df = pd.DataFrame({'y': y, 'x': x})
 
-            # Fit your estimator (use 'binary' for nonparametric correction)
-            dre = DoublyRobustElasticityEstimator(
-                endog=df['y'],
-                exog=df[['x']],
-                interest='x',
-                estimator_type='binary',
-                elasticity=False
-            )
-            results = dre.fit()
-            # Pull out the values
-            beta_hat = results.beta_hat[0]  # Only one regressor
-            m0 = results.nonparam_model.predict(np.array([[0]]))[0]
-            m1 = results.nonparam_model.predict(np.array([[1]]))[0]
-            # Expected semi-elasticity for binary: e^{beta_hat} * m1/m0 - 1
-            expected = np.exp(beta_hat) * (m1 / m0) - 1
+# Additional pytest utilities
+@pytest.fixture
+def sample_binary_data():
+    """Fixture to provide sample binary regression data."""
+    np.random.seed(123)
+    n = 100
+    x = np.random.binomial(1, 0.4, size=n)
+    u = np.random.normal(0, 0.25, n)
+    log_y = 0.5 + 1.2 * x + u
+    y = np.exp(log_y)
+    return pd.DataFrame({'y': y, 'x': x})
 
-            # The estimator_values for a binary variable should be constant at either value
-            est_x0 = results.estimator_values[0][x == 0]
-            est_x1 = results.estimator_values[0][x == 1]
-
-            # They should both be close to the expected formula
-            self.assertTrue(np.allclose(est_x0, expected, atol=1e-2))
-            self.assertTrue(np.allclose(est_x1, expected, atol=1e-2))
-
-            print(f"Estimated semi-elasticity (binary): {est_x0[0]:.5f}")
-            print(f"Expected value from formula: {expected:.5f}")
-
+def test_with_fixture(sample_binary_data):
+    """Example test using a pytest fixture."""
+    df = sample_binary_data
+    
+    # Basic validation
+    assert len(df) == 100
+    assert set(df['x'].unique()) == {0, 1}
+    assert all(df['y'] > 0)
+    
+    # Test the estimator
+    dre = DoublyRobustElasticityEstimator(
+        endog=df['y'],
+        exog=df[['x']],
+        interest='x',
+        estimator_type='binary',
+        elasticity=False
+    )
+    results = dre.fit()
+    
+    # Basic checks
+    assert hasattr(results, 'beta_hat')
+    assert hasattr(results, 'estimator_values')
+    assert len(results.beta_hat) == 1  # Only one regressor

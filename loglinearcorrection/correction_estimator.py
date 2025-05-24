@@ -602,7 +602,6 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
     def _compute_corrections(self):
         """Compute correction terms for all data points in the sample."""
-        # TODO: Fix for percentage changes case so its e^beta1 * m1/m0 - 1
         # Get the values of m(x) for all observations
         self.m_hat = self.nonparam_model.predict(self.model.exog)
         
@@ -616,22 +615,51 @@ class DoublyRobustElasticityEstimatorResults(Results):
             # Get derivative for this variable
             self.m_prime_hat[var_idx] = self.nonparam_model.derivative(self.model.exog, var_idx)
             
-            # Compute the correction term
-            self.correction[var_idx] = self.m_prime_hat[var_idx] / self.m_hat
-            
-            # Compute the doubly robust estimator values
-            if self.model.elasticity and self.model.log_x[i]:
-                # For elasticity with log(x)
-                self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx]
-            elif not self.model.elasticity and not self.model.log_x[i]:
-                # For semi-elasticity with untransformed x
-                self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx]
-            elif self.model.elasticity and not self.model.log_x[i]:
-                # For elasticity with untransformed x
-                self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx] * self.model.exog[:, var_idx]
-            else:  # not self.model.elasticity and self.model.log_x[i]
-                # For semi-elasticity with log(x)
-                self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx] / self.model.exog[:, var_idx]
+            if var_idx in self.model.binary_vars:
+                # For binary variables, use the formula: e^{beta} * (m1/m0) - 1
+                # The derivative method returns m1 - m0, so we need to compute m1 and m0
+                
+                # Get beta coefficient
+                if self.all_variables:
+                    beta_hat = self.beta_hat[var_idx]
+                else:
+                    beta_hat = self.beta_hat[i]
+                
+                # Get m0 and m1 values
+                X_0 = self.model.exog.copy()
+                X_1 = self.model.exog.copy()
+                X_0[:, var_idx] = 0
+                X_1[:, var_idx] = 1
+                m_0 = self.nonparam_model.predict(X_0)
+                m_1 = self.nonparam_model.predict(X_1)
+                
+                # For binary variables, the semi-elasticity is e^{beta} * (m1/m0) - 1
+                # This is constant for all observations
+                semi_elasticity = np.exp(beta_hat) * (m_1 / m_0) - 1
+                self.estimator_values[var_idx] = semi_elasticity
+                
+                # Store correction term for consistency (though not used for binary)
+                self.correction[var_idx] = self.m_prime_hat[var_idx] / self.m_hat
+            else:
+                # For continuous variables, use the original logic
+                # Compute the correction term
+                self.correction[var_idx] = self.m_prime_hat[var_idx] / self.m_hat
+                
+                # Compute the doubly robust estimator values
+                if self.model.elasticity and self.model.log_x[i]:
+                    # For elasticity with log(x)
+                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx]
+                elif not self.model.elasticity and not self.model.log_x[i]:
+                    # For semi-elasticity with untransformed x
+                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx]
+                elif self.model.elasticity and not self.model.log_x[i]:
+                    # For elasticity with untransformed x
+                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx] * self.model.exog[:, var_idx]
+                else:  # not self.model.elasticity and self.model.log_x[i]
+                    # For semi-elasticity with log(x)
+                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx] / self.model.exog[:, var_idx]
+
+
     
     def _bootstrap_standard_errors(self, bootstrap_reps, bootstrap_method, weights, kwargs):
         """Compute bootstrap standard errors.
@@ -641,7 +669,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
         bootstrap_reps : int
             Number of bootstrap replications
         bootstrap_method : str
-            Bootstrap method to use: 'pairs' or 'residuals'
+            Bootstrap method to use: 'pairs' only (residuals method removed)
         weights : array-like or None
             Weights for WLS if provided
         kwargs : dict
@@ -652,14 +680,14 @@ class DoublyRobustElasticityEstimatorResults(Results):
         None
             Results are stored in bootstrap_estimates attribute
         """
+        # FIX 1: Remove residuals bootstrap option
+        if bootstrap_method != 'pairs':
+            raise ValueError(f"Bootstrap method '{bootstrap_method}' not supported. "
+                            f"Only 'pairs' bootstrap is available.")
+        
         n = len(self.model.endog)
         
         # Initialize storage for bootstrap estimates
-        # For each variable of interest, we track 4 estimates:
-        # 1. OLS estimate
-        # 2. Average correction
-        # 3. Average estimate
-        # 4. Estimate at average X
         if self.all_variables:
             var_indices = self.interest
         else:
@@ -672,63 +700,27 @@ class DoublyRobustElasticityEstimatorResults(Results):
             if i > 0 and i % 100 == 0:
                 print(f"  Completed {i} bootstrap replications")
                 
-            if bootstrap_method == 'pairs':
-                # Resample pairs (x_i, y_i)
-                indices = np.random.choice(n, size=n, replace=True)
-                bs_exog = self.model.exog[indices]
-                bs_endog = self.model.endog[indices]
-                
-                # Create a new estimator with the resampled data
-                bs_model = DoublyRobustElasticityEstimator(
-                    endog=bs_endog,
-                    exog=bs_exog,
-                    interest=self.model.interest,
-                    log_x=self.model.log_x,
-                    estimator_type=self.model.estimator_type,
-                    elasticity=self.model.elasticity,
-                    kernel_params=self.model.kernel_params,
-                    nn_params=self.model.nn_params,
-                    density_estimator=self.model.density_estimator,
-                    density_params=self.model.density_params
-                )
-                
-                # Fit the bootstrapped model
-                bs_results = bs_model.fit(weights=weights, bootstrap=False, **kwargs)
-                
-            elif bootstrap_method == 'residuals': #DO NOT USE - WILL BE REMOVED 
-                # Get fitted values from OLS model
-                fitted_values = np.exp(self.ols_results.fittedvalues)
-                
-                # Resample residuals
-                residual_indices = np.random.choice(n, size=n, replace=True)
-                resampled_residuals = self.exp_residuals[residual_indices]
-                
-                # Create new outcome by multiplying fitted values with resampled residuals
-                bs_endog = fitted_values * resampled_residuals
-                
-                # Use original exog
-                bs_exog = self.model.exog
-                
-                # Create a new estimator with the resampled data
-                bs_model = DoublyRobustElasticityEstimator(
-                    endog=bs_endog,
-                    exog=bs_exog,
-                    interest=self.model.interest,
-                    log_x=self.model.log_x,
-                    estimator_type=self.model.estimator_type,
-                    elasticity=self.model.elasticity,
-                    kernel_params=self.model.kernel_params,
-                    nn_params=self.model.nn_params,
-                    density_estimator=self.model.density_estimator,
-                    density_params=self.model.density_params
-                )
-                
-                # Fit the bootstrapped model
-                bs_results = bs_model.fit(weights=weights, bootstrap=False, **kwargs)
+            # Resample pairs (x_i, y_i)
+            indices = np.random.choice(n, size=n, replace=True)
+            bs_exog = self.model.exog[indices]
+            bs_endog = self.model.endog[indices]
             
-            else:
-                raise ValueError(f"Bootstrap method '{bootstrap_method}' not supported. "
-                                f"Use 'pairs' or 'residuals'.")
+            # Create a new estimator with the resampled data
+            bs_model = DoublyRobustElasticityEstimator(
+                endog=bs_endog,
+                exog=bs_exog,
+                interest=self.model.interest,
+                log_x=self.model.log_x,
+                estimator_type=self.model.estimator_type,
+                elasticity=self.model.elasticity,
+                kernel_params=self.model.kernel_params,
+                nn_params=self.model.nn_params,
+                density_estimator=self.model.density_estimator,
+                density_params=self.model.density_params
+            )
+            
+            # Fit the bootstrapped model
+            bs_results = bs_model.fit(weights=weights, bootstrap=False, **kwargs)
             
             # Store estimates from this bootstrap replication for each variable
             X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
@@ -746,12 +738,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 bootstrap_estimates_dict[var_idx][i, 0] = beta_hat  # OLS estimate
                 bootstrap_estimates_dict[var_idx][i, 1] = np.mean(bs_results.correction[var_idx])  # Average correction
                 # Average estimate 
-                # TODO: make sure the logic here allows non parallel processing too somehow
                 original_estimator_values = bs_results.calculate_estimator_at_points_parallel(
                     self.model.exog, var_idx, n_jobs=4, backend='threading'
                 )
                 bootstrap_estimates_dict[var_idx][i, 2] = np.mean(original_estimator_values)
-
 
                 bootstrap_estimates_dict[var_idx][i, 3] = bs_results.estimate_at_point(
                     original_X_mean, var_idx  # Use original average, not bootstrap average
@@ -886,33 +876,8 @@ class DoublyRobustElasticityEstimatorResults(Results):
         float
             Estimator value at average X
         """
-        # Convert variable name to index if needed
-        if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
-            variable_idx = self.model.exog_names.index(variable_idx)
-        elif variable_idx is None:
-            variable_idx = self.interest[0]
-            
-        # Get the index of this variable in the interest list
-        if self.all_variables:
-            i = list(self.interest).index(variable_idx)
-            beta_hat = self.beta_hat[variable_idx]
-        else:
-            i = self.interest.index(variable_idx)
-            beta_hat = self.beta_hat[i]
-            
-        X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
-        m_at_mean = self.nonparam_model.predict(X_mean)[0]
-        m_prime_at_mean = self.nonparam_model.derivative(X_mean, variable_idx)[0]
-        correction = m_prime_at_mean / m_at_mean
-        
-        if self.model.elasticity and self.model.log_x[i]:
-            return beta_hat + correction
-        elif not self.model.elasticity and not self.model.log_x[i]:
-            return beta_hat + correction
-        elif self.model.elasticity and not self.model.log_x[i]:
-            return beta_hat + correction * X_mean[0, variable_idx]
-        else:  # not self.model.elasticity and self.model.log_x[i]
-            return beta_hat + correction / X_mean[0, variable_idx]
+        X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1) 
+        return self.estimate_at_point(X_mean, variable_idx) 
     
     def average_estimate(self, variable_idx=None):
         """Calculate the average estimate for values of regressors.
@@ -1040,9 +1005,13 @@ class DoublyRobustElasticityEstimatorResults(Results):
 
     def estimate_at_point(self, point, variable_idx=None):
         """Calculate the estimator at a specific point."""
-        # Handle variable selection (new parameter)
+        # Handle variable selection
         if variable_idx is None:
             variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
+        
+        # Convert variable name to index if needed
+        if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
         
         # Get proper beta coefficient and position
         if self.all_variables:
@@ -1052,21 +1021,33 @@ class DoublyRobustElasticityEstimatorResults(Results):
             i = self.interest.index(variable_idx) if isinstance(self.interest, list) else 0
             beta_hat = self.beta_hat[i] if hasattr(self.beta_hat, '__getitem__') else self.beta_hat
         
-        m_at_point = self.nonparam_model.predict(point)[0]
-        m_prime_at_point = self.nonparam_model.derivative(point, variable_idx)[0]  # Use variable_idx instead of self.interest
-        correction = m_prime_at_point / m_at_point
-        
-        # Handle log_x indexing properly
-        log_x_val = self.model.log_x[i] if hasattr(self.model.log_x, '__getitem__') else self.model.log_x
-        
-        if self.model.elasticity and log_x_val:
-            return beta_hat + correction
-        elif not self.model.elasticity and not log_x_val:
-            return beta_hat + correction
-        elif self.model.elasticity and not log_x_val:
-            return beta_hat + correction * point[0, variable_idx]
-        else:  # not self.model.elasticity and log_x_val
-            return beta_hat + correction / point[0, variable_idx]
+        if variable_idx in self.model.binary_vars:
+            # For binary variables, use the formula: e^{beta} * (m1/m0) - 1
+            point_0 = point.copy()
+            point_1 = point.copy()
+            point_0[:, variable_idx] = 0
+            point_1[:, variable_idx] = 1
+            m_0 = self.nonparam_model.predict(point_0)[0]
+            m_1 = self.nonparam_model.predict(point_1)[0]
+            
+            return np.exp(beta_hat) * (m_1 / m_0) - 1
+        else:
+            # For continuous variables, use the original logic
+            m_at_point = self.nonparam_model.predict(point)[0]
+            m_prime_at_point = self.nonparam_model.derivative(point, variable_idx)[0]
+            correction = m_prime_at_point / m_at_point
+            
+            # Handle log_x indexing properly
+            log_x_val = self.model.log_x[i] if hasattr(self.model.log_x, '__getitem__') else self.model.log_x
+            
+            if self.model.elasticity and log_x_val:
+                return beta_hat + correction
+            elif not self.model.elasticity and not log_x_val:
+                return beta_hat + correction
+            elif self.model.elasticity and not log_x_val:
+                return beta_hat + correction * point[0, variable_idx]
+            else:  # not self.model.elasticity and log_x_val
+                return beta_hat + correction / point[0, variable_idx]
 
 
     def calculate_estimator_at_points_parallel(self, X_points, variable_idx=None, n_jobs=-1, backend='threading'):
