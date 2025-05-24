@@ -9,6 +9,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import scipy.stats as stats
 import statsmodels.api as sm
+import joblib
+
+
+def _estimate_single_point_worker(args):
+    """Worker function for parallel estimation (must be at module level for pickling)."""
+    x_point, results_obj, variable_idx = args
+    x_point = x_point.reshape(1, -1)
+    return results_obj.estimate_at_point(x_point, variable_idx)
 
 
 class DoublyRobustElasticityEstimator(Model):
@@ -709,11 +717,13 @@ class DoublyRobustElasticityEstimatorResults(Results):
 
                 bootstrap_estimates_dict[var_idx][i, 0] = beta_hat  # OLS estimate
                 bootstrap_estimates_dict[var_idx][i, 1] = np.mean(bs_results.correction[var_idx])  # Average correction
-                # Average estimate
-                original_estimator_values = bs_results.calculate_estimator_at_points(
-                    self.model.exog, var_idx  # Use original X, not bootstrap X
+                # Average estimate 
+                # TODO: make sure the logic here allows non parallel processing too somehow
+                original_estimator_values = bs_results.calculate_estimator_at_points_parallel(
+                    self.model.exog, var_idx, n_jobs=4, backend='threading'
                 )
                 bootstrap_estimates_dict[var_idx][i, 2] = np.mean(original_estimator_values)
+
 
                 bootstrap_estimates_dict[var_idx][i, 3] = bs_results.estimate_at_point(
                     original_X_mean, var_idx  # Use original average, not bootstrap average
@@ -1013,6 +1023,26 @@ class DoublyRobustElasticityEstimatorResults(Results):
         else:  # not self.model.elasticity and log_x_val
             return beta_hat + correction / point[0, variable_idx]
 
+
+    def calculate_estimator_at_points_parallel(self, X_points, variable_idx=None, n_jobs=-1, backend='threading'):
+        """Calculate estimator values with parallel processing (pickle-safe)."""
+        import joblib
+        
+        if backend == 'threading':
+            # Threading avoids pickling issues
+            estimator_values = joblib.Parallel(n_jobs=n_jobs, backend='threading')(
+                joblib.delayed(lambda x: self.estimate_at_point(x.reshape(1, -1), variable_idx))(x_point) 
+                for x_point in X_points
+            )
+        else:
+            # Multiprocessing requires module-level worker function
+            args = [(x_point, self, variable_idx) for x_point in X_points]
+            estimator_values = joblib.Parallel(n_jobs=n_jobs, backend='multiprocessing')(
+                joblib.delayed(_estimate_single_point_worker)(arg) for arg in args
+            )
+        
+        return np.array(estimator_values)
+    
     # Add this new method to the Results class (much cleaner - just calls estimate_at_point):
     def calculate_estimator_at_points(self, X_points, variable_idx=None):
         """Calculate estimator values at specific X points."""
@@ -1236,7 +1266,8 @@ class KernelRegressionModel(RegressionModel):
                 mean, mfx = self.model.fit(X)
             except Exception as e:
                 # Fallback to numerical differentiation if kernel regression fails
-                epsilon = 1e-6
+                print("Falling back to numerical differentiation in kernel regression.")
+                epsilon = 1e-3
                 X_plus = X.copy()
                 X_minus = X.copy()
                 X_plus[:, index] += epsilon
@@ -1250,7 +1281,7 @@ class KernelRegressionModel(RegressionModel):
                     return mfx[index] * self.scaling_factor
                 else:
                     # Fallback to numerical differentiation if mfx format is unexpected
-                    epsilon = 1e-6
+                    epsilon = 1e-3
                     X_plus = X.copy()
                     X_minus = X.copy()
                     X_plus[:, index] += epsilon
@@ -1271,7 +1302,7 @@ class KernelRegressionModel(RegressionModel):
                     return mfx * self.scaling_factor
             else:
                 # Fallback to numerical differentiation as a last resort
-                epsilon = 1e-6
+                epsilon = 1e-3
                 X_plus = X.copy()
                 X_minus = X.copy()
                 X_plus[:, index] += epsilon
@@ -1578,7 +1609,7 @@ class OLSRegressionModel(RegressionModel):
         
         # For continuous variables, use numerical differentiation
         else:
-            epsilon = 1e-6
+            epsilon = 1e-3
             X_plus = X.copy()
             X_minus = X.copy()
             X_plus[:, index] += epsilon
@@ -1598,15 +1629,15 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     
     # Generate some sample data
-    np.random.seed(666999)
-    n = 20000
-    x1 = np.random.normal(0, 1, n)
+    np.random.seed(6699)
+    n = 2000
+    x1 = np.random.normal(5, 1, n)
     #x2 = (np.random.uniform(0, 1, n) > 0.5).astype(int)  # Binary variable
     #x3 = np.random.choice(np.arange(1, 6), n)  # Ordinal variable (1-5)
     
     # Create a log-linear model with heteroskedasticity
     log_y = 0.5 + 1.2 * x1 + \
-        0.5 * np.random.normal(0, 3* x1**2, n)
+        np.random.normal(0, 1 + 0.1 * x1 ** 2 , n)
         # 0.8 * x2 + 0.3 * x3 + 
 
     y = np.exp(log_y)
@@ -1628,6 +1659,12 @@ if __name__ == "__main__":
     ols_mod = sm.OLS(np.log(df['y']), X).fit()
     print("OLS results:")
     print(ols_mod.summary())
+
+
+    # Fit PPML
+    ppml_mod = sm.GLM(df['y'], X, family=sm.families.Poisson()).fit()
+    print("PPML results:")
+    print(ppml_mod.summary())
     
     # Option 1: Fit with a specific variable of interest
     print("\n1. Fitting with a specific variable of interest (x1):")
@@ -1637,10 +1674,10 @@ if __name__ == "__main__":
             #'x2', 'x3'
             ]],
         interest='x1',
-        estimator_type='ols',
+        estimator_type='nn',
         elasticity=False,
         density_estimator='kernel',
-        kernel_params={'degree':4},
+        kernel_params={'degree':2},
     )
     dre_results1 = dre1.fit()
     print(dre_results1.summary())
@@ -1680,13 +1717,13 @@ if __name__ == "__main__":
             #'x2', 'x3'
             ]],
         interest='x1',
-        estimator_type='ols',
+        estimator_type='nn',
         elasticity=False,
         density_estimator='kernel',
-        kernel_params={'bw':'normal_reference'}
+        kernel_params={'bw':'normal_reference', 'degree':2}
     )
     # Reduce bootstrap_reps for this example
-    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=100, bootstrap_method='pairs')
+    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=10, bootstrap_method='pairs')
     print(dre_results4.summary())
     
     # Plot distribution of estimates for a specific variable
