@@ -1585,8 +1585,8 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 bootstrap_estimates_dict[var_idx][i, 0] = beta_hat  # OLS estimate
                 bootstrap_estimates_dict[var_idx][i, 1] = np.mean(bs_results.correction[var_idx])  # Average correction
                 # Average estimate 
-                original_estimator_values = bs_results.calculate_estimator_at_points_parallel(
-                    self.model.exog, var_idx, n_jobs=4, backend='threading'
+                original_estimator_values = bs_results.calculate_estimator_at_points(
+                    self.model.exog, var_idx 
                 )
                 bootstrap_estimates_dict[var_idx][i, 2] = np.mean(original_estimator_values)
 
