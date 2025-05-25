@@ -73,7 +73,6 @@ class DoublyRobustElasticityEstimator(Model):
         """Initialize the doubly robust estimator."""
 
         # Initialize the base Model class
-        super(DoublyRobustElasticityEstimator, self).__init__(endog, exog)
 
         # Store the original data
         self.original_endog = endog
@@ -169,10 +168,12 @@ class DoublyRobustElasticityEstimator(Model):
         
         # Automatically detect variable types
         self._detect_variable_types()
+        super(DoublyRobustElasticityEstimator, self).__init__(self.endog, self.exog)
         
 
     
     def _apply_fixed_effects(self):
+        #TODO: Doesn't work for large datasets, implement with pyhdfe
         """Apply fixed effects transformation to the data."""
         # Extract the fixed effects columns
 
@@ -183,15 +184,15 @@ class DoublyRobustElasticityEstimator(Model):
 
         if fe_cols.ndim == 1:
             fe_cols = fe_cols.reshape(-1, 1)
-        
+
         # Create dummy variables for fixed effects
         one_hot_encoder = OneHotEncoder(sparse_output=False, drop='first')
         dummy_vars = one_hot_encoder.fit_transform(fe_cols)
-        
+
         # Create residual maker matrix
         residual_maker = np.eye(len(dummy_vars)) - dummy_vars @ np.linalg.pinv(
             np.transpose(dummy_vars) @ dummy_vars) @ np.transpose(dummy_vars)
-        
+
         # Apply demeaning to both X and y
         if isinstance(self.original_endog, pd.Series) or isinstance(self.original_endog, pd.DataFrame):
             endog_to_use = np.log(self.original_endog.copy().values.reshape(-1, 1))
@@ -205,16 +206,16 @@ class DoublyRobustElasticityEstimator(Model):
 
         combined = np.column_stack([exog_to_use, endog_to_use])
         demeaned = residual_maker @ combined
-        
+
         # Update X and y with demeaned values
         self.exog = np.delete(demeaned[:, :-1], self.fe_indices, axis=1)
         self.endog = np.exp(demeaned[:, -1])
-        
+
         # Update exog_names to remove fixed effect variables
         if hasattr(self, '_exog_names'):
-            self._exog_names = [name for i, name in enumerate(self._exog_names) 
+            self._exog_names = [name for i, name in enumerate(self._exog_names)
                               if i not in self.fe_indices]
-        
+
         # Update interest index if needed
         if hasattr(self, 'interest') and isinstance(self.interest, int):
             # Adjust interest index after removing fixed effect columns
@@ -223,9 +224,9 @@ class DoublyRobustElasticityEstimator(Model):
                 if fe_idx < self.interest:
                     adjusted_index -= 1
             self.interest = adjusted_index
-        
+
         print('Fixed effects applied. Variables have been demeaned.')
-        
+
     def _detect_variable_types(self):
         """Detect binary and ordinal variables in the regressor matrix."""
         n_unique = np.array([len(np.unique(self.exog[:, i])) for i in range(self.exog.shape[1])])
