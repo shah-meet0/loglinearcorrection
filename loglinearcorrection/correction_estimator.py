@@ -91,24 +91,7 @@ class DoublyRobustElasticityEstimator(Model):
             exog = exog.values
         else:
             self._exog_names = [f'x{i}' for i in range(exog.shape[1])]
-        
-        # Process fixed effects if provided
-        if fe is not None:
-            if isinstance(fe, list):
-                if isinstance(fe[0], str):
-                    self.fe_indices = self.original_exog.columns.get_indexer(['rail', 'distid'])
-                else:
-                    self.fe_indices = fe
-            if isinstance(fe, int):
-                self.fe_indices = [fe]
-            if isinstance(fe, str):
-                self.fe_indices = [self.original_exog.columns.get_loc(fe)]
-            self._apply_fixed_effects()
-        else:
-            # If no fixed effects, just use the original data
-            self.endog = endog
-            self.exog = exog
-        
+
         # Process interest variable(s)
         if interest is None:
             # If no specific interest variable, all variables are of interest
@@ -130,6 +113,25 @@ class DoublyRobustElasticityEstimator(Model):
                 self.interest = [self._exog_names.index(interest)]
             else:
                 self.interest = [interest]
+        
+        # Process fixed effects if provided
+        if fe is not None:
+            if isinstance(fe, list):
+                if isinstance(fe[0], str):
+                    self.fe_indices = self.original_exog.columns.get_indexer(fe)
+                else:
+                    self.fe_indices = fe
+            if isinstance(fe, int):
+                self.fe_indices = [fe]
+            if isinstance(fe, str):
+                self.fe_indices = [self.original_exog.columns.get_loc(fe)]
+            self._apply_fixed_effects()
+        else:
+            # If no fixed effects, just use the original data
+            self.endog = endog
+            self.exog = exog
+        
+
             
         # Process log_x
         if isinstance(log_x, (list, tuple, np.ndarray)):
@@ -172,8 +174,14 @@ class DoublyRobustElasticityEstimator(Model):
 
     
     def _apply_fixed_effects(self):
-        #TODO: Doesn't work for large datasets, implement with pyhdfe
+        #TODO: Adjust ols se for dof adjustment, make clear that intercept needs to be included in matrix,or detect intercept as new method
         """Apply fixed effects transformation to the data."""
+
+        try:
+            import pyhdfe
+        except ImportError:
+            raise ImportError("pyhdfe is required for fixed effects estimation. "
+                             "Please install pyhdfe package.")
         # Extract the fixed effects columns
 
         if isinstance(self.original_exog, pd.DataFrame):
@@ -184,13 +192,9 @@ class DoublyRobustElasticityEstimator(Model):
         if fe_cols.ndim == 1:
             fe_cols = fe_cols.reshape(-1, 1)
 
-        # Create dummy variables for fixed effects
-        one_hot_encoder = OneHotEncoder(sparse_output=False, drop='first')
-        dummy_vars = one_hot_encoder.fit_transform(fe_cols)
+        # Create pyhdfe algorithm
+        fe_algorithm = pyhdfe.create(fe_cols)
 
-        # Create residual maker matrix
-        residual_maker = np.eye(len(dummy_vars)) - dummy_vars @ np.linalg.pinv(
-            np.transpose(dummy_vars) @ dummy_vars) @ np.transpose(dummy_vars)
 
         # Apply demeaning to both X and y
         if isinstance(self.original_endog, pd.Series) or isinstance(self.original_endog, pd.DataFrame):
@@ -203,26 +207,65 @@ class DoublyRobustElasticityEstimator(Model):
         else:
             exog_to_use = self.original_exog.copy()
 
+        exog_to_use = np.delete(exog_to_use, self.fe_indices, axis=1).astype(np.float64)  # Remove fixed effect columns
         combined = np.column_stack([exog_to_use, endog_to_use])
-        demeaned = residual_maker @ combined
+        demeaned = fe_algorithm.residualize(combined)
 
         # Update X and y with demeaned values
-        self.exog = np.delete(demeaned[:, :-1], self.fe_indices, axis=1)
         self.endog = np.exp(demeaned[:, -1])
+
+        exog = demeaned[:, :-1]  # All columns except the last one
+
+        # Check if any exog is all 0:
+        zero_cols = np.where(np.all(np.abs(exog) < 1e-6, axis=0))[0]
+
+        self.exog = np.delete(exog, zero_cols, axis=1)
+
+        if len(self.endog) < len(self.original_endog):
+            # TODO: maybe account for this explicitly? tell which groups were singleton?
+            print('Some singleton observations dropped. \n'
+                  'Please ensure all singleton groups removed prior to estimation if using weights.')
+
 
         # Update exog_names to remove fixed effect variables
         if hasattr(self, '_exog_names'):
-            self._exog_names = [name for i, name in enumerate(self._exog_names)
-                              if i not in self.fe_indices]
+            _exog_names_no_fe = []
+            for i, name in enumerate(self._exog_names):
+                if i not in self.fe_indices:
+                    _exog_names_no_fe.append(name)
+                else:
+                    print(f"Removing fixed effect variable: {name}")
+
+            _exog_names = []
+            for i, name in enumerate(_exog_names_no_fe):
+                if i not in zero_cols:
+                    _exog_names.append(name)
+                else:
+                    print(f"Removing redundant column variable: {name}")
+
+            self._exog_names = np.array(_exog_names)
 
         # Update interest index if needed
-        if hasattr(self, 'interest') and isinstance(self.interest, int):
-            # Adjust interest index after removing fixed effect columns
-            adjusted_index = self.interest
-            for fe_idx in sorted(self.fe_indices):
-                if fe_idx < self.interest:
-                    adjusted_index -= 1
-            self.interest = adjusted_index
+        if hasattr(self, 'interest'):
+            if len(self.interest) == 1:
+                # Adjust interest index after removing fixed effect columns
+                adjusted_index = self.interest[0]
+                for idx in sorted(self.fe_indices):
+                    if idx < self.interest[0]:
+                        adjusted_index -= 1
+
+                readjusted_index = adjusted_index
+
+                for idx in sorted(zero_cols):
+                    if idx < readjusted_index:
+                        adjusted_index -= 1
+
+                print('Adjusting interest index from', self.interest[0], 'to', adjusted_index)
+                self.interest = [adjusted_index]
+            else:
+                raise NotImplementedError('Fixed effects not implemented for multiple variables of interest')
+
+
 
         print('Fixed effects applied. Variables have been demeaned.')
 

@@ -15,7 +15,7 @@ df = df.dropna()
 print(len(df))
 
 # Extract the columns you want initially
-X_new = df[['RAIL', 'distid', 'year']]
+X_new = df[['distid','RAIL',  'year']]
 
 # Create dummy variables for 'division' and convert to integers
 dist_dummies = pd.get_dummies(X_new['distid'], prefix='distid', drop_first=True).astype(int)
@@ -80,8 +80,8 @@ print(x)
 # X needs to include intercept if needed
 # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
 
-model = DoublyRobustElasticityEstimator(yexp, X_new, estimator_type='nn', interest=0, fe=[1,2])
-res = model.fit()
+model = DoublyRobustElasticityEstimator(yexp, X_new, estimator_type='nn', interest=1, fe=[0,2])
+res = model.fit(compute_asymptotic_variance=False)
 
 res.summary()
 print(res.test_ppml())
