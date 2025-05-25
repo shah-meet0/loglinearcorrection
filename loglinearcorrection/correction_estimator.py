@@ -2118,7 +2118,7 @@ class NNRegressionModel(RegressionModel):
         self.mean = mean
         self.std = std
         self.scaling_factor = scaling_factor
-        self.bandwidth = 0.1  # Placeholder, not actually used
+        self.bandwidth = None  # Note: this is used in the asymptotic variance calculation - defaults to Silverman rule. MUST FIX TODO
         
         # Import tensorflow only when needed
         import tensorflow as tf
@@ -2328,8 +2328,9 @@ class OLSRegressionModel(RegressionModel):
         # Return predictions scaled back to original scale
         return self.model.predict(X_poly) * self.scaling_factor
     
+
     def derivative(self, X, index):
-        """Calculate the derivative of m(x) with respect to a specific regressor."""
+        """Calculate the derivative of m(x) with respect to a specific regressor using analytical derivatives."""
         # For binary variables, use difference instead of derivative
         if index in self.binary_vars:
             X_0 = X.copy()
@@ -2384,15 +2385,52 @@ class OLSRegressionModel(RegressionModel):
                     derivatives[i] = self.derivative(x_i, index)[0]
                 return derivatives
         
-        # For continuous variables, use numerical differentiation
+        # For continuous variables, use analytical derivative of the polynomial
         else:
-            epsilon = 1e-3
-            X_plus = X.copy()
-            X_minus = X.copy()
-            X_plus[:, index] += epsilon
-            X_minus[:, index] -= epsilon
-            return (self.predict(X_plus) - self.predict(X_minus)) / (2 * epsilon)
-
+            # Ensure X is 2D
+            if X.ndim == 1:
+                X = X.reshape(1, -1)
+            
+            # Get the polynomial powers matrix and model coefficients
+            powers = self.poly.powers_  # Shape: (n_features, n_input_features)
+            coeffs = self.model.params  # Shape: (n_features,)
+            
+            # Initialize derivative values
+            derivatives = np.zeros(X.shape[0])
+            
+            # Loop through each polynomial feature and compute its derivative
+            for i, power_vec in enumerate(powers):
+                # Get the power of the variable of interest in this feature
+                power_of_interest = power_vec[index]
+                
+                # If the power is 0, this feature doesn't depend on the variable of interest
+                # so its derivative is 0
+                if power_of_interest == 0:
+                    continue
+                    
+                # Calculate the derivative coefficient for this feature
+                # d/dx_j [c * x_j^k * other_terms] = c * k * x_j^(k-1) * other_terms
+                deriv_coeff = power_of_interest * coeffs[i]
+                
+                # Calculate the value of this derivative term at each X point
+                feature_deriv = deriv_coeff * np.ones(X.shape[0])
+                
+                # Multiply by the appropriate powers of all variables
+                for j, power in enumerate(power_vec):
+                    if j == index:
+                        # For the variable of interest, use power - 1
+                        if power > 1:
+                            feature_deriv *= X[:, j] ** (power - 1)
+                        # If power == 1, x^(1-1) = x^0 = 1, so no multiplication needed
+                    else:
+                        # For other variables, use the original power
+                        if power > 0:
+                            feature_deriv *= X[:, j] ** power
+                
+                derivatives += feature_deriv
+            
+            # Scale back to original scale (same as in predict method)
+            return derivatives * self.scaling_factor
 
 
 class NNConditionalVarianceModel:
@@ -2500,17 +2538,24 @@ if __name__ == "__main__":
     
     # Generate some sample data
     np.random.seed(6699)
-    n = 200
+    n = 20000
     x1 = np.random.normal(5, 1, n)
     #x2 = (np.random.uniform(0, 1, n) > 0.5).astype(int)  # Binary variable
     #x3 = np.random.choice(np.arange(1, 6), n)  # Ordinal variable (1-5)
     
     # Create a log-linear model with heteroskedasticity
-    log_y = 0.5 + 1.2 * x1 + \
-        np.random.normal(0, 1 + 0.1 * x1 ** 2 , n)
+    #log_y = 0.5 + 1.2 * x1 + \
+    #    np.random.normal(0, 1 + 0.1 * x1 ** 2 , n)
         # 0.8 * x2 + 0.3 * x3 + 
 
-    y = np.exp(log_y)
+    #y = np.exp(log_y)
+
+
+    # Create an exponential model
+
+    y = np.exp(
+        0.5 + 1.2 * x1
+    ) * np.random.uniform(0.5,1.5,n)
     
     # Create a DataFrame
     df = pd.DataFrame({
@@ -2526,13 +2571,13 @@ if __name__ == "__main__":
         'x1', 
         #'x2', 'x3'
     ]])
-    ols_mod = sm.OLS(np.log(df['y']), X).fit()
+    ols_mod = sm.OLS(np.log(df['y']), X).fit(cov_type='HC3')
     print("OLS results:")
     print(ols_mod.summary())
 
 
     # Fit PPML
-    ppml_mod = sm.GLM(df['y'], X, family=sm.families.Poisson()).fit()
+    ppml_mod = sm.GLM(df['y'], X, family=sm.families.Poisson()).fit(cov_type='HC3')
     print("PPML results:")
     print(ppml_mod.summary())
     
@@ -2544,9 +2589,9 @@ if __name__ == "__main__":
             #'x2', 'x3'
             ]],
         interest='x1',
-        estimator_type='nn',
+        estimator_type='ols',
         elasticity=False,
-        density_estimator='kernel',
+        density_estimator='nn',
         kernel_params={'degree':2},
     )
     dre_results1 = dre1.fit()
@@ -2587,13 +2632,13 @@ if __name__ == "__main__":
             #'x2', 'x3'
             ]],
         interest='x1',
-        estimator_type='nn',
+        estimator_type='ols',
         elasticity=False,
-        density_estimator='kernel',
+        density_estimator='nn',
         kernel_params={'bw':'normal_reference', 'degree':2}
     )
     # Reduce bootstrap_reps for this example
-    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=10, bootstrap_method='pairs')
+    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=100, bootstrap_method='pairs')
     print(dre_results4.summary())
     
     # Plot distribution of estimates for a specific variable
