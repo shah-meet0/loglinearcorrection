@@ -261,7 +261,7 @@ class DoublyRobustElasticityEstimator(Model):
         return self._endog_name
         
     def fit(self, weights=None, method='ols', bootstrap=False, bootstrap_reps=500, 
-        bootstrap_method='pairs', **kwargs):
+        bootstrap_method='pairs', compute_asymptotic_variance=None, **kwargs):
         """Fit the doubly robust estimator.
         
         Parameters
@@ -277,6 +277,9 @@ class DoublyRobustElasticityEstimator(Model):
         bootstrap_method : str, optional
             Bootstrap method to use, either 'pairs' (resample observation pairs) or 
             'residuals' (resample residuals), defaults to 'pairs'
+        compute_asymptotic_variance : bool, optional
+            Whether to compute asymptotic variance. If None, defaults to True when 
+            bootstrap=False and False when bootstrap=True
         **kwargs : dict
             Additional arguments to pass to the OLS fit method
             
@@ -287,6 +290,10 @@ class DoublyRobustElasticityEstimator(Model):
         """
 
         kwargs.setdefault("cov_type", 'HC3')
+        
+        # Set default for asymptotic variance computation
+        if compute_asymptotic_variance is None:
+            compute_asymptotic_variance = not bootstrap
 
         # Step 1: Fit the parametric model (OLS)
         if method == 'ols':
@@ -339,11 +346,12 @@ class DoublyRobustElasticityEstimator(Model):
             raise ValueError(f"Estimator type '{self.estimator_type}' not supported. "
                             f"Use 'kernel', 'nn', 'ols', or 'binary'.")
         
-        # Step 4: Fit the density estimator if using neural network density estimation
-        if self.density_estimator == 'nn':
+        # Step 4: Fit the density estimator if needed for asymptotic variance
+        density_model = None
+        if compute_asymptotic_variance and self.density_estimator == 'nn':
+            print('Fitting neural network density estimator...')
             density_model = self._fit_nn_density_estimator(self.exog)
-        else:
-            density_model = None
+            print('Neural network density estimator fitted')
             
         print('Correction term estimated')
         
@@ -353,7 +361,8 @@ class DoublyRobustElasticityEstimator(Model):
             ols_results=ols_results,
             nonparam_model=nonparam_model,
             exp_residuals=exp_residuals,
-            density_model=density_model
+            density_model=density_model,
+            compute_asymptotic_variance=compute_asymptotic_variance
         )
         
         # Step 6: Compute bootstrap standard errors if requested
@@ -544,6 +553,21 @@ class DoublyRobustElasticityEstimator(Model):
         
         return model
 
+    def _fit_nn_density_estimator(self, X):
+        """Fit neural network density estimator for f_X(x).
+        
+        Parameters
+        ----------
+        X : array_like of shape (n, d)
+            Data for density estimation
+            
+        Returns
+        -------
+        NNDensityEstimator
+            Fitted neural network density estimator
+        """
+        return NNDensityEstimator(X, **self.density_params)
+
 
 import numpy as np
 import pandas as pd
@@ -561,11 +585,11 @@ import joblib
 
 class DoublyRobustElasticityEstimatorResults(Results):
     """
-    Results from the DoublyRobustElasticityEstimator with corrected asymptotic variance.
+    Results from the DoublyRobustElasticityEstimator with optional asymptotic variance.
     
     This class stores and presents results from the doubly robust elasticity estimator,
     providing methods to access various statistics, visualizations, and tests with
-    properly implemented multivariate asymptotic variance calculations.
+    properly implemented multivariate asymptotic variance calculations when requested.
     
     Parameters
     ----------
@@ -577,8 +601,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
         The fitted nonparametric model
     exp_residuals : array_like
         Exponentiated residuals from the parametric model
-    density_model : NNDensityModel or None, optional
+    density_model : NNDensityEstimator or None, optional
         The fitted density model for high-dimensional X
+    compute_asymptotic_variance : bool, optional
+        Whether to compute asymptotic variance components. Defaults to True.
     bootstrap : bool, optional
         Whether bootstrap standard errors have been computed
     bootstrap_reps : int, optional
@@ -610,15 +636,18 @@ class DoublyRobustElasticityEstimatorResults(Results):
         Correction terms for each variable
     estimator_values : dict
         Final estimator values for each variable
-    kernel_constants : dict
-        Computed kernel constants for asymptotic variance
+    compute_asymptotic_variance : bool
+        Whether asymptotic variance components are computed
+    kernel_constants : dict or None
+        Computed kernel constants for asymptotic variance (if computed)
     """
     
     def __init__(self, model, ols_results, nonparam_model, exp_residuals, 
-                 density_model=None, bootstrap=False, bootstrap_reps=None, 
+                 density_model=None, compute_asymptotic_variance=True, 
+                 bootstrap=False, bootstrap_reps=None, 
                  bootstrap_estimates=None, kernel_type='gaussian', 
                  density_bandwidth_method='scott'):
-        """Initialize the results object with corrected asymptotic variance capabilities."""
+        """Initialize the results object with optional asymptotic variance capabilities."""
         self.model = model
         self.ols_results = ols_results
         self.nonparam_model = nonparam_model
@@ -626,6 +655,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
         self.interest = model.interest
         self.all_variables = model.all_variables
         self.density_model = density_model
+        self.compute_asymptotic_variance = compute_asymptotic_variance
         
         # Asymptotic variance parameters
         self.kernel_type = kernel_type.lower()
@@ -646,8 +676,12 @@ class DoublyRobustElasticityEstimatorResults(Results):
         else:
             self.beta_hat = [ols_results.params[idx] for idx in self.interest]
         
-        # Initialize asymptotic variance components
-        self._initialize_asymptotic_variance()
+        # Initialize asymptotic variance components only if requested
+        if self.compute_asymptotic_variance:
+            self._initialize_asymptotic_variance()
+        else:
+            self.kernel_constants = None
+            self._conditional_variance_model = None
         
         # Compute correction terms for all data points
         self._compute_corrections()
@@ -753,7 +787,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
             self._conditional_variance_model = sm.OLS(exp_residuals_squared, X_poly).fit()
             
         elif self.model.estimator_type == 'nn':
-            # NEW: Proper neural network conditional variance estimation
+            # Use unified neural network density estimator for conditional variance
             print("Fitting neural network for conditional variance estimation...")
             self._conditional_variance_model = self._fit_nn_conditional_variance_model()
             print("Neural network conditional variance model fitted successfully!")
@@ -772,219 +806,51 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 bw='cv_ls'
             )
 
-
-
     def _fit_nn_conditional_variance_model(self):
         """
-        Fit neural network model for conditional variance estimation.
-        
-        This method fits a dedicated neural network to estimate E[w²|X] where w = e^u,
-        using similar architecture to the main neural network but optimized for variance.
+        Fit neural network model for conditional variance estimation using unified estimator.
         
         Returns
         -------
-        NNConditionalVarianceModel
+        NNDensityEstimator
             Fitted neural network model for conditional variance estimation
             
         Notes
         -----
-        The architecture is slightly simplified compared to the main model since
-        variance estimation is often less complex than mean estimation. Includes
-        regularization and early stopping to prevent overfitting.
+        This method uses the unified NNDensityEstimator class for conditional variance,
+        ensuring consistency with the main density estimation approach.
         """
-        try:
-            import tensorflow as tf
-        except ImportError:
-            raise ImportError("TensorFlow is required for neural network estimator. "
-                             "Please install tensorflow package.")
-        
         # Get squared exponentiated residuals
         exp_residuals_squared = self.exp_residuals ** 2
         
         # Use same neural network parameters as main model, with some adjustments
-        nn_params = dict(self.model.nn_params)  # Create a copy
-        
-        # Default parameters specifically for conditional variance estimation
-        nn_params.setdefault('num_layers', 3)
-        nn_params.setdefault('activation', 'relu')  
-        nn_params.setdefault('num_units', 64)
-        nn_params.setdefault('optimizer', 'adam')
-        nn_params.setdefault('loss', 'mean_squared_error')
-        nn_params.setdefault('validation_split', 0.2)
-        nn_params.setdefault('batch_size', 64)
-        nn_params.setdefault('epochs', 100)
-        nn_params.setdefault('patience', 10)
-        nn_params.setdefault('verbose', 0)  # Less verbose for conditional variance
+        density_params = dict(self.model.density_params)  # Create a copy
         
         # Reduce complexity slightly for variance estimation (often less complex than mean)
-        if isinstance(nn_params['num_units'], list):
+        if 'hidden_layers' in density_params:
             # Reduce each layer size by ~25%
-            nn_params['num_units'] = [max(16, int(0.75 * units)) for units in nn_params['num_units']]
-        else:
-            nn_params['num_units'] = max(16, int(0.75 * nn_params['num_units']))
+            density_params['hidden_layers'] = [max(16, int(0.75 * units)) 
+                                              for units in density_params['hidden_layers']]
         
-        # Create the neural network model for conditional variance
-        variance_model = self._create_nn_variance_model(nn_params)
+        # Set target variable to squared residuals
+        density_params['target_type'] = 'conditional_variance'
+        density_params.setdefault('verbose', 0)  # Less verbose for conditional variance
         
-        # Normalize squared exponentiated residuals for numerical stability
-        min_exp_residual_sq = np.min(exp_residuals_squared)
-        if min_exp_residual_sq <= 0:
-            min_exp_residual_sq = 1e-10  # Prevent division by zero
-            
-        normalized_exp_residuals_sq = exp_residuals_squared / min_exp_residual_sq
-        
-        # Further standardize to prevent explosion in neural network training
-        residuals_mean = np.mean(normalized_exp_residuals_sq)
-        residuals_std = np.std(normalized_exp_residuals_sq)
-        
-        # Prevent division by zero
-        if residuals_std < 1e-8:
-            residuals_std = 1.0
-            warnings.warn("Very low variance in squared residuals. Check for homoskedasticity.")
-        
-        scaled_residuals_sq = (normalized_exp_residuals_sq - residuals_mean) / residuals_std
-        
-        # Prepare the inputs
-        X_nn = self.model.exog.copy()
-        
-        # Convert to tensors
-        X_tensor = tf.convert_to_tensor(X_nn, dtype=tf.float32)
-        y_tensor = tf.convert_to_tensor(scaled_residuals_sq, dtype=tf.float32)
-        
-        # Set up callbacks for robust training
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=nn_params['patience'],
-                restore_best_weights=True,
-                verbose=0
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.5,
-                patience=max(5, nn_params['patience'] // 2),
-                min_lr=1e-6,
-                verbose=0
-            )
-        ]
-        
-        # Fit the model with error handling
         try:
-            history = variance_model.fit(
-                x=X_tensor,
-                y=y_tensor,
-                validation_split=nn_params['validation_split'],
-                batch_size=nn_params['batch_size'],
-                epochs=nn_params['epochs'],
-                callbacks=callbacks,
-                verbose=nn_params['verbose']
+            # Create neural network density estimator for conditional variance
+            nn_estimator = NNDensityEstimator(
+                X=self.model.exog,
+                y=exp_residuals_squared,
+                **density_params
             )
             
-            # Check if training was successful
-            final_loss = history.history['loss'][-1]
-            if np.isnan(final_loss) or np.isinf(final_loss):
-                raise ValueError("Neural network training failed - loss is NaN or infinite")
-                
-            # Check for reasonable convergence
-            if len(history.history['loss']) < 5:
-                warnings.warn("Neural network training stopped very early. Results may be unreliable.")
-                
+            return nn_estimator
+            
         except Exception as e:
             warnings.warn(f"Neural network conditional variance training failed: {e}. "
                          f"Falling back to kernel method.")
             # Fall back to kernel method
             return self._fit_kernel_conditional_variance_fallback()
-        
-        # Create and return the NNConditionalVarianceModel
-        # Account for the scaling factor from the original model
-        scaling_factor = min_exp_residual_sq
-        
-        return NNConditionalVarianceModel(
-            model=variance_model,
-            mean=residuals_mean,
-            std=residuals_std, 
-            scaling_factor=scaling_factor,
-            binary_vars=self.model.binary_vars,
-            ordinal_vars=self.model.ordinal_vars
-        )
-
-
-    def _create_nn_variance_model(self, nn_params):
-        """
-        Create a neural network model optimized for conditional variance estimation.
-        
-        Parameters
-        ----------
-        nn_params : dict
-            Neural network parameters
-            
-        Returns
-        -------
-        tensorflow.keras.Model
-            Compiled neural network model for variance estimation
-            
-        Notes
-        -----
-        The architecture includes regularization and dropout to prevent overfitting,
-        which is particularly important for variance estimation where the signal
-        may be weaker than for mean estimation.
-        """
-        import tensorflow as tf
-        
-        num_layers = nn_params['num_layers']
-        activation = nn_params['activation']
-        num_units = nn_params['num_units']
-        optimizer = nn_params['optimizer']
-        loss = nn_params['loss']
-        
-        # Handle num_units as either int or list
-        if isinstance(num_units, int):
-            num_units = [num_units] * num_layers
-        elif len(num_units) != num_layers:
-            raise ValueError("num_units must be an int or a list of length num_layers")
-        
-        # Create the model with appropriate architecture for variance estimation
-        model = tf.keras.Sequential()
-        model.add(tf.keras.layers.Input(shape=(self.model.exog.shape[1],)))
-        
-        # Add hidden layers with regularization
-        for i in range(num_layers):
-            model.add(tf.keras.layers.Dense(
-                num_units[i], 
-                activation=activation,
-                kernel_regularizer=tf.keras.regularizers.l2(1e-4),
-                kernel_initializer='he_normal'  # Good for ReLU activations
-            ))
-            
-            # Add batch normalization for training stability
-            model.add(tf.keras.layers.BatchNormalization())
-            
-            # Add dropout for regularization (except last hidden layer)
-            if i < num_layers - 1:
-                model.add(tf.keras.layers.Dropout(0.1))
-        
-        # Output layer - no activation since variance can be any positive value
-        # We'll enforce non-negativity in the conditional variance calculation
-        model.add(tf.keras.layers.Dense(1, kernel_initializer='glorot_uniform'))
-        
-        # Compile the model with appropriate settings for variance estimation
-        if optimizer == 'adam':
-            opt = tf.keras.optimizers.Adam(
-                learning_rate=0.001, 
-                clipnorm=1.0,  # Gradient clipping for stability
-                beta_1=0.9,
-                beta_2=0.999
-            )
-        else:
-            opt = optimizer
-            
-        model.compile(
-            optimizer=opt, 
-            loss=loss, 
-            metrics=['mae', 'mse']
-        )
-        
-        return model
 
     def _fit_kernel_conditional_variance_fallback(self):
         """
@@ -1015,7 +881,6 @@ class DoublyRobustElasticityEstimatorResults(Results):
             bw='cv_ls'
         )
 
-    
     def _estimate_conditional_variance(self, x):
         """
         Estimate conditional variance σ²_w(x) = Var(e^u|X=x) at point x.
@@ -1030,6 +895,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
         float
             Estimated conditional variance σ²_w(x)
         """
+        if not self.compute_asymptotic_variance:
+            raise ValueError("Asymptotic variance computation is disabled. "
+                           "Set compute_asymptotic_variance=True to enable.")
+        
         x = np.atleast_2d(x)
         if x.shape[0] != 1:
             raise ValueError("x must be a single point of shape (1, d)")
@@ -1038,135 +907,9 @@ class DoublyRobustElasticityEstimatorResults(Results):
         if self.model.estimator_type == 'ols' and hasattr(self, '_poly_variance'):
             x_poly = self._poly_variance.transform(x)
             m_w2_x = self._conditional_variance_model.predict(x_poly)[0]
-        else:
-            m_w2_x = self._conditional_variance_model.fit(x)[0][0]
-        
-        # Get E[w|X=x] = m(x)
-        m_x = self.nonparam_model.predict(x)[0]
-        
-        # Compute conditional variance with non-negativity constraint
-        conditional_var = max(0.0, m_w2_x - m_x**2)
-        
-        return conditional_var
-
-
-
-    def _estimate_conditional_variance_nn(self, x):
-        """
-        Estimate conditional variance using neural network models.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d)
-            Point at which to evaluate conditional variance
-            
-        Returns
-        -------
-        float
-            Estimated conditional variance σ²_w(x)
-            
-        Notes
-        -----
-        Uses the dedicated neural network model for E[w²|X] and combines it
-        with the main model's E[w|X] to compute the conditional variance.
-        """
-        # Check if we have a neural network conditional variance model
-        if hasattr(self._conditional_variance_model, 'fit'):
-            # Neural network case
-            try:
-                # Get E[w²|X=x] from the NN variance model
-                m_w2_x = self._conditional_variance_model.fit(x)[0]
-                
-                # Get E[w|X=x] = m(x) from the main model
-                m_x = self.nonparam_model.predict(x)[0]
-                
-                # Compute conditional variance: Var(w|X=x) = E[w²|X=x] - (E[w|X=x])²
-                conditional_var = m_w2_x - m_x**2
-                
-                # Ensure non-negativity (numerical precision issues can cause small negative values)
-                conditional_var = max(0.0, conditional_var)
-                
-                # Additional sanity check
-                if conditional_var > 1000 * np.var(self.exp_residuals):
-                    warnings.warn("Conditional variance estimate seems unusually large. "
-                                 "Check neural network training.")
-                    # Fall back to a reasonable value
-                    conditional_var = min(conditional_var, 10 * np.var(self.exp_residuals))
-                
-                return conditional_var
-                
-            except Exception as e:
-                warnings.warn(f"Neural network conditional variance prediction failed: {e}. "
-                             f"Using fallback method.")
-                # Fall back to kernel method if NN prediction fails
-                return self._estimate_conditional_variance_kernel_fallback(x)
-        else:
-            # Fallback if model doesn't have NN interface
-            return self._estimate_conditional_variance_kernel_fallback(x)
-
-
-    def _estimate_conditional_variance_kernel_fallback(self, x):
-        """
-        Fallback conditional variance estimation using kernel methods.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d)
-            Point at which to evaluate conditional variance
-            
-        Returns
-        -------
-        float
-            Estimated conditional variance using kernel fallback
-            
-        Notes
-        -----
-        This method provides a robust fallback when neural network prediction
-        fails or produces unreasonable results.
-        """
-        # Use kernel regression as fallback
-        exp_residuals_squared = self.exp_residuals ** 2
-        
-        from statsmodels.nonparametric.kernel_regression import KernelReg
-        var_type = 'c' * self.n_vars
-        
-        kernel_var_model = KernelReg(
-            endog=exp_residuals_squared,  
-            exog=self.model.exog,
-            var_type=var_type,
-            reg_type='ll',
-            bw='cv_ls'
-        )
-        
-        m_w2_x = kernel_var_model.fit(x)[0][0]
-        m_x = self.nonparam_model.predict(x)[0]
-        
-        return max(0.0, m_w2_x - m_x**2)
-
-
-    def _estimate_conditional_variance_original(self, x):
-        """
-        Original conditional variance estimation method for non-NN cases.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d)
-            Point at which to evaluate conditional variance
-            
-        Returns
-        -------
-        float
-            Estimated conditional variance using the original method
-            
-        Notes
-        -----
-        This method handles kernel, OLS, and other non-neural network estimators
-        using the appropriate fitted conditional variance models.
-        """
-        # Get E[w²|X=x] using the appropriate method
-        if self.model.estimator_type == 'ols' and hasattr(self, '_poly_variance'):
-            x_poly = self._poly_variance.transform(x)
-            m_w2_x = self._conditional_variance_model.predict(x_poly)[0]
+        elif hasattr(self._conditional_variance_model, 'predict_density'):
+            # Neural network case using unified estimator
+            m_w2_x = self._conditional_variance_model.predict_density(x)[0]
         else:
             # Kernel or other methods
             m_w2_x = self._conditional_variance_model.fit(x)[0][0]
@@ -1179,10 +922,9 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
         return conditional_var
 
-    
     def _estimate_density(self, x):
         """
-        Estimate density f_X(x) at point x using kernel density estimation.
+        Estimate density f_X(x) at point x using the appropriate density estimator.
         
         Parameters
         ----------
@@ -1194,19 +936,27 @@ class DoublyRobustElasticityEstimatorResults(Results):
         float
             Estimated density f_X(x)
         """
+        if not self.compute_asymptotic_variance:
+            raise ValueError("Asymptotic variance computation is disabled. "
+                           "Set compute_asymptotic_variance=True to enable.")
+        
         x = np.atleast_2d(x)
         
-        # Set up KDE parameters
-        var_type = 'c' * self.n_vars
-        
-        # Create KDE object
-        kde = KDEMultivariate(
-            data=self.model.exog,
-            var_type=var_type,
-            bw=self.density_bandwidth_method
-        )
-        
-        return kde.pdf(x.flatten())
+        if self.density_model is not None:
+            # Use neural network density estimator
+            return self.density_model.predict_density(x)[0]
+        else:
+            # Use kernel density estimation
+            var_type = 'c' * self.n_vars
+            
+            # Create KDE object
+            kde = KDEMultivariate(
+                data=self.model.exog,
+                var_type=var_type,
+                bw=self.density_bandwidth_method
+            )
+            
+            return kde.pdf(x.flatten())
     
     def _get_bandwidth(self):
         """
@@ -1312,6 +1062,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
             \\widehat{AVar}(\\hat{z}(x)) = \\frac{\\hat{\\sigma}_w^2(x)}{N \\hat{f}_X(x) h^{d+2} \\hat{m}(x)^4} 
             \\left[ \\hat{m}(x)^2 \\mathcal{K}_1 + h^2 \\nabla \\hat{m}(x)(\\nabla \\hat{m}(x))^T \\mathcal{K}_0 \\right]
         """
+        if not self.compute_asymptotic_variance:
+            raise ValueError("Asymptotic variance computation is disabled. "
+                           "Set compute_asymptotic_variance=True to enable.")
+        
         x = np.atleast_2d(x)
         if x.shape[0] != 1:
             raise ValueError("x must be a single point of shape (1, d)")
@@ -1363,6 +1117,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
         float
             Asymptotic variance AVar(ẑⱼ(x)) for variable j
         """
+        if not self.compute_asymptotic_variance:
+            raise ValueError("Asymptotic variance computation is disabled. "
+                           "Set compute_asymptotic_variance=True to enable.")
+        
         # Handle variable selection
         if variable_idx is None:
             variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
@@ -1487,7 +1245,11 @@ class DoublyRobustElasticityEstimatorResults(Results):
         float
             Standard error at average X values
         """
-        return self.asymptotic_standard_error_at_average(variable_idx)
+        if self.compute_asymptotic_variance:
+            return self.asymptotic_standard_error_at_average(variable_idx)
+        else:
+            raise ValueError("Standard error computation requires asymptotic variance. "
+                           "Set compute_asymptotic_variance=True or use bootstrap.")
     
     def conf_int(self, alpha=0.05, point=None, variable_idx=None):
         """
@@ -1508,10 +1270,14 @@ class DoublyRobustElasticityEstimatorResults(Results):
         tuple of float
             (lower_bound, upper_bound) for the confidence interval
         """
-        if point is None:
-            point = np.mean(self.model.exog, axis=0).reshape(1, -1)
-            
-        return self.asymptotic_confidence_interval(point, variable_idx, alpha)
+        if self.compute_asymptotic_variance:
+            if point is None:
+                point = np.mean(self.model.exog, axis=0).reshape(1, -1)
+                
+            return self.asymptotic_confidence_interval(point, variable_idx, alpha)
+        else:
+            raise ValueError("Confidence interval computation requires asymptotic variance. "
+                           "Set compute_asymptotic_variance=True or use bootstrap.")
 
     # Keep all other existing methods unchanged (bootstrap, plotting, etc.)
     def _bootstrap_standard_errors(self, bootstrap_reps, bootstrap_method, weights, kwargs):
@@ -1567,8 +1333,9 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 density_params=self.model.density_params
             )
             
-            # Fit the bootstrapped model
-            bs_results = bs_model.fit(weights=weights, bootstrap=False, **kwargs)
+            # Fit the bootstrapped model (disable asymptotic variance for bootstrap)
+            bs_results = bs_model.fit(weights=weights, bootstrap=False, 
+                                    compute_asymptotic_variance=False, **kwargs)
             
             # Store estimates from this bootstrap replication for each variable
             X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
@@ -1605,7 +1372,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
 
     def summary(self):
         """
-        Provide a summary of the results with corrected standard errors.
+        Provide a summary of the results with available standard errors.
         
         Returns
         -------
@@ -1677,7 +1444,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
                     row["Bootstrap SE"] = "N/A"
                     row["95% CI Lower"] = "N/A"
                     row["95% CI Upper"] = "N/A"
-            else:
+            elif self.compute_asymptotic_variance:
                 try:
                     se = self.asymptotic_standard_error_at_average(var_idx)
                     row["Asymptotic SE"] = f"{se:.4f}"
@@ -1688,6 +1455,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
                     row["Asymptotic SE"] = "N/A"
                     row["95% CI Lower"] = "N/A"
                     row["95% CI Upper"] = "N/A"
+            else:
+                row["SE"] = "Not computed"
+                row["95% CI Lower"] = "N/A"
+                row["95% CI Upper"] = "N/A"
             
             data.append(row)
         
@@ -1703,14 +1474,15 @@ class DoublyRobustElasticityEstimatorResults(Results):
         if self.model.estimator_type == 'kernel' and hasattr(self.nonparam_model, 'bandwidth'):
             smry.add_text(f"Bandwidth: {self.nonparam_model.bandwidth}")
         
-        # Add information about bootstrap if used
+        # Add information about standard error computation
         if self.bootstrap:
             smry.add_text(f"\nBootstrap: {self.bootstrap_reps} replications")
-        
-        # Add information about asymptotic variance
-        smry.add_text(f"\nAsymptotic Variance: Corrected multivariate implementation")
-        smry.add_text(f"Kernel type: {self.kernel_type}")
-        smry.add_text(f"Density estimator: {self.density_bandwidth_method}")
+        elif self.compute_asymptotic_variance:
+            smry.add_text(f"\nAsymptotic Variance: Corrected multivariate implementation")
+            smry.add_text(f"Kernel type: {self.kernel_type}")
+            smry.add_text(f"Density estimator: {self.model.density_estimator}")
+        else:
+            smry.add_text(f"\nStandard Errors: Not computed")
         
         return smry
 
@@ -1920,6 +1692,155 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
         return fig
     
+    def plot_bootstrap_distribution(self, statistic='estimate_at_average', variable_idx=None):
+        """
+        Plot the bootstrap distribution for a given statistic.
+        
+        Parameters
+        ----------
+        statistic : str, default 'estimate_at_average'
+            Which statistic to plot: 'ols_estimate', 'average_correction', 
+            'average_estimate', or 'estimate_at_average'
+        variable_idx : int or str, optional
+            Variable for which to plot bootstrap distribution.
+            If None, uses first variable of interest.
+            
+        Returns
+        -------
+        tuple
+            (fig, ax) matplotlib figure and axis objects
+        """
+        if not self.bootstrap:
+            raise ValueError("Bootstrap standard errors have not been computed. "
+                           "Call fit() with bootstrap=True first.")
+        
+        # Handle variable selection
+        if variable_idx is None:
+            variable_idx = self.interest[0]
+        elif isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
+        
+        if variable_idx not in self.bootstrap_estimates_dict:
+            raise ValueError(f"Variable {variable_idx} not found in bootstrap estimates.")
+        
+        # Map statistic names to column indices
+        stat_map = {
+            'ols_estimate': 0,
+            'average_correction': 1,
+            'average_estimate': 2,
+            'estimate_at_average': 3
+        }
+        
+        if statistic not in stat_map:
+            raise ValueError(f"Unknown statistic '{statistic}'. "
+                           f"Choose from: {list(stat_map.keys())}")
+        
+        col_idx = stat_map[statistic]
+        bootstrap_values = self.bootstrap_estimates_dict[variable_idx][:, col_idx]
+        
+        # Create the plot
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Plot histogram and KDE
+        sns.histplot(bootstrap_values, ax=ax, kde=True, alpha=0.7)
+        
+        # Add vertical lines for key statistics
+        mean_val = np.mean(bootstrap_values)
+        median_val = np.median(bootstrap_values)
+        
+        ax.axvline(x=mean_val, color='red', linestyle='--', label=f'Mean: {mean_val:.4f}')
+        ax.axvline(x=median_val, color='blue', linestyle='--', label=f'Median: {median_val:.4f}')
+        
+        # Add confidence interval lines
+        ci_lower = np.percentile(bootstrap_values, 2.5)
+        ci_upper = np.percentile(bootstrap_values, 97.5)
+        ax.axvline(x=ci_lower, color='green', linestyle=':', alpha=0.7, label='95% CI')
+        ax.axvline(x=ci_upper, color='green', linestyle=':', alpha=0.7)
+        
+        # Formatting
+        var_name = self.model.exog_names[variable_idx]
+        ax.set_title(f'Bootstrap Distribution of {statistic.replace("_", " ").title()} for {var_name}')
+        ax.set_xlabel(statistic.replace("_", " ").title())
+        ax.set_ylabel('Density')
+        ax.legend()
+        
+        return fig, ax
+    
+    def bootstrap_confidence_interval(self, alpha=0.05, method='percentile', variable_idx=None):
+        """
+        Calculate bootstrap confidence intervals.
+        
+        Parameters
+        ----------
+        alpha : float, default 0.05
+            Significance level for (1-α)×100% confidence interval
+        method : str, default 'percentile'
+            Method for calculating confidence intervals: 'percentile' or 'bias_corrected'
+        variable_idx : int or str, optional
+            Variable for which to compute confidence intervals.
+            If None, computes for all variables of interest.
+            
+        Returns
+        -------
+        dict
+            Dictionary with confidence intervals for each statistic and variable
+        """
+        if not self.bootstrap:
+            raise ValueError("Bootstrap standard errors have not been computed. "
+                           "Call fit() with bootstrap=True first.")
+        
+        # Handle variable selection
+        if variable_idx is None:
+            variables = list(self.bootstrap_estimates_dict.keys())
+        else:
+            if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+                variable_idx = self.model.exog_names.index(variable_idx)
+            variables = [variable_idx]
+        
+        confidence_intervals = {}
+        
+        stat_names = ['ols_estimate', 'average_correction', 'average_estimate', 'estimate_at_average']
+        
+        for var_idx in variables:
+            var_name = self.model.exog_names[var_idx]
+            confidence_intervals[var_name] = {}
+            
+            bootstrap_values = self.bootstrap_estimates_dict[var_idx]
+            
+            for i, stat_name in enumerate(stat_names):
+                values = bootstrap_values[:, i]
+                
+                if method == 'percentile':
+                    lower = np.percentile(values, 100 * alpha / 2)
+                    upper = np.percentile(values, 100 * (1 - alpha / 2))
+                elif method == 'bias_corrected':
+                    # Bias-corrected and accelerated (BCa) bootstrap
+                    # This is a simplified version - full BCa requires more computation
+                    n_boot = len(values)
+                    
+                    # Bias correction
+                    original_estimate = getattr(self, stat_name.replace('_estimate', '').replace('_', '_'))(var_idx) if hasattr(self, stat_name.replace('_estimate', '').replace('_', '_')) else np.mean(values)
+                    bias_correction = stats.norm.ppf((np.sum(values < original_estimate)) / n_boot)
+                    
+                    # Acceleration (simplified - assumes jackknife acceleration = 0)
+                    acceleration = 0
+                    
+                    # Adjusted percentiles
+                    z_alpha_2 = stats.norm.ppf(alpha / 2)
+                    z_1_alpha_2 = stats.norm.ppf(1 - alpha / 2)
+                    
+                    alpha_1 = stats.norm.cdf(bias_correction + (bias_correction + z_alpha_2) / (1 - acceleration * (bias_correction + z_alpha_2)))
+                    alpha_2 = stats.norm.cdf(bias_correction + (bias_correction + z_1_alpha_2) / (1 - acceleration * (bias_correction + z_1_alpha_2)))
+                    
+                    lower = np.percentile(values, 100 * alpha_1)
+                    upper = np.percentile(values, 100 * alpha_2)
+                else:
+                    raise ValueError(f"Unknown method '{method}'. Use 'percentile' or 'bias_corrected'.")
+                
+                confidence_intervals[var_name][stat_name] = (lower, upper)
+        
+        return confidence_intervals
+    
     def test_ppml(self):
         """Test the consistency of PPML estimation."""
         ppml_mod = sm.GLM(self.model.endog, self.model.exog, 
@@ -1927,6 +1848,317 @@ class DoublyRobustElasticityEstimatorResults(Results):
         # Assuming AssumptionTest is defined as imported
         from .ppml_consistency import AssumptionTest
         return AssumptionTest(ppml_mod).test_direct()
+
+
+class NNDensityEstimator:
+    """
+    Unified neural network density estimator for both density estimation and conditional variance.
+    
+    This class provides a unified interface for neural network-based density estimation
+    that can be used for both f_X(x) estimation and conditional variance σ²_w(x) estimation.
+    
+    Parameters
+    ----------
+    X : array_like of shape (n, d)
+        Input data for density estimation
+    y : array_like of shape (n,), optional
+        Target variable for conditional density/variance estimation.
+        If None, estimates marginal density of X.
+    target_type : str, default 'density'
+        Type of target estimation: 'density' for f_X(x), 'conditional_variance' for σ²_w(x)
+    hidden_layers : list, default [64, 32]
+        List of hidden layer sizes
+    activation : str, default 'relu'
+        Activation function for hidden layers
+    epochs : int, default 100
+        Number of training epochs
+    batch_size : int, default 32
+        Batch size for training
+    validation_split : float, default 0.2
+        Fraction of data to use for validation
+    verbose : int, default 1
+        Verbosity level during training
+    **kwargs : dict
+        Additional parameters for neural network training
+        
+    Attributes
+    ----------
+    model : tensorflow.keras.Model
+        Fitted neural network model
+    target_type : str
+        Type of target estimation
+    is_fitted : bool
+        Whether the model has been fitted
+    """
+    
+    def __init__(self, X, y=None, target_type='density', hidden_layers=[64, 32], 
+                 activation='relu', epochs=100, batch_size=32, validation_split=0.2,
+                 verbose=1, **kwargs):
+        """Initialize the neural network density estimator."""
+        try:
+            import tensorflow as tf
+            self.tf = tf
+        except ImportError:
+            raise ImportError("TensorFlow is required for neural network density estimator. "
+                             "Please install tensorflow package.")
+        
+        self.X = np.array(X)
+        self.y = np.array(y) if y is not None else None
+        self.target_type = target_type.lower()
+        self.hidden_layers = hidden_layers
+        self.activation = activation
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.validation_split = validation_split
+        self.verbose = verbose
+        
+        # Store additional parameters
+        self.kwargs = kwargs
+        
+        # Initialize model attributes
+        self.model = None
+        self.is_fitted = False
+        self.mean = None
+        self.std = None
+        self.scaling_factor = None
+        
+        # Fit the model upon initialization
+        self._fit()
+    
+    def _fit(self):
+        """Fit the neural network model."""
+        if self.target_type == 'density':
+            self._fit_density_model()
+        elif self.target_type == 'conditional_variance':
+            self._fit_conditional_variance_model()
+        else:
+            raise ValueError(f"Unknown target_type '{self.target_type}'. "
+                           f"Use 'density' or 'conditional_variance'.")
+        
+        self.is_fitted = True
+    
+    def _fit_density_model(self):
+        """Fit neural network for density estimation f_X(x)."""
+        # For density estimation, we use a variational approach
+        # This is a simplified implementation - a full implementation would use 
+        # normalizing flows or mixture density networks
+        
+        # Create synthetic targets for density estimation using KDE
+        from statsmodels.nonparametric.kernel_density import KDEMultivariate
+        
+        var_type = 'c' * self.X.shape[1]
+        kde = KDEMultivariate(data=self.X, var_type=var_type, bw='normal_reference')
+        
+        # Evaluate KDE at training points to create targets
+        targets = np.array([kde.pdf(x) for x in self.X])
+        
+        # Normalize targets for numerical stability
+        self.mean = np.mean(targets)
+        self.std = np.std(targets)
+        if self.std < 1e-8:
+            self.std = 1.0
+        
+        normalized_targets = (targets - self.mean) / self.std
+        
+        # Create and compile model
+        self.model = self._create_model('density')
+        
+        # Convert to tensors
+        X_tensor = self.tf.convert_to_tensor(self.X, dtype=self.tf.float32)
+        y_tensor = self.tf.convert_to_tensor(normalized_targets, dtype=self.tf.float32)
+        
+        # Set up callbacks
+        callbacks = [
+            self.tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=self.kwargs.get('patience', 10),
+                restore_best_weights=True,
+                verbose=0
+            )
+        ]
+        
+        # Fit the model
+        self.model.fit(
+            x=X_tensor,
+            y=y_tensor,
+            validation_split=self.validation_split,
+            batch_size=self.batch_size,
+            epochs=self.epochs,
+            callbacks=callbacks,
+            verbose=self.verbose
+        )
+    
+    def _fit_conditional_variance_model(self):
+        """Fit neural network for conditional variance estimation."""
+        if self.y is None:
+            raise ValueError("Target variable y is required for conditional variance estimation.")
+        
+        # Normalize targets for numerical stability
+        min_y = np.min(self.y)
+        if min_y <= 0:
+            min_y = 1e-10
+        
+        self.scaling_factor = min_y
+        normalized_y = self.y / self.scaling_factor
+        
+        self.mean = np.mean(normalized_y)
+        self.std = np.std(normalized_y)
+        if self.std < 1e-8:
+            self.std = 1.0
+        
+        scaled_y = (normalized_y - self.mean) / self.std
+        
+        # Create and compile model
+        self.model = self._create_model('conditional_variance')
+        
+        # Convert to tensors
+        X_tensor = self.tf.convert_to_tensor(self.X, dtype=self.tf.float32)
+        y_tensor = self.tf.convert_to_tensor(scaled_y, dtype=self.tf.float32)
+        
+        # Set up callbacks with regularization for variance estimation
+        callbacks = [
+            self.tf.keras.callbacks.EarlyStopping(
+                monitor='val_loss',
+                patience=self.kwargs.get('patience', 10),
+                restore_best_weights=True,
+                verbose=0
+            ),
+            self.tf.keras.callbacks.ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.5,
+                patience=max(5, self.kwargs.get('patience', 10) // 2),
+                min_lr=1e-6,
+                verbose=0
+            )
+        ]
+        
+        # Fit the model
+        try:
+            history = self.model.fit(
+                x=X_tensor,
+                y=y_tensor,
+                validation_split=self.validation_split,
+                batch_size=self.batch_size,
+                epochs=self.epochs,
+                callbacks=callbacks,
+                verbose=self.verbose
+            )
+            
+            # Check if training was successful
+            final_loss = history.history['loss'][-1]
+            if np.isnan(final_loss) or np.isinf(final_loss):
+                raise ValueError("Neural network training failed - loss is NaN or infinite")
+                
+        except Exception as e:
+            raise RuntimeError(f"Neural network conditional variance training failed: {e}")
+    
+    def _create_model(self, model_type):
+        """Create neural network model based on type."""
+        # Create the model architecture
+        model = self.tf.keras.Sequential()
+        model.add(self.tf.keras.layers.Input(shape=(self.X.shape[1],)))
+        
+        # Add hidden layers
+        for i, units in enumerate(self.hidden_layers):
+            model.add(self.tf.keras.layers.Dense(
+                units, 
+                activation=self.activation,
+                kernel_regularizer=self.tf.keras.regularizers.l2(1e-4),
+                kernel_initializer='he_normal'
+            ))
+            
+            # Add batch normalization for stability
+            model.add(self.tf.keras.layers.BatchNormalization())
+            
+            # Add dropout for regularization (except last hidden layer)
+            if i < len(self.hidden_layers) - 1:
+                model.add(self.tf.keras.layers.Dropout(0.1))
+        
+        # Output layer
+        if model_type == 'density':
+            # For density estimation, use positive output
+            model.add(self.tf.keras.layers.Dense(1, activation='softplus'))
+        else:
+            # For conditional variance, no activation (will enforce non-negativity in prediction)
+            model.add(self.tf.keras.layers.Dense(1))
+        
+        # Compile with appropriate settings
+        optimizer = self.tf.keras.optimizers.Adam(
+            learning_rate=0.001,
+            clipnorm=1.0,
+            beta_1=0.9,
+            beta_2=0.999
+        )
+        
+        model.compile(
+            optimizer=optimizer,
+            loss='mean_squared_error',
+            metrics=['mae']
+        )
+        
+        return model
+    
+    def predict_density(self, X):
+        """
+        Predict density or conditional variance at given points.
+        
+        Parameters
+        ----------
+        X : array_like of shape (n, d)
+            Points at which to evaluate the density/variance
+            
+        Returns
+        -------
+        ndarray of shape (n,)
+            Predicted density or conditional variance values
+        """
+        if not self.is_fitted:
+            raise ValueError("Model must be fitted before prediction.")
+        
+        X = np.atleast_2d(X)
+        X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
+        
+        # Get predictions from neural network
+        predictions = self.model.predict(X_tensor, verbose=0)
+        
+        if self.target_type == 'density':
+            # Denormalize density predictions
+            unstandardized = predictions.reshape(-1) * self.std + self.mean
+            # Ensure positive density values
+            return np.maximum(unstandardized, 1e-10)
+            
+        elif self.target_type == 'conditional_variance':
+            # Denormalize conditional variance predictions
+            unstandardized = predictions.reshape(-1) * self.std + self.mean
+            # Unscale back to original scale
+            unscaled = unstandardized * self.scaling_factor
+            # Ensure non-negative variance values
+            return np.maximum(unscaled, 0.0)
+    
+    def fit(self, X):
+        """
+        Interface compatibility method for conditional variance estimation.
+        
+        This method provides the same interface as KernelReg.fit() for seamless
+        integration with existing conditional variance code.
+        
+        Parameters
+        ----------
+        X : array_like of shape (n, d)
+            Points at which to evaluate
+            
+        Returns
+        -------
+        tuple
+            (predictions, marginal_effects) where:
+            - predictions: ndarray of shape (n,) with predicted values
+            - marginal_effects: None (for compatibility)
+        """
+        if self.target_type != 'conditional_variance':
+            raise ValueError("fit() method is only available for conditional_variance target_type.")
+        
+        predictions = self.predict_density(X)
+        return (predictions, None)
 
 
 class RegressionModel:
@@ -2119,7 +2351,7 @@ class NNRegressionModel(RegressionModel):
         self.mean = mean
         self.std = std
         self.scaling_factor = scaling_factor
-        self.bandwidth = 0.1  # Placeholder, not actually used
+        self.bandwidth = None  # Note: this is used in the asymptotic variance calculation - defaults to Silverman rule. MUST FIX TODO
         
         # Import tensorflow only when needed
         import tensorflow as tf
@@ -2329,8 +2561,9 @@ class OLSRegressionModel(RegressionModel):
         # Return predictions scaled back to original scale
         return self.model.predict(X_poly) * self.scaling_factor
     
+
     def derivative(self, X, index):
-        """Calculate the derivative of m(x) with respect to a specific regressor."""
+        """Calculate the derivative of m(x) with respect to a specific regressor using analytical derivatives."""
         # For binary variables, use difference instead of derivative
         if index in self.binary_vars:
             X_0 = X.copy()
@@ -2385,107 +2618,52 @@ class OLSRegressionModel(RegressionModel):
                     derivatives[i] = self.derivative(x_i, index)[0]
                 return derivatives
         
-        # For continuous variables, use numerical differentiation
+        # For continuous variables, use analytical derivative of the polynomial
         else:
-            epsilon = 1e-3
-            X_plus = X.copy()
-            X_minus = X.copy()
-            X_plus[:, index] += epsilon
-            X_minus[:, index] -= epsilon
-            return (self.predict(X_plus) - self.predict(X_minus)) / (2 * epsilon)
-
-
-
-class NNConditionalVarianceModel:
-    """
-    Neural network model for estimating conditional variance σ²_w(x) = Var(e^u|X=x).
-    
-    This class implements a neural network to estimate E[w²|X] where w = e^u,
-    which is then used to compute the conditional variance as E[w²|X] - (E[w|X])².
-    
-    Parameters
-    ----------
-    model : tensorflow.keras.Model
-        Fitted neural network model for E[w²|X]
-    mean : float
-        Mean used for standardizing the squared residuals
-    std : float
-        Standard deviation used for standardizing the squared residuals
-    scaling_factor : float
-        Scaling factor used to normalize the exponentiated residuals
-    binary_vars : array-like
-        Indices of binary variables
-    ordinal_vars : array-like
-        Indices of ordinal variables
-        
-    Attributes
-    ----------
-    model : tensorflow.keras.Model
-        The fitted neural network
-    mean : float
-        Normalization mean for squared residuals
-    std : float
-        Normalization standard deviation for squared residuals
-    scaling_factor : float
-        Original scaling factor
-    tf : module
-        TensorFlow module reference
-    """
-    
-        
-    def __init__(self, model, mean, std, scaling_factor, binary_vars, ordinal_vars):
-        """Initialize the neural network conditional variance model."""
-        self.model = model
-        self.mean = mean
-        self.std = std
-        self.scaling_factor = scaling_factor
-        self.binary_vars = binary_vars
-        self.ordinal_vars = ordinal_vars
-        
-        # Import tensorflow only when needed
-        try:
-            import tensorflow as tf
-            self.tf = tf
-        except ImportError:
-            raise ImportError("TensorFlow is required for neural network conditional variance.")
-    
-    def fit(self, X):
-        """
-        Predict E[w²|X] at given points using conventional .fit() interface.
-        
-        Parameters
-        ----------
-        X : array_like of shape (n, d)
-            Input points for prediction
+            # Ensure X is 2D
+            if X.ndim == 1:
+                X = X.reshape(1, -1)
             
-        Returns
-        -------
-        tuple
-            (predictions, marginal_effects) where:
-            - predictions: ndarray of shape (n,) with E[w²|X] values
-            - marginal_effects: None (for compatibility with KernelReg)
+            # Get the polynomial powers matrix and model coefficients
+            powers = self.poly.powers_  # Shape: (n_features, n_input_features)
+            coeffs = self.model.params  # Shape: (n_features,)
             
-        Notes
-        -----
-        Returns the same format as statsmodels.nonparametric.kernel_regression.KernelReg.fit()
-        for seamless integration with existing conditional variance code.
-        """
-        X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
-        
-        # Get predictions from neural network (in standardized scale)
-        predictions = self.model.predict(X_tensor, verbose=0)
-        
-        # Denormalize: reverse standardization from training
-        unstandardized = predictions.reshape(-1) * self.std + self.mean
-        
-        # Unscale: reverse scaling for numerical stability
-        unscaled = unstandardized * self.scaling_factor
-        
-        # Ensure non-negative predictions (variance must be non-negative)
-        unscaled = np.maximum(unscaled, 0.0)
-        
-        # Return in KernelReg.fit() format: (predictions, marginal_effects)
-        return (unscaled, None)
+            # Initialize derivative values
+            derivatives = np.zeros(X.shape[0])
+            
+            # Loop through each polynomial feature and compute its derivative
+            for i, power_vec in enumerate(powers):
+                # Get the power of the variable of interest in this feature
+                power_of_interest = power_vec[index]
+                
+                # If the power is 0, this feature doesn't depend on the variable of interest
+                # so its derivative is 0
+                if power_of_interest == 0:
+                    continue
+                    
+                # Calculate the derivative coefficient for this feature
+                # d/dx_j [c * x_j^k * other_terms] = c * k * x_j^(k-1) * other_terms
+                deriv_coeff = power_of_interest * coeffs[i]
+                
+                # Calculate the value of this derivative term at each X point
+                feature_deriv = deriv_coeff * np.ones(X.shape[0])
+                
+                # Multiply by the appropriate powers of all variables
+                for j, power in enumerate(power_vec):
+                    if j == index:
+                        # For the variable of interest, use power - 1
+                        if power > 1:
+                            feature_deriv *= X[:, j] ** (power - 1)
+                        # If power == 1, x^(1-1) = x^0 = 1, so no multiplication needed
+                    else:
+                        # For other variables, use the original power
+                        if power > 0:
+                            feature_deriv *= X[:, j] ** power
+                
+                derivatives += feature_deriv
+            
+            # Scale back to original scale (same as in predict method)
+            return derivatives * self.scaling_factor
 
 
 # Alias names for easier use
@@ -2501,100 +2679,87 @@ if __name__ == "__main__":
     
     # Generate some sample data
     np.random.seed(6699)
-    n = 200
+    n = 20000
     x1 = np.random.normal(5, 1, n)
-    #x2 = (np.random.uniform(0, 1, n) > 0.5).astype(int)  # Binary variable
-    #x3 = np.random.choice(np.arange(1, 6), n)  # Ordinal variable (1-5)
     
-    # Create a log-linear model with heteroskedasticity
-    log_y = 0.5 + 1.2 * x1 + \
-        np.random.normal(0, 1 + 0.1 * x1 ** 2 , n)
-        # 0.8 * x2 + 0.3 * x3 + 
-
-    y = np.exp(log_y)
+    # Create an exponential model
+    y = np.exp(
+        0.5 + 1.2 * x1
+    ) * np.random.uniform(0.5,1.5,n)
     
     # Create a DataFrame
     df = pd.DataFrame({
         'y': y,
         'x1': x1,
-        #'x2': x2,
-        #'x3': x3
     })
     
     # Fit standard OLS model
     import statsmodels.api as sm
-    X = sm.add_constant(df[[
-        'x1', 
-        #'x2', 'x3'
-    ]])
-    ols_mod = sm.OLS(np.log(df['y']), X).fit()
+    X = sm.add_constant(df[['x1']])
+    ols_mod = sm.OLS(np.log(df['y']), X).fit(cov_type='HC3')
     print("OLS results:")
     print(ols_mod.summary())
 
-
     # Fit PPML
-    ppml_mod = sm.GLM(df['y'], X, family=sm.families.Poisson()).fit()
+    ppml_mod = sm.GLM(df['y'], X, family=sm.families.Poisson()).fit(cov_type='HC3')
     print("PPML results:")
     print(ppml_mod.summary())
     
-    # Option 1: Fit with a specific variable of interest
-    print("\n1. Fitting with a specific variable of interest (x1):")
+    # Option 1: Fit with asymptotic variance (default when bootstrap=False)
+    print("\n1. Fitting with asymptotic variance calculation:")
     dre1 = DRE(
         df['y'],
-        df[['x1', 
-            #'x2', 'x3'
-            ]],
+        df[['x1']],
         interest='x1',
-        estimator_type='nn',
+        estimator_type='ols',
         elasticity=False,
-        density_estimator='kernel',
+        density_estimator='kernel',  # Use kernel for speed
         kernel_params={'degree':2},
     )
-    dre_results1 = dre1.fit()
+    dre_results1 = dre1.fit(compute_asymptotic_variance=True)
     print(dre_results1.summary())
-    #
-    ## Option 2: Fit with multiple variables of interest
-    #print("\n2. Fitting with multiple variables of interest (x1 and x2):")
-    #dre2 = DRE(
-    #    df['y'],
-    #    df[['x1', 'x2', 'x3']],
-    #    interest=['x1', 'x2'],
-    #    log_x=[False, False],
-    #    estimator_type='kernel',
-    #    elasticity=False,
-    #    density_estimator='kernel'
-    #)
-    #dre_results2 = dre2.fit()
-    #print(dre_results2.summary())
-    #
-    ## Option 3: Fit for all variables
-    #print("\n3. Fitting for all variables:")
-    #dre3 = DRE(
-    #    df['y'],
-    #    df[['x1', 'x2', 'x3']],
-    #    interest=None,  # Calculate for all variables
-    #    estimator_type='kernel',
-    #    elasticity=False,
-    #    density_estimator='kernel'
-    #)
-    #dre_results3 = dre3.fit()
-    #print(dre_results3.summary())
     
-    # Option 4: Fit with bootstrap
-    print("\n4. Fitting with bootstrap standard errors:")
+    # Option 2: Fit with bootstrap (asymptotic variance automatically disabled)
+    print("\n2. Fitting with bootstrap standard errors (asymptotic variance disabled):")
+    dre2 = DRE(
+        df['y'],
+        df[['x1']],
+        interest='x1',
+        estimator_type='ols',
+        elasticity=False,
+        density_estimator='nn',  # This won't be used since asymptotic variance is disabled
+        kernel_params={'degree':2}
+    )
+    # When bootstrap=True, compute_asymptotic_variance defaults to False
+    dre_results2 = dre2.fit(bootstrap=True, bootstrap_reps=100, bootstrap_method='pairs')
+    print(dre_results2.summary())
+    
+    # Option 3: Explicitly disable asymptotic variance without bootstrap
+    print("\n3. Fitting without asymptotic variance or bootstrap:")
+    dre3 = DRE(
+        df['y'],
+        df[['x1']],
+        interest='x1',
+        estimator_type='ols',
+        elasticity=False,
+        kernel_params={'degree':2}
+    )
+    dre_results3 = dre3.fit(compute_asymptotic_variance=False, bootstrap=False)
+    print(dre_results3.summary())
+    
+    # Option 4: Neural network density estimation with asymptotic variance
+    print("\n4. Fitting with neural network density estimation:")
     dre4 = DRE(
         df['y'],
-        df[['x1', 
-            #'x2', 'x3'
-            ]],
+        df[['x1']],
         interest='x1',
-        estimator_type='nn',
+        estimator_type='ols',
         elasticity=False,
-        density_estimator='kernel',
-        kernel_params={'bw':'normal_reference', 'degree':2}
+        density_estimator='nn',
+        density_params={'hidden_layers': [32, 16], 'epochs': 50, 'verbose': 0},
+        kernel_params={'degree':2}
     )
-    # Reduce bootstrap_reps for this example
-    dre_results4 = dre4.fit(bootstrap=True, bootstrap_reps=10, bootstrap_method='pairs')
+    dre_results4 = dre4.fit(compute_asymptotic_variance=True)
     print(dre_results4.summary())
     
     # Plot distribution of estimates for a specific variable
@@ -2604,15 +2769,4 @@ if __name__ == "__main__":
     # Plot correction term for a specific variable
     fig = dre_results1.plot_correction('x1')
     plt.show()
-    
-    # If bootstrap was used, plot bootstrap distribution
-    if hasattr(dre_results4, 'bootstrap') and dre_results4.bootstrap:
-        fig, ax = dre_results4.plot_bootstrap_distribution('estimate_at_average')
-        plt.show()
-        
-        # Get bootstrap confidence intervals
-        ci = dre_results4.bootstrap_confidence_interval(method='percentile')
-        print("\nBootstrap Confidence Intervals (95%):")
-        for key, value in ci.items():
-            print(f"{key}: [{value[0]:.4f}, {value[1]:.4f}]")
 
