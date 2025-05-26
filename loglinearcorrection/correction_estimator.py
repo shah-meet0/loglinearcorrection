@@ -260,8 +260,9 @@ class DoublyRobustElasticityEstimator(Model):
                     if idx < readjusted_index:
                         adjusted_index -= 1
 
-                print('Adjusting interest index from', self.interest[0], 'to', adjusted_index)
-                self.interest = [adjusted_index]
+                if adjusted_index != self.interest[0]:
+                    print('Adjusting interest index from', self.interest[0], 'to', adjusted_index)
+                    self.interest = [adjusted_index]
             else:
                 raise NotImplementedError('Fixed effects not implemented for multiple variables of interest')
 
@@ -2402,6 +2403,7 @@ class NNRegressionModel(RegressionModel):
     
     def predict(self, X):
         """Predict the expected value m(x) for given data."""
+        # TODO: remove scaling from neural networks and just keep batchnorm layers in. Scaling factor is blowing up results, especially because its essentially 0 in many cases
         X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
         predictions = self.model.predict(X_tensor)
         # Unstandardize and unscale to get back to original scale

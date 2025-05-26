@@ -81,7 +81,7 @@ print(x)
 # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
 
 model = DoublyRobustElasticityEstimator(yexp, X_new, estimator_type='nn', interest=1, fe=[0,2])
-res = model.fit(compute_asymptotic_variance=False)
+res = model.fit()
 
 res.summary()
 print(res.test_ppml())
