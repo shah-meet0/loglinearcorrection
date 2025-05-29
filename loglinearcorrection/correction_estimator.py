@@ -72,6 +72,7 @@ class DoublyRobustElasticityEstimator(Model):
     Estimator 2: \hat{z_2}(x) = \hat\gamma + \frac{\hat\psi'(x)}{\hat\psi(x)}
     where \hat\psi(x) is estimated from PPML residuals
     """
+
     
     def __init__(self, endog, exog, interest=None, log_x=False, estimator_type='kernel', 
                  elasticity=False, kernel_params=None, nn_params=None, 
@@ -1382,6 +1383,226 @@ class DoublyRobustElasticityEstimatorResults(Results):
         # Assuming AssumptionTest is defined as imported
         from .ppml_consistency import AssumptionTest
         return AssumptionTest(ppml_mod).test_direct()
+
+    def calculate_estimator_at_points_parallel(self, X_points, variable_idx=None, n_jobs=-1, backend='threading'):
+        """Calculate estimator values with parallel processing (pickle-safe).
+        
+        Parameters
+        ----------
+        X_points : array-like
+            Points at which to calculate the estimator
+        variable_idx : int or str, optional
+            Variable for which to calculate estimates. If None, uses first variable of interest.
+        n_jobs : int, default -1
+            Number of parallel jobs. -1 means use all processors.
+        backend : str, default 'threading'
+            Joblib backend to use: 'threading' or 'multiprocessing'
+            
+        Returns
+        -------
+        ndarray
+            Array of estimator values at the specified points
+        """
+        import joblib
+        
+        if not isinstance(X_points, np.ndarray):
+            X_points = np.array(X_points)
+        if X_points.ndim == 1:
+            X_points = X_points.reshape(1, -1)
+
+        if backend == 'threading' and n_jobs == 1:
+            return self.estimate_at_point(X_points, variable_idx)
+        
+        if backend == 'threading':
+            estimator_values = joblib.Parallel(n_jobs=n_jobs, backend='threading')(
+                joblib.delayed(lambda x_row: self.estimate_at_point(x_row.reshape(1, -1), variable_idx))(x_point_row) 
+                for x_point_row in X_points
+            )
+        else:  # multiprocessing
+            args = [(x_point_row, self, variable_idx) for x_point_row in X_points]
+            estimator_values = joblib.Parallel(n_jobs=n_jobs, backend='multiprocessing')(
+                joblib.delayed(_estimate_single_point_worker)(arg) for arg in args
+            )
+        
+        return np.array(estimator_values).flatten()
+
+    def plot_correction(self, variable_idx=None):
+        """Plot the correction term against the regressor of interest.
+        
+        Parameters
+        ----------
+        variable_idx : int or str, optional
+            Variable for which to plot correction terms.
+            If None, uses first variable of interest.
+            
+        Returns
+        -------
+        matplotlib.figure.Figure
+            Figure containing the correction term plot
+        """
+        # Convert variable name to index if needed
+        if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
+        elif variable_idx is None:
+            variable_idx = self.interest[0]
+            
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        x_values = self.model.exog[:, variable_idx]
+        
+        sns.scatterplot(x=x_values, y=self.correction[variable_idx], ax=ax, alpha=0.5)
+        
+        # Add a smoothed line
+        sns.regplot(x=x_values, y=self.correction[variable_idx], ax=ax, scatter=False, 
+                   lowess=True, line_kws={'color': 'red'})
+        
+        method_name = "OLS" if self.parametric_method == 'ols' else "PPML"
+        ax.set_title(f'Correction Term vs {self.model.exog_names[variable_idx]} ({method_name}-based)')
+        ax.set_xlabel(f'Regressor: {self.model.exog_names[variable_idx]}')
+        ax.set_ylabel('Correction Term')
+        
+        return fig
+
+    def std_error_at_average(self, variable_idx=None):
+        """Calculate the standard error of the estimator at average values.
+        
+        Parameters
+        ----------
+        variable_idx : int or str, optional
+            Variable for which to compute standard error.
+            
+        Returns
+        -------
+        float
+            Standard error at average X values
+            
+        Raises
+        ------
+        ValueError
+            If neither asymptotic variance nor bootstrap is available
+        """
+        if self.compute_asymptotic_variance:
+            return self.asymptotic_standard_error_at_average(variable_idx)
+        elif self.bootstrap:
+            if hasattr(self, 'bootstrap_se_dict'):
+                if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+                    variable_idx = self.model.exog_names.index(variable_idx)
+                elif variable_idx is None:
+                    variable_idx = self.interest[0]
+                return self.bootstrap_se_dict[variable_idx][3]  # Index 3 is for 'Estimate at Average'
+            else:
+                raise ValueError("Bootstrap standard errors not computed properly.")
+        else:
+            raise ValueError("Standard error computation requires asymptotic variance or bootstrap. "
+                           "Set compute_asymptotic_variance=True or use bootstrap.")
+
+    def conf_int(self, alpha=0.05, point=None, variable_idx=None):
+        """Calculate confidence intervals for the estimator at a specific point.
+        
+        Parameters
+        ----------
+        alpha : float, default 0.05
+            Significance level for (1-α)×100% confidence interval
+        point : array_like of shape (1, d), optional
+            Point at which to compute confidence interval. 
+            If None, uses average values of regressors.
+        variable_idx : int or str, optional
+            Variable for confidence interval. If None, uses first variable of interest.
+            
+        Returns
+        -------
+        tuple of float
+            (lower_bound, upper_bound) for the confidence interval
+            
+        Raises
+        ------
+        ValueError
+            If neither asymptotic variance nor bootstrap is available
+        """
+        if self.compute_asymptotic_variance:
+            if point is None:
+                point = np.mean(self.model.exog, axis=0).reshape(1, -1)
+            return self.asymptotic_confidence_interval(point, variable_idx, alpha)
+        elif self.bootstrap:
+            # Use bootstrap confidence intervals
+            if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+                variable_idx = self.model.exog_names.index(variable_idx)
+            elif variable_idx is None:
+                variable_idx = self.interest[0]
+                
+            var_name = self.model.exog_names[variable_idx]
+            ci_dict = self.bootstrap_confidence_interval(alpha=alpha, variable_idx=variable_idx)
+            return ci_dict[var_name]['estimate_at_average']
+        else:
+            raise ValueError("Confidence interval computation requires asymptotic variance or bootstrap. "
+                           "Set compute_asymptotic_variance=True or use bootstrap.")
+
+    def asymptotic_variance_matrix(self, x):
+        """Compute full d×d asymptotic variance-covariance matrix at point x.
+        
+        Parameters
+        ----------
+        x : array_like of shape (1, d) or (d,)
+            Point at which to compute asymptotic variance matrix
+            
+        Returns
+        -------
+        ndarray of shape (d, d)
+            Asymptotic variance-covariance matrix AVar(ẑ(x))
+            
+        Notes
+        -----
+        Implements the corrected multivariate formula:
+        
+        .. math::
+            \\widehat{AVar}(\\hat{z}(x)) = \\frac{\\hat{\\sigma}_w^2(x)}{N \\hat{f}_X(x) h^{d+2} \\hat{m}(x)^4} 
+            \\left[ \\hat{m}(x)^2 \\mathcal{K}_1 + h^2 \\nabla \\hat{m}(x)(\\nabla \\hat{m}(x))^T \\mathcal{K}_0 \\right]
+            
+        where:
+        - :math:`\\hat{\\sigma}_w^2(x)` is the conditional variance of :math:`e^u` given :math:`X=x`
+        - :math:`\\hat{f}_X(x)` is the estimated density at :math:`x`
+        - :math:`h` is the bandwidth
+        - :math:`\\hat{m}(x)` is the estimated conditional expectation
+        - :math:`\\nabla \\hat{m}(x)` is the gradient of :math:`\\hat{m}` at :math:`x`
+        - :math:`\\mathcal{K}_0` and :math:`\\mathcal{K}_1` are kernel constants
+        """
+        if not self.compute_asymptotic_variance:
+            raise ValueError("Asymptotic variance computation is disabled. "
+                           "Set compute_asymptotic_variance=True to enable.")
+        
+        x = np.atleast_2d(x)
+        if x.shape[0] != 1:
+            raise ValueError("x must be a single point of shape (1, d)")
+        
+        # Get required components
+        sigma_w2_x = self._estimate_conditional_variance(x)
+        f_x = self._estimate_density(x)
+        h = self._get_bandwidth()
+        m_x = self.nonparam_model.predict(x)[0]
+        
+        # Get gradient vector ∇m(x)
+        grad_m_x = np.zeros(self.n_vars)
+        for j in range(self.n_vars):
+            grad_m_x[j] = self.nonparam_model.derivative(x, j)[0]
+        
+        # Extract kernel constants
+        K_0_matrix = self.kernel_constants['K_0_matrix']
+        K_1_matrix = self.kernel_constants['K_1_matrix']
+        
+        # Compute the two terms
+        # Term 1: m̂(x)² 𝒦₁ / (nh^{d+2})
+        term1 = (m_x**2 / (self.n_obs * h**(self.n_vars + 2))) * K_1_matrix
+        
+        # Term 2: h² ∇m̂(x)(∇m̂(x))ᵀ 𝒦₀ / (nh^d)  
+        grad_outer = np.outer(grad_m_x, grad_m_x)
+        term2 = (h**2 / (self.n_obs * h**self.n_vars)) * grad_outer @ K_0_matrix
+        
+        # Combine terms with common factor
+        common_factor = sigma_w2_x / (f_x * m_x**4)
+        
+        avar_matrix = common_factor * (term1 + term2)
+        
+        return avar_matrix
 
 
 class NNDensityEstimator:
