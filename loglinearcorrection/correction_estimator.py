@@ -21,9 +21,15 @@ def _estimate_single_point_worker(args):
 class DoublyRobustElasticityEstimator(Model):
     r"""Doubly robust estimator for elasticities and semi-elasticities in log-transformed models.
     
-    This class implements a doubly robust estimator that corrects for the bias that occurs
-    in log-transformed OLS models by estimating the conditional expectation of the
+    This class implements two doubly robust estimators that correct for the bias that occurs
+    in log-transformed models by estimating the conditional expectation of the
     exponentiated residuals and its gradient.
+
+    Estimator 1 (OLS-based):
+    $$\hat{z_1}(x) = \hat\beta + \dfrac{\hat{m}'(x; \hat\beta)}{\hat{m}(x; \hat\beta)}$$
+
+    Estimator 2 (PPML-based):
+    $$\hat{z_2}(x) = \hat\gamma + \dfrac{\nabla \hat\psi(x)}{\hat\psi(x)}$$
     
     Parameters
     ----------
@@ -58,20 +64,19 @@ class DoublyRobustElasticityEstimator(Model):
         
     Notes
     -----
-    The estimator is based on the formula:
-    \hat{z}(x) = \hat\beta + \frac{\hat{m}'(x; \hat\beta)}{\hat{m}(x; \hat\beta)}
+    The estimators are based on the formulas:
     
-    where \hat{m}(x) is a local linear kernel regression for m(x) = E[e^{v_i}|x_i] and
-    \hat{m}'(x) is an estimated gradient of \hat{m}'(x) which should converge to m'(x)=dm(x)/d(x).
-    \hat\beta is the vector of OLS estimators for \beta.
+    Estimator 1: \hat{z_1}(x) = \hat\beta + \frac{\hat{m}'(x; \hat\beta)}{\hat{m}(x; \hat\beta)}
+    where \hat{m}(x) is estimated from OLS residuals
+    
+    Estimator 2: \hat{z_2}(x) = \hat\gamma + \frac{\hat\psi'(x)}{\hat\psi(x)}
+    where \hat\psi(x) is estimated from PPML residuals
     """
     
     def __init__(self, endog, exog, interest=None, log_x=False, estimator_type='kernel', 
                  elasticity=False, kernel_params=None, nn_params=None, 
                  density_estimator='kernel', density_params=None, fe=None):
         """Initialize the doubly robust estimator."""
-
-        # Initialize the base Model class
 
         # Store the original data
         self.original_endog = endog
@@ -80,7 +85,6 @@ class DoublyRobustElasticityEstimator(Model):
         
         # Convert pandas objects to numpy arrays and store names
         if isinstance(endog, pd.Series):
-            # Store the name but don't set endog_names (will be handled by Model.__init__)
             self._endog_name = endog.name
             endog = endog.values
         else:
@@ -94,13 +98,11 @@ class DoublyRobustElasticityEstimator(Model):
 
         # Process interest variable(s)
         if interest is None:
-            # If no specific interest variable, all variables are of interest
             self.interest = list(range(exog.shape[1]))
             self.all_variables = True
         else:
             self.all_variables = False
             if isinstance(interest, (list, tuple, np.ndarray)):
-                # If a list of variables is provided
                 self.interest = []
                 for var in interest:
                     if isinstance(var, str) and var in self._exog_names:
@@ -127,11 +129,8 @@ class DoublyRobustElasticityEstimator(Model):
                 self.fe_indices = [self.original_exog.columns.get_loc(fe)]
             self._apply_fixed_effects()
         else:
-            # If no fixed effects, just use the original data
             self.endog = endog
             self.exog = exog
-        
-
             
         # Process log_x
         if isinstance(log_x, (list, tuple, np.ndarray)):
@@ -139,7 +138,6 @@ class DoublyRobustElasticityEstimator(Model):
                 raise ValueError("log_x must be a single bool or a list matching the length of interest")
             self.log_x = log_x
         else:
-            # If a single value is provided, replicate it for all variables of interest
             self.log_x = [log_x] * len(self.interest)
             
         # Store other parameters
@@ -170,20 +168,16 @@ class DoublyRobustElasticityEstimator(Model):
         # Automatically detect variable types
         self._detect_variable_types()
         super(DoublyRobustElasticityEstimator, self).__init__(self.endog, self.exog)
-        
-
     
     def _apply_fixed_effects(self):
-        #TODO: Adjust ols se for dof adjustment, make clear that intercept needs to be included in matrix,or detect intercept as new method
         """Apply fixed effects transformation to the data."""
-
         try:
             import pyhdfe
         except ImportError:
             raise ImportError("pyhdfe is required for fixed effects estimation. "
                              "Please install pyhdfe package.")
+        
         # Extract the fixed effects columns
-
         if isinstance(self.original_exog, pd.DataFrame):
             fe_cols = self.original_exog.iloc[:, self.fe_indices].values
         else:
@@ -194,7 +188,6 @@ class DoublyRobustElasticityEstimator(Model):
 
         # Create pyhdfe algorithm
         fe_algorithm = pyhdfe.create(fe_cols)
-
 
         # Apply demeaning to both X and y
         if isinstance(self.original_endog, pd.Series) or isinstance(self.original_endog, pd.DataFrame):
@@ -207,25 +200,21 @@ class DoublyRobustElasticityEstimator(Model):
         else:
             exog_to_use = self.original_exog.copy()
 
-        exog_to_use = np.delete(exog_to_use, self.fe_indices, axis=1).astype(np.float64)  # Remove fixed effect columns
+        exog_to_use = np.delete(exog_to_use, self.fe_indices, axis=1).astype(np.float64)
         combined = np.column_stack([exog_to_use, endog_to_use])
         demeaned = fe_algorithm.residualize(combined)
 
         # Update X and y with demeaned values
         self.endog = np.exp(demeaned[:, -1])
-
-        exog = demeaned[:, :-1]  # All columns except the last one
+        exog = demeaned[:, :-1]
 
         # Check if any exog is all 0:
         zero_cols = np.where(np.all(np.abs(exog) < 1e-6, axis=0))[0]
-
         self.exog = np.delete(exog, zero_cols, axis=1)
 
         if len(self.endog) < len(self.original_endog):
-            # TODO: maybe account for this explicitly? tell which groups were singleton?
             print('Some singleton observations dropped. \n'
                   'Please ensure all singleton groups removed prior to estimation if using weights.')
-
 
         # Update exog_names to remove fixed effect variables
         if hasattr(self, '_exog_names'):
@@ -248,14 +237,12 @@ class DoublyRobustElasticityEstimator(Model):
         # Update interest index if needed
         if hasattr(self, 'interest'):
             if len(self.interest) == 1:
-                # Adjust interest index after removing fixed effect columns
                 adjusted_index = self.interest[0]
                 for idx in sorted(self.fe_indices):
                     if idx < self.interest[0]:
                         adjusted_index -= 1
 
                 readjusted_index = adjusted_index
-
                 for idx in sorted(zero_cols):
                     if idx < readjusted_index:
                         adjusted_index -= 1
@@ -265,8 +252,6 @@ class DoublyRobustElasticityEstimator(Model):
                     self.interest = [adjusted_index]
             else:
                 raise NotImplementedError('Fixed effects not implemented for multiple variables of interest')
-
-
 
         print('Fixed effects applied. Variables have been demeaned.')
 
@@ -313,7 +298,7 @@ class DoublyRobustElasticityEstimator(Model):
         weights : array-like, optional
             Weights for weighted least squares, defaults to None
         method : str, optional
-            Method to use for the parametric component, currently only 'ols' is supported
+            Method to use for the parametric component: 'ols' (Estimator 1) or 'ppml' (Estimator 2)
         bootstrap : bool, optional
             Whether to compute bootstrap standard errors, defaults to False
         bootstrap_reps : int, optional
@@ -325,44 +310,61 @@ class DoublyRobustElasticityEstimator(Model):
             Whether to compute asymptotic variance. If None, defaults to True when 
             bootstrap=False and False when bootstrap=True
         **kwargs : dict
-            Additional arguments to pass to the OLS fit method
+            Additional arguments to pass to the parametric fit method
             
         Returns
         -------
         DoublyRobustElasticityEstimatorResults
             Fitted model results object
         """
-
-        kwargs.setdefault("cov_type", 'HC3')
-        
         # Set default for asymptotic variance computation
         if compute_asymptotic_variance is None:
             compute_asymptotic_variance = not bootstrap
 
-        # Step 1: Fit the parametric model (OLS)
+        # Step 1: Fit the parametric model
         if method == 'ols':
+            kwargs.setdefault("cov_type", 'HC3')
             if weights is None:
-                ols_results = sm.OLS(np.log(self.endog), self.exog).fit(**kwargs)
+                parametric_results = sm.OLS(np.log(self.endog), self.exog).fit(**kwargs)
             else:
-                ols_results = sm.WLS(np.log(self.endog), self.exog, weights=weights).fit(**kwargs)
-        else:
-            raise ValueError(f"Method '{method}' not supported. Currently only 'ols' is available.")
+                parametric_results = sm.WLS(np.log(self.endog), self.exog, weights=weights).fit(**kwargs)
             
-        # Print OLS results for variables of interest
+            # Calculate OLS residuals: u_i = log(y_i) - x_i * beta_hat
+            residuals = parametric_results.resid
+            
+        elif method == 'ppml':
+            kwargs.setdefault("cov_type", 'HC3')
+            if weights is None:
+                parametric_results = sm.GLM(self.endog, self.exog, 
+                                          family=sm.families.Poisson()).fit(**kwargs)
+            else:
+                parametric_results = sm.GLM(self.endog, self.exog, 
+                                          family=sm.families.Poisson(),
+                                          freq_weights=weights).fit(**kwargs)
+            
+            # Calculate PPML residuals: u_i = log(y_i) - x_i * gamma_hat
+            # fitted_values from GLM are exp(x_i * gamma_hat)
+            residuals = np.log(self.endog) - np.log(parametric_results.fittedvalues)
+            
+        else:
+            raise ValueError(f"Method '{method}' not supported. Use 'ols' or 'ppml'.")
+            
+        # Print parametric results for variables of interest
         if self.all_variables:
-            print(f'OLS model fitted for all variables')
+            print(f'{method.upper()} model fitted for all variables')
         elif len(self.interest) == 1:
             var_idx = self.interest[0]
             var_name = self.exog_names[var_idx]
-            print(f'OLS model fitted, estimated beta for {var_name}: {ols_results.params[var_idx]:.4f}')
+            coef_name = 'beta' if method == 'ols' else 'gamma'
+            print(f'{method.upper()} model fitted, estimated {coef_name} for {var_name}: {parametric_results.params[var_idx]:.4f}')
         else:
-            print(f'OLS model fitted for {len(self.interest)} variables of interest')
+            print(f'{method.upper()} model fitted for {len(self.interest)} variables of interest')
             for var_idx in self.interest:
                 var_name = self.exog_names[var_idx]
-                print(f'  {var_name}: {ols_results.params[var_idx]:.4f}')
+                coef_name = 'beta' if method == 'ols' else 'gamma'
+                print(f'  {var_name}: {parametric_results.params[var_idx]:.4f}')
             
-        # Step 2: Calculate residuals and exponentiate them
-        residuals = ols_results.resid
+        # Step 2: Calculate exponentiated residuals
         exp_residuals = np.exp(residuals)
         
         print('Estimating correction term...')
@@ -372,10 +374,9 @@ class DoublyRobustElasticityEstimator(Model):
             nonparam_model = self._fit_kernel_model(exp_residuals)
         elif self.estimator_type == 'nn':
             nonparam_model = self._fit_nn_model(exp_residuals)
-        elif self.estimator_type == 'ols':  # Add this option
+        elif self.estimator_type == 'ols':
             nonparam_model = self._fit_ols_model(exp_residuals)
         elif self.estimator_type == 'binary':
-            # For binary estimator, check if any variables of interest are binary
             binary_interest = False
             for var_idx in self.interest:
                 if var_idx in self.binary_vars:
@@ -402,7 +403,8 @@ class DoublyRobustElasticityEstimator(Model):
         # Step 5: Create the results object
         results = DoublyRobustElasticityEstimatorResults(
             model=self,
-            ols_results=ols_results,
+            parametric_results=parametric_results,
+            parametric_method=method,
             nonparam_model=nonparam_model,
             exp_residuals=exp_residuals,
             density_model=density_model,
@@ -412,45 +414,40 @@ class DoublyRobustElasticityEstimator(Model):
         # Step 6: Compute bootstrap standard errors if requested
         if bootstrap:
             print(f'Computing bootstrap standard errors with {bootstrap_reps} replications...')
-            results._bootstrap_standard_errors(bootstrap_reps, bootstrap_method, weights, kwargs)
+            results._bootstrap_standard_errors(bootstrap_reps, bootstrap_method, weights, kwargs, method)
             print('Bootstrap completed')
             
         return results
     
     def _fit_kernel_model(self, exp_residuals):
         """Fit a local linear kernel regression model for E[exp(u)|X]."""
-        # Extract kernel parameters
         var_type = self.kernel_params.get('var_type', 'c' * self.exog.shape[1])
         bw = self.kernel_params.get('bw', 'cv_ls')
         
         # Normalize exponentiated residuals for numerical stability
-        min_exp_residual = np.min(exp_residuals)
-        normalized_exp_residuals = exp_residuals / min_exp_residual
+        min_exp_r = np.min(exp_residuals)
+        normalized_exp_residuals = exp_residuals / min_exp_r
         
-        # Fit the kernel regression model
         kr_model = KernelReg(
             endog=normalized_exp_residuals,
             exog=self.exog,
             var_type=var_type,
-            reg_type='ll',  # Local linear regression
+            reg_type='ll',
             bw=bw
         )
         
-        return KernelRegressionModel(kr_model, self.binary_vars, self.ordinal_vars, min_exp_residual)
+        return KernelRegressionModel(kr_model, self.binary_vars, self.ordinal_vars, min_exp_r)
     
     def _fit_nn_model(self, exp_residuals):
         """Fit a neural network model for E[exp(u)|X]."""
-        # Import tensorflow only when needed
         try:
             import tensorflow as tf
         except ImportError:
-            raise ImportError("TensorFlow is required for neural network estimator. "
-                             "Please install tensorflow package.")
+            raise ImportError("TensorFlow is required for neural network estimator.")
         
-        # Default neural network parameters
         defaults = {
             'num_layers': 3,
-            'activation': 'relu',
+            'activation': 'relu', 
             'num_units': 64,
             'optimizer': 'adam',
             'loss': 'mean_squared_error',
@@ -461,29 +458,20 @@ class DoublyRobustElasticityEstimator(Model):
             'verbose': 1
         }
         
-        # Update defaults with user-provided parameters
         nn_params = {**defaults, **self.nn_params}
-        
-        # Create the neural network model
         model = self._create_nn_model(nn_params)
         
-        # Normalize exponentiated residuals for numerical stability
-        min_exp_residual = np.min(exp_residuals)
-        normalized_exp_residuals = exp_residuals / min_exp_residual
+        min_exp_r = np.min(exp_residuals)
+        normalized_exp_residuals = exp_residuals / min_exp_r
         
-        # Further normalize to prevent explosion in neural network training
         residuals_mean = np.mean(normalized_exp_residuals)
         residuals_std = np.std(normalized_exp_residuals)
         scaled_residuals = (normalized_exp_residuals - residuals_mean) / residuals_std
         
-        # Prepare the inputs
         X_nn = self.exog.copy()
-        
-        # Convert to tensors
         X_tensor = tf.convert_to_tensor(X_nn, dtype=tf.float32)
         y_tensor = tf.convert_to_tensor(scaled_residuals, dtype=tf.float32)
         
-        # Fit the model
         model.fit(
             x=X_tensor,
             y=y_tensor,
@@ -500,73 +488,45 @@ class DoublyRobustElasticityEstimator(Model):
             verbose=nn_params['verbose']
         )
         
-        # Create and return the NNRegressionModel
-        return NNRegressionModel(model, residuals_mean, residuals_std, min_exp_residual, 
+        return NNRegressionModel(model, residuals_mean, residuals_std, min_exp_r, 
                                  self.binary_vars, self.ordinal_vars)
     
     def _fit_binary_model(self, exp_residuals):
         """Fit a binary model for E[exp(u)|X] when the regressor of interest is binary."""
-        #TODO: NEEDS TO BE CORRECTED FOR FE ESTIMATION
-        # This method needs to handle multiple binary variables of interest
-        # Normalize exponentiated residuals for numerical stability
-        min_exp_residual = np.min(exp_residuals)
-        normalized_exp_residuals = exp_residuals / min_exp_residual
+        min_exp_r = np.min(exp_residuals)
+        normalized_exp_residuals = exp_residuals / min_exp_r
         
-        # For binary model, we consider only binary variables in the interest list
         binary_interest = [var_idx for var_idx in self.interest if var_idx in self.binary_vars]
         
-        # If no binary variables of interest, use the first variable in interest list
         if not binary_interest and self.interest:
             binary_interest = [self.interest[0]]
         
-        # Fit binary models for all binary variables of interest
         binary_models = {}
         for var_idx in binary_interest:
-            # Extract the binary variable
             x_binary = self.exog[:, var_idx]
-            
-            # Calculate the mean of normalized exp_residuals for each value of the binary variable
             eu_0 = np.mean(normalized_exp_residuals[x_binary == 0])
             eu_1 = np.mean(normalized_exp_residuals[x_binary == 1])
-            
-            # Store the model
             binary_models[var_idx] = (eu_0, eu_1)
         
-        # Create a binary regression model that handles multiple variables
-        return MultiBinaryRegressionModel(binary_models, min_exp_residual, 
+        return MultiBinaryRegressionModel(binary_models, min_exp_r, 
                                          self.binary_vars, self.ordinal_vars)
 
     def _fit_ols_model(self, exp_residuals):
-        """Fit a polynomial OLS model for E[exp(u)|X].
-        
-        Parameters
-        ----------
-        exp_residuals : array-like
-            Exponentiated residuals from the parametric model
-            
-        Returns
-        -------
-        OLSRegressionModel
-            Fitted OLS regression model
-        """
-        # Get polynomial degree from parameters (default is 3)
+        """Fit a polynomial OLS model for E[exp(u)|X]."""
         degree = self.kernel_params.get('degree', 3)
         
-        # Normalize exponentiated residuals for numerical stability
-        min_exp_residual = np.min(exp_residuals)
-        normalized_exp_residuals = exp_residuals / min_exp_residual
+        min_exp_r = np.min(exp_residuals)
+        normalized_exp_residuals = exp_residuals / min_exp_r
         
-        # Create polynomial features
         poly = PolynomialFeatures(degree=degree, include_bias=False)
         X_poly = poly.fit_transform(self.exog)
         
-        # Fit OLS model on polynomial features
         ols_model = sm.OLS(normalized_exp_residuals, X_poly).fit()
         
         print(f'OLS correction model fitted with polynomial degree {degree}')
         print(f'R-squared: {ols_model.rsquared:.4f}')
         
-        return OLSRegressionModel(ols_model, poly, min_exp_residual, 
+        return OLSRegressionModel(ols_model, poly, min_exp_r, 
                                  self.binary_vars, self.ordinal_vars)
     
     def _create_nn_model(self, nn_params):
@@ -579,121 +539,38 @@ class DoublyRobustElasticityEstimator(Model):
         optimizer = nn_params['optimizer']
         loss = nn_params['loss']
         
-        # Handle num_units as either int or list
         if isinstance(num_units, int):
             num_units = [num_units] * num_layers
         elif len(num_units) != num_layers:
             raise ValueError("num_units must be an int or a list of length num_layers")
         
-        # Create the model
         model = tf.keras.Sequential()
         model.add(tf.keras.layers.Input(shape=(self.exog.shape[1],)))
         for i in range(num_layers):
             model.add(tf.keras.layers.Dense(num_units[i], activation=activation))
         model.add(tf.keras.layers.Dense(1))
         
-        # Compile the model
         model.compile(optimizer=optimizer, loss=loss)
-        
         return model
 
     def _fit_nn_density_estimator(self, X):
-        """Fit neural network density estimator for f_X(x).
-        
-        Parameters
-        ----------
-        X : array_like of shape (n, d)
-            Data for density estimation
-            
-        Returns
-        -------
-        NNDensityEstimator
-            Fitted neural network density estimator
-        """
+        """Fit neural network density estimator for f_X(x)."""
         return NNDensityEstimator(X, **self.density_params)
-
-
-import numpy as np
-import pandas as pd
-from statsmodels.base.model import Results
-from statsmodels.nonparametric.kernel_regression import KernelReg
-from statsmodels.nonparametric.kernel_density import KDEMultivariate
-from sklearn.preprocessing import PolynomialFeatures
-import statsmodels.api as sm
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-import warnings
-import joblib
 
 
 class DoublyRobustElasticityEstimatorResults(Results):
     """
-    Results from the DoublyRobustElasticityEstimator with optional asymptotic variance.
-    
-    This class stores and presents results from the doubly robust elasticity estimator,
-    providing methods to access various statistics, visualizations, and tests with
-    properly implemented multivariate asymptotic variance calculations when requested.
-    
-    Parameters
-    ----------
-    model : DoublyRobustElasticityEstimator
-        The estimator model
-    ols_results : RegressionResults
-        Results from the initial OLS model
-    nonparam_model : RegressionModel
-        The fitted nonparametric model
-    exp_residuals : array_like
-        Exponentiated residuals from the parametric model
-    density_model : NNDensityEstimator or None, optional
-        The fitted density model for high-dimensional X
-    compute_asymptotic_variance : bool, optional
-        Whether to compute asymptotic variance components. Defaults to True.
-    bootstrap : bool, optional
-        Whether bootstrap standard errors have been computed
-    bootstrap_reps : int, optional
-        Number of bootstrap replications
-    bootstrap_estimates : array-like, optional
-        Bootstrap estimates
-    kernel_type : str, default 'gaussian'
-        Type of kernel used for nonparametric estimation
-    density_bandwidth_method : str, default 'scott'
-        Method for selecting density estimation bandwidth
-        
-    Attributes
-    ----------
-    model : DoublyRobustElasticityEstimator
-        The fitted estimator model
-    ols_results : RegressionResults
-        OLS regression results
-    nonparam_model : RegressionModel
-        Fitted nonparametric model for correction term
-    exp_residuals : ndarray
-        Exponentiated residuals from parametric model
-    beta_hat : list or ndarray
-        OLS estimates for variables of interest
-    m_hat : ndarray
-        Predicted values from nonparametric model
-    m_prime_hat : dict
-        Derivatives from nonparametric model for each variable
-    correction : dict
-        Correction terms for each variable
-    estimator_values : dict
-        Final estimator values for each variable
-    compute_asymptotic_variance : bool
-        Whether asymptotic variance components are computed
-    kernel_constants : dict or None
-        Computed kernel constants for asymptotic variance (if computed)
+    Results from the DoublyRobustElasticityEstimator supporting both OLS and PPML methods.
     """
     
-    def __init__(self, model, ols_results, nonparam_model, exp_residuals, 
+    def __init__(self, model, parametric_results, parametric_method, nonparam_model, exp_residuals, 
                  density_model=None, compute_asymptotic_variance=True, 
-                 bootstrap=False, bootstrap_reps=None, 
-                 bootstrap_estimates=None, kernel_type='gaussian', 
-                 density_bandwidth_method='scott'):
-        """Initialize the results object with optional asymptotic variance capabilities."""
+                 bootstrap=False, bootstrap_reps=None, bootstrap_estimates=None, 
+                 kernel_type='gaussian', density_bandwidth_method='scott'):
+        """Initialize the results object."""
         self.model = model
-        self.ols_results = ols_results
+        self.parametric_results = parametric_results
+        self.parametric_method = parametric_method.lower()
         self.nonparam_model = nonparam_model
         self.exp_residuals = exp_residuals
         self.interest = model.interest
@@ -714,11 +591,14 @@ class DoublyRobustElasticityEstimatorResults(Results):
         self.bootstrap_reps = bootstrap_reps
         self.bootstrap_estimates = bootstrap_estimates
         
-        # Extract the OLS estimate of the parameter(s) of interest
+        # Extract the parametric estimates (beta for OLS, gamma for PPML)
         if self.all_variables:
-            self.beta_hat = ols_results.params
+            self.parametric_coef = parametric_results.params
         else:
-            self.beta_hat = [ols_results.params[idx] for idx in self.interest]
+            self.parametric_coef = [parametric_results.params[idx] for idx in self.interest]
+        
+        # For backward compatibility, also store as beta_hat
+        self.beta_hat = self.parametric_coef
         
         # Initialize asymptotic variance components only if requested
         if self.compute_asymptotic_variance:
@@ -731,57 +611,32 @@ class DoublyRobustElasticityEstimatorResults(Results):
         self._compute_corrections()
         
         # Initialize the base Results class
-        super(DoublyRobustElasticityEstimatorResults, self).__init__(model, ols_results.params)
+        super(DoublyRobustElasticityEstimatorResults, self).__init__(model, parametric_results.params)
     
     def _initialize_asymptotic_variance(self):
-        """
-        Initialize components needed for asymptotic variance calculation.
-        
-        This method computes kernel constants and sets up the conditional variance
-        model that will be used throughout the asymptotic variance calculations.
-        """
-        # Compute kernel constants
+        """Initialize components needed for asymptotic variance calculation."""
         self.kernel_constants = self._compute_kernel_constants()
-        
-        # Initialize conditional variance model
         self._conditional_variance_model = None
         self._fit_conditional_variance_model()
     
     def _compute_kernel_constants(self):
-        """
-        Compute kernel constants for multivariate asymptotic variance calculation.
-        
-        For product kernels K(u) = ∏_{j=1}^d K_0(u_j), computes:
-        - ν₀(K) = (ν₀(K₀))^d  
-        - 𝒦₀ = ν₀(K) I_d
-        - 𝒦₁ = [ν₂(K₀)(ν₀(K₀))^{d-1} / μ₂(K₀)²] I_d
-        
-        Returns
-        -------
-        dict
-            Dictionary containing all kernel constants needed for variance calculations
-        """
+        """Compute kernel constants for multivariate asymptotic variance calculation."""
         d = self.n_vars
         
         if self.kernel_type == 'gaussian':
-            # Theoretical values for standard Gaussian kernel K₀(u) = (2π)^{-1/2} exp(-u²/2)
-            nu_0_K0 = 1 / (2 * np.sqrt(np.pi))  # ≈ 0.2821
+            nu_0_K0 = 1 / (2 * np.sqrt(np.pi))
             mu_2_K0 = 1.0
-            nu_2_K0 = 3 / (4 * np.sqrt(np.pi))  # ≈ 0.4239
-            
+            nu_2_K0 = 3 / (4 * np.sqrt(np.pi))
         elif self.kernel_type == 'epanechnikov':
-            # Theoretical values for Epanechnikov kernel K₀(u) = (3/4)(1-u²)𝟙{|u|≤1}
             nu_0_K0 = 3/5
             mu_2_K0 = 1/5  
             nu_2_K0 = 3/35
-            
         else:
             warnings.warn(f"Unknown kernel type '{self.kernel_type}'. Using Gaussian defaults.")
             nu_0_K0 = 1 / (2 * np.sqrt(np.pi))
             mu_2_K0 = 1.0
             nu_2_K0 = 3 / (4 * np.sqrt(np.pi))
         
-        # Compute multivariate kernel constants
         K_0_scalar = nu_0_K0 ** d
         K_0_matrix = K_0_scalar * np.eye(d)
         
@@ -799,20 +654,13 @@ class DoublyRobustElasticityEstimatorResults(Results):
         }
     
     def _fit_conditional_variance_model(self):
-        """
-        Fit nonparametric model for conditional variance σ²_w(x) = Var(e^u|X=x).
-        
-        Uses the same nonparametric method as the main model to estimate
-        E[w²|X] where w = e^u, then computes σ²_w(x) = E[w²|X=x] - (E[w|X=x])².
-        """
+        """Fit nonparametric model for conditional variance σ²_w(x) = Var(e^u|X=x)."""
         if self.model.estimator_type == 'kernel':
-        # Use same kernel parameters as main model
             var_type = self.model.kernel_params.get('var_type', 'c' * self.n_vars)
             bw = self.model.kernel_params.get('bw', 'cv_ls')
             
             exp_residuals_squared = self.exp_residuals ** 2
             
-            from statsmodels.nonparametric.kernel_regression import KernelReg
             self._conditional_variance_model = KernelReg(
                 endog=exp_residuals_squared,
                 exog=self.model.exog,
@@ -820,28 +668,21 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 reg_type='ll',
                 bw=bw
             )
-            
         elif self.model.estimator_type == 'ols':
-            # Use polynomial features
             degree = self.model.kernel_params.get('degree', 3)
             self._poly_variance = PolynomialFeatures(degree=degree, include_bias=False)
             
             exp_residuals_squared = self.exp_residuals ** 2
             X_poly = self._poly_variance.fit_transform(self.model.exog)
             self._conditional_variance_model = sm.OLS(exp_residuals_squared, X_poly).fit()
-            
         elif self.model.estimator_type == 'nn':
-            # Use unified neural network density estimator for conditional variance
             print("Fitting neural network for conditional variance estimation...")
             self._conditional_variance_model = self._fit_nn_conditional_variance_model()
             print("Neural network conditional variance model fitted successfully!")
-            
         else:
-            # For binary and other methods, use simple kernel
             exp_residuals_squared = self.exp_residuals ** 2
             var_type = 'c' * self.n_vars
             
-            from statsmodels.nonparametric.kernel_regression import KernelReg
             self._conditional_variance_model = KernelReg(
                 endog=exp_residuals_squared,
                 exog=self.model.exog,
@@ -851,67 +692,32 @@ class DoublyRobustElasticityEstimatorResults(Results):
             )
 
     def _fit_nn_conditional_variance_model(self):
-        """
-        Fit neural network model for conditional variance estimation using unified estimator.
-        
-        Returns
-        -------
-        NNDensityEstimator
-            Fitted neural network model for conditional variance estimation
-            
-        Notes
-        -----
-        This method uses the unified NNDensityEstimator class for conditional variance,
-        ensuring consistency with the main density estimation approach.
-        """
-        # Get squared exponentiated residuals
+        """Fit neural network model for conditional variance estimation."""
         exp_residuals_squared = self.exp_residuals ** 2
         
-        # Use same neural network parameters as main model, with some adjustments
-        density_params = dict(self.model.density_params)  # Create a copy
+        density_params = dict(self.model.density_params)
         
-        # Reduce complexity slightly for variance estimation (often less complex than mean)
         if 'hidden_layers' in density_params:
-            # Reduce each layer size by ~25%
             density_params['hidden_layers'] = [max(16, int(0.75 * units)) 
                                               for units in density_params['hidden_layers']]
         
-        # Set target variable to squared residuals
         density_params['target_type'] = 'conditional_variance'
-        density_params.setdefault('verbose', 0)  # Less verbose for conditional variance
+        density_params.setdefault('verbose', 0)
         
         try:
-            # Create neural network density estimator for conditional variance
             nn_estimator = NNDensityEstimator(
                 X=self.model.exog,
                 y=exp_residuals_squared,
                 **density_params
             )
-            
             return nn_estimator
-            
         except Exception as e:
             warnings.warn(f"Neural network conditional variance training failed: {e}. "
                          f"Falling back to kernel method.")
-            # Fall back to kernel method
             return self._fit_kernel_conditional_variance_fallback()
 
     def _fit_kernel_conditional_variance_fallback(self):
-        """
-        Fallback method using kernel regression when neural network fails.
-        
-        Returns
-        -------
-        KernelReg
-            Fitted kernel regression model for conditional variance
-            
-        Notes
-        -----
-        This fallback ensures robustness when neural network training fails
-        due to numerical issues or other problems.
-        """
-        from statsmodels.nonparametric.kernel_regression import KernelReg
-        
+        """Fallback method using kernel regression when neural network fails."""
         exp_residuals_squared = self.exp_residuals ** 2
         var_type = 'c' * self.n_vars
         
@@ -926,22 +732,9 @@ class DoublyRobustElasticityEstimatorResults(Results):
         )
 
     def _estimate_conditional_variance(self, x):
-        """
-        Estimate conditional variance σ²_w(x) = Var(e^u|X=x) at point x.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d) or (d,)
-            Point at which to evaluate conditional variance
-            
-        Returns
-        -------
-        float
-            Estimated conditional variance σ²_w(x)
-        """
+        """Estimate conditional variance σ²_w(x) = Var(e^u|X=x) at point x."""
         if not self.compute_asymptotic_variance:
-            raise ValueError("Asymptotic variance computation is disabled. "
-                           "Set compute_asymptotic_variance=True to enable.")
+            raise ValueError("Asymptotic variance computation is disabled.")
         
         x = np.atleast_2d(x)
         if x.shape[0] != 1:
@@ -952,10 +745,8 @@ class DoublyRobustElasticityEstimatorResults(Results):
             x_poly = self._poly_variance.transform(x)
             m_w2_x = self._conditional_variance_model.predict(x_poly)[0]
         elif hasattr(self._conditional_variance_model, 'predict_density'):
-            # Neural network case using unified estimator
             m_w2_x = self._conditional_variance_model.predict_density(x)[0]
         else:
-            # Kernel or other methods
             m_w2_x = self._conditional_variance_model.fit(x)[0][0]
         
         # Get E[w|X=x] = m(x)
@@ -967,69 +758,37 @@ class DoublyRobustElasticityEstimatorResults(Results):
         return conditional_var
 
     def _estimate_density(self, x):
-        """
-        Estimate density f_X(x) at point x using the appropriate density estimator.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d) or (d,)
-            Point at which to evaluate density
-            
-        Returns
-        -------
-        float
-            Estimated density f_X(x)
-        """
+        """Estimate density f_X(x) at point x."""
         if not self.compute_asymptotic_variance:
-            raise ValueError("Asymptotic variance computation is disabled. "
-                           "Set compute_asymptotic_variance=True to enable.")
+            raise ValueError("Asymptotic variance computation is disabled.")
         
         x = np.atleast_2d(x)
         
         if self.density_model is not None:
-            # Use neural network density estimator
             return self.density_model.predict_density(x)[0]
         else:
-            # Use kernel density estimation
             var_type = 'c' * self.n_vars
-            
-            # Create KDE object
             kde = KDEMultivariate(
                 data=self.model.exog,
                 var_type=var_type,
                 bw=self.density_bandwidth_method
             )
-            
             return kde.pdf(x.flatten())
     
     def _get_bandwidth(self):
-        """
-        Get bandwidth used in the nonparametric model.
-        
-        Returns
-        -------
-        float
-            Bandwidth parameter. For multivariate case, returns mean bandwidth.
-        """
+        """Get bandwidth used in the nonparametric model."""
         if hasattr(self.nonparam_model, 'bandwidth') and self.nonparam_model.bandwidth is not None:
             bandwidth = self.nonparam_model.bandwidth
-            # Convert to scalar if needed (take mean for multivariate)
             if hasattr(bandwidth, '__len__') and len(bandwidth) > 1:
                 return np.mean(bandwidth)
             else:
                 return float(bandwidth)
         else:
-            # Rule of thumb bandwidth for d-dimensional case
             return self.n_obs ** (-1 / (4 + self.n_vars))
     
     def _compute_corrections(self):
-        """
-        Compute correction terms for all data points in the sample.
-        
-        This method calculates the nonparametric corrections and final estimator
-        values for each variable of interest.
-        """
-        # Get the values of m(x) for all observations
+        """Compute correction terms for all data points in the sample."""
+        # Get the values of m(x) or psi(x) for all observations
         self.m_hat = self.nonparam_model.predict(self.model.exog)
         
         # Initialize dictionaries to store results for each variable of interest
@@ -1043,12 +802,11 @@ class DoublyRobustElasticityEstimatorResults(Results):
             self.m_prime_hat[var_idx] = self.nonparam_model.derivative(self.model.exog, var_idx)
             
             if var_idx in self.model.binary_vars:
-                # For binary variables, use the formula: e^{beta} * (m1/m0) - 1
-                # Get beta coefficient
+                # For binary variables, use the formula: e^{coef} * (m1/m0) - 1
                 if self.all_variables:
-                    beta_hat = self.beta_hat[var_idx]
+                    param_coef = self.parametric_coef[var_idx]
                 else:
-                    beta_hat = self.beta_hat[i]
+                    param_coef = self.parametric_coef[i]
                 
                 # Get m0 and m1 values
                 X_0 = self.model.exog.copy()
@@ -1058,114 +816,38 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 m_0 = self.nonparam_model.predict(X_0)
                 m_1 = self.nonparam_model.predict(X_1)
                 
-                # For binary variables, the semi-elasticity is e^{beta} * (m1/m0) - 1
-                # This is constant for all observations
-                semi_elasticity = np.exp(beta_hat) * (m_1 / m_0) - 1
+                # For binary variables, the semi-elasticity is e^{coef} * (m1/m0) - 1
+                semi_elasticity = np.exp(param_coef) * (m_1 / m_0) - 1
                 self.estimator_values[var_idx] = semi_elasticity
                 
-                # Store correction term for consistency (though not used for binary)
+                # Store correction term for consistency
                 self.correction[var_idx] = self.m_prime_hat[var_idx] / self.m_hat
             else:
-                # For continuous variables, use the original logic
+                # For continuous variables, use the appropriate formula
                 # Compute the correction term
                 self.correction[var_idx] = self.m_prime_hat[var_idx] / self.m_hat
                 
                 # Compute the doubly robust estimator values
                 if self.model.elasticity and self.model.log_x[i]:
                     # For elasticity with log(x)
-                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx]
+                    self.estimator_values[var_idx] = self.parametric_coef[i] + self.correction[var_idx]
                 elif not self.model.elasticity and not self.model.log_x[i]:
                     # For semi-elasticity with untransformed x
-                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx]
+                    self.estimator_values[var_idx] = self.parametric_coef[i] + self.correction[var_idx]
                 elif self.model.elasticity and not self.model.log_x[i]:
                     # For elasticity with untransformed x
-                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx] * self.model.exog[:, var_idx]
+                    self.estimator_values[var_idx] = self.parametric_coef[i] + self.correction[var_idx] * self.model.exog[:, var_idx]
                 else:  # not self.model.elasticity and self.model.log_x[i]
                     # For semi-elasticity with log(x)
-                    self.estimator_values[var_idx] = self.beta_hat[i] + self.correction[var_idx] / self.model.exog[:, var_idx]
+                    x_val_col = self.model.exog[:, var_idx].copy()
+                    x_val_col[x_val_col == 0] = 1e-9
+                    self.estimator_values[var_idx] = self.parametric_coef[i] + self.correction[var_idx] / x_val_col
 
-    def asymptotic_variance_matrix(self, x):
-        """
-        Compute full d×d asymptotic variance-covariance matrix at point x.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d) or (d,)
-            Point at which to compute asymptotic variance matrix
-            
-        Returns
-        -------
-        ndarray of shape (d, d)
-            Asymptotic variance-covariance matrix AVar(ẑ(x))
-            
-        Notes
-        -----
-        Implements the corrected multivariate formula:
-        
-        .. math::
-            \\widehat{AVar}(\\hat{z}(x)) = \\frac{\\hat{\\sigma}_w^2(x)}{N \\hat{f}_X(x) h^{d+2} \\hat{m}(x)^4} 
-            \\left[ \\hat{m}(x)^2 \\mathcal{K}_1 + h^2 \\nabla \\hat{m}(x)(\\nabla \\hat{m}(x))^T \\mathcal{K}_0 \\right]
-        """
-        if not self.compute_asymptotic_variance:
-            raise ValueError("Asymptotic variance computation is disabled. "
-                           "Set compute_asymptotic_variance=True to enable.")
-        
-        x = np.atleast_2d(x)
-        if x.shape[0] != 1:
-            raise ValueError("x must be a single point of shape (1, d)")
-        
-        # Get required components
-        sigma_w2_x = self._estimate_conditional_variance(x)
-        f_x = self._estimate_density(x)
-        h = self._get_bandwidth()
-        m_x = self.nonparam_model.predict(x)[0]
-        
-        # Get gradient vector ∇m(x)
-        grad_m_x = np.zeros(self.n_vars)
-        for j in range(self.n_vars):
-            grad_m_x[j] = self.nonparam_model.derivative(x, j)[0]
-        
-        # Extract kernel constants
-        K_0_matrix = self.kernel_constants['K_0_matrix']
-        K_1_matrix = self.kernel_constants['K_1_matrix']
-        
-        # Compute the two terms
-        # Term 1: m̂(x)² 𝒦₁ / (nh^{d+2})
-        term1 = (m_x**2 / (self.n_obs * h**(self.n_vars + 2))) * K_1_matrix
-        
-        # Term 2: h² ∇m̂(x)(∇m̂(x))ᵀ 𝒦₀ / (nh^d)  
-        grad_outer = np.outer(grad_m_x, grad_m_x)
-        term2 = (h**2 / (self.n_obs * h**self.n_vars)) * grad_outer @ K_0_matrix
-        
-        # Combine terms with common factor
-        common_factor = sigma_w2_x / (f_x * m_x**4)
-        
-        avar_matrix = common_factor * (term1 + term2)
-        
-        return avar_matrix
-    
     def asymptotic_variance(self, x, variable_idx=None):
-        """
-        Compute scalar asymptotic variance for specific variable at point x.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d) or (d,)
-            Point at which to compute asymptotic variance
-        variable_idx : int or str, optional
-            Index or name of variable for which to compute variance.
-            If None, uses first variable of interest.
-            
-        Returns
-        -------
-        float
-            Asymptotic variance AVar(ẑⱼ(x)) for variable j
-        """
+        """Compute scalar asymptotic variance for specific variable at point x."""
         if not self.compute_asymptotic_variance:
-            raise ValueError("Asymptotic variance computation is disabled. "
-                           "Set compute_asymptotic_variance=True to enable.")
+            raise ValueError("Asymptotic variance computation is disabled.")
         
-        # Handle variable selection
         if variable_idx is None:
             variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
         elif isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
@@ -1190,10 +872,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
         K_1_scalar = self.kernel_constants['K_1_scalar']
         
         # Compute scalar version of the formula
-        # Term 1: m̂(x)² K₁ / (nh^{d+2})
         term1 = (m_x**2 * K_1_scalar) / (self.n_obs * h**(self.n_vars + 2))
-        
-        # Term 2: h² (∂m̂/∂xⱼ)² K₀ / (nh^d)
         term2 = (h**2 * m_prime_x**2 * K_0_scalar) / (self.n_obs * h**self.n_vars)
         
         # Common factor
@@ -1204,62 +883,17 @@ class DoublyRobustElasticityEstimatorResults(Results):
         return avar_scalar
     
     def asymptotic_standard_error_at_point(self, x, variable_idx=None):
-        """
-        Compute asymptotic standard error at point x.
-        
-        Parameters
-        ----------
-        x : array_like of shape (1, d) or (d,)
-            Point at which to compute standard error
-        variable_idx : int or str, optional
-            Variable for which to compute standard error.
-            If None, uses first variable of interest.
-            
-        Returns
-        -------
-        float
-            Asymptotic standard error
-        """
+        """Compute asymptotic standard error at point x."""
         variance = self.asymptotic_variance(x, variable_idx)
         return np.sqrt(variance)
     
     def asymptotic_standard_error_at_average(self, variable_idx=None):
-        """
-        Compute asymptotic standard error at average values of regressors.
-        
-        Parameters
-        ----------
-        variable_idx : int or str, optional
-            Variable for which to compute standard error.
-            If None, uses first variable of interest.
-            
-        Returns
-        -------
-        float
-            Asymptotic standard error at average X
-        """
+        """Compute asymptotic standard error at average values of regressors."""
         X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
         return self.asymptotic_standard_error_at_point(X_mean, variable_idx)
     
     def asymptotic_confidence_interval(self, x, variable_idx=None, alpha=0.05):
-        """
-        Compute asymptotic confidence interval at point x.
-        
-        Parameters  
-        ----------
-        x : array_like of shape (1, d) or (d,)
-            Point at which to compute confidence interval
-        variable_idx : int or str, optional
-            Variable for confidence interval. If None, uses first variable of interest.
-        alpha : float, default 0.05
-            Significance level (1-α confidence level)
-            
-        Returns
-        -------
-        tuple of float
-            (lower_bound, upper_bound) for confidence interval
-        """
-        # Handle variable selection
+        """Compute asymptotic confidence interval at point x."""
         if variable_idx is None:
             variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
         elif isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
@@ -1274,78 +908,13 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
         return (lower_bound, upper_bound)
 
-    # Keep all the existing methods but update the ones that use asymptotic variance
-    def std_error_at_average(self, variable_idx=None):
-        """
-        Calculate the standard error of the estimator at average values.
-        
-        Parameters
-        ----------
-        variable_idx : int or str, optional
-            Variable for which to compute standard error.
-            
-        Returns
-        -------
-        float
-            Standard error at average X values
-        """
-        if self.compute_asymptotic_variance:
-            return self.asymptotic_standard_error_at_average(variable_idx)
-        else:
-            raise ValueError("Standard error computation requires asymptotic variance. "
-                           "Set compute_asymptotic_variance=True or use bootstrap.")
-    
-    def conf_int(self, alpha=0.05, point=None, variable_idx=None):
-        """
-        Calculate confidence intervals for the estimator at a specific point.
-        
-        Parameters
-        ----------
-        alpha : float, default 0.05
-            Significance level for (1-α)×100% confidence interval
-        point : array_like of shape (1, d), optional
-            Point at which to compute confidence interval. 
-            If None, uses average values of regressors.
-        variable_idx : int or str, optional
-            Variable for confidence interval. If None, uses first variable of interest.
-            
-        Returns
-        -------
-        tuple of float
-            (lower_bound, upper_bound) for the confidence interval
-        """
-        if self.compute_asymptotic_variance:
-            if point is None:
-                point = np.mean(self.model.exog, axis=0).reshape(1, -1)
-                
-            return self.asymptotic_confidence_interval(point, variable_idx, alpha)
-        else:
-            raise ValueError("Confidence interval computation requires asymptotic variance. "
-                           "Set compute_asymptotic_variance=True or use bootstrap.")
-
-    # Keep all other existing methods unchanged (bootstrap, plotting, etc.)
-    def _bootstrap_standard_errors(self, bootstrap_reps, bootstrap_method, weights, kwargs):
-        """
-        Compute bootstrap standard errors.
-        
-        Parameters
-        ----------
-        bootstrap_reps : int
-            Number of bootstrap replications
-        bootstrap_method : str
-            Bootstrap method to use: 'pairs' only (residuals method removed)
-        weights : array-like or None
-            Weights for WLS if provided
-        kwargs : dict
-            Additional arguments for the OLS fit method
-        """
+    def _bootstrap_standard_errors(self, bootstrap_reps, bootstrap_method, weights, kwargs, method):
+        """Compute bootstrap standard errors."""
         if bootstrap_method != 'pairs':
-            raise ValueError(f"Bootstrap method '{bootstrap_method}' not supported. "
-                            f"Only 'pairs' bootstrap is available.")
+            raise ValueError("Only 'pairs' bootstrap is available.")
         
         n = len(self.model.endog)
         
-        # Initialize storage for bootstrap estimates
         if self.all_variables:
             var_indices = self.interest
         else:
@@ -1377,33 +946,30 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 density_params=self.model.density_params
             )
             
-            # Fit the bootstrapped model (disable asymptotic variance for bootstrap)
-            bs_results = bs_model.fit(weights=weights, bootstrap=False, 
+            # Fit the bootstrapped model with the specified method
+            bs_results = bs_model.fit(weights=weights, method=method, bootstrap=False, 
                                     compute_asymptotic_variance=False, **kwargs)
             
             # Store estimates from this bootstrap replication for each variable
-            X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
             for var_idx in var_indices:
-                # Find the position of this variable in the bootstrapped results
                 if bs_results.all_variables:
                     var_pos = list(bs_results.interest).index(var_idx)
-                    beta_hat = bs_results.beta_hat[var_idx]
+                    param_coef = bs_results.parametric_coef[var_idx]
                 else:
                     var_pos = bs_results.interest.index(var_idx)
-                    beta_hat = bs_results.beta_hat[var_pos]
+                    param_coef = bs_results.parametric_coef[var_pos]
                 
                 original_X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1)
 
-                bootstrap_estimates_dict[var_idx][i, 0] = beta_hat  # OLS estimate
-                bootstrap_estimates_dict[var_idx][i, 1] = np.mean(bs_results.correction[var_idx])  # Average correction
-                # Average estimate 
+                bootstrap_estimates_dict[var_idx][i, 0] = param_coef
+                bootstrap_estimates_dict[var_idx][i, 1] = np.mean(bs_results.correction[var_idx])
+                
                 original_estimator_values = bs_results.calculate_estimator_at_points(
                     self.model.exog, var_idx 
                 )
                 bootstrap_estimates_dict[var_idx][i, 2] = np.mean(original_estimator_values)
-
                 bootstrap_estimates_dict[var_idx][i, 3] = bs_results.estimate_at_point(
-                    original_X_mean, var_idx  # Use original average, not bootstrap average
+                    original_X_mean, var_idx
                 )
         
         self.bootstrap = True
@@ -1415,55 +981,51 @@ class DoublyRobustElasticityEstimatorResults(Results):
                                  for var_idx in var_indices}
 
     def summary(self):
-        """
-        Provide a summary of the results with available standard errors.
-        
-        Returns
-        -------
-        Summary
-            Summary object containing results tables and statistics
-        """
+        """Provide a summary of the results."""
         from statsmodels.iolib.summary2 import Summary
         
         smry = Summary()
         
         # Add a title
+        method_name = "OLS-based" if self.parametric_method == 'ols' else "PPML-based"
         if self.model.elasticity:
-            title = "Doubly Robust Elasticity Estimator Results"
+            title = f"Doubly Robust Elasticity Estimator Results ({method_name})"
         else:
-            title = "Doubly Robust Semi-Elasticity Estimator Results"
+            title = f"Doubly Robust Semi-Elasticity Estimator Results ({method_name})"
             
         smry.add_title(title)
         
-        # Add OLS results
-        smry.add_text("OLS Results:")
-        # Get the OLS summary table and convert to DataFrame
-        ols_summary_table = self.ols_results.summary().tables[1]
-        if hasattr(ols_summary_table, 'data'):
-            # Extract data from the table
-            ols_data = []
-            for row in ols_summary_table.data[1:]:  # Skip header
-                ols_data.append(row)
-            ols_df = pd.DataFrame(ols_data, columns=ols_summary_table.data[0])
-            smry.add_df(ols_df)
+        # Add parametric results
+        method_upper = self.parametric_method.upper()
+        smry.add_text(f"{method_upper} Results:")
+        
+        # Get the parametric summary table
+        param_summary_table = self.parametric_results.summary().tables[1]
+        if hasattr(param_summary_table, 'data'):
+            param_data = []
+            for row in param_summary_table.data[1:]:
+                param_data.append(row)
+            param_df = pd.DataFrame(param_data, columns=param_summary_table.data[0])
+            smry.add_df(param_df)
         else:
-            smry.add_text(str(ols_summary_table))
+            smry.add_text(str(param_summary_table))
         
         # Build a table of corrected estimates for each variable of interest
         data = []
         
-        # Add rows for each variable of interest
         for i, var_idx in enumerate(self.interest):
             var_name = self.model.exog_names[var_idx]
             row = {}
             row["Variable"] = var_name
             
-            # Add OLS estimate
+            # Add parametric estimate
             if self.all_variables:
-                beta_hat = self.beta_hat[var_idx]
+                param_coef = self.parametric_coef[var_idx]
             else:
-                beta_hat = self.beta_hat[i]
-            row["OLS Estimate"] = f"{beta_hat:.4f}"
+                param_coef = self.parametric_coef[i]
+            
+            coef_name = "Beta" if self.parametric_method == 'ols' else "Gamma"
+            row[f"{coef_name} Estimate"] = f"{param_coef:.4f}"
             
             # Add average correction
             avg_corr = np.mean(self.correction[var_idx])
@@ -1477,10 +1039,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
             est_at_avg = self.estimate_at_average(var_idx)
             row["Estimate at Average"] = f"{est_at_avg:.4f}"
             
-            # Add standard errors and CI based on bootstrap or asymptotic
+            # Add standard errors based on method used
             if self.bootstrap:
                 if hasattr(self, 'bootstrap_se_dict'):
-                    se = self.bootstrap_se_dict[var_idx][3]  # Index 3 is for 'Estimate at Average'
+                    se = self.bootstrap_se_dict[var_idx][3]
                     row["Bootstrap SE"] = f"{se:.4f}"
                     row["95% CI Lower"] = f"{est_at_avg - 1.96 * se:.4f}"
                     row["95% CI Upper"] = f"{est_at_avg + 1.96 * se:.4f}"
@@ -1506,11 +1068,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
             
             data.append(row)
         
-        # Create DataFrame from the data dictionary
         results_df = pd.DataFrame(data)
         results_df = results_df.set_index("Variable")
         
-        smry.add_text("\nDoubly Robust Estimates:")
+        smry.add_text(f"\nDoubly Robust Estimates (Estimator {1 if self.parametric_method == 'ols' else 2}):")
         smry.add_df(results_df)
         
         # Add information about the nonparametric component
@@ -1530,7 +1091,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
         
         return smry
 
-    # Keep all other existing methods unchanged
+    # Keep all other existing methods...
     def estimate_at_average(self, variable_idx=None):
         """Calculate the estimator at the average values of regressors."""
         X_mean = np.mean(self.model.exog, axis=0).reshape(1, -1) 
@@ -1546,11 +1107,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
         return np.mean(self.estimator_values[variable_idx])
     
     def estimate_at_point(self, X_points, variable_idx=None):
-        """
-        Calculate the estimator at specific point(s) X_points.
-        X_points can be a single point (1D or 2D array) or multiple points (2D array).
-        Returns an array of estimates.
-        """
+        """Calculate the estimator at specific point(s) X_points."""
         if not isinstance(X_points, np.ndarray):
             X_points = np.array(X_points)
         if X_points.ndim == 1:
@@ -1561,27 +1118,22 @@ class DoublyRobustElasticityEstimatorResults(Results):
 
         # Handle variable selection
         if variable_idx is None:
-            if not self.interest: # Should not happen if model is fit
+            if not self.interest:
                 raise ValueError("No variable of interest specified or found.")
-            variable_idx = self.interest[0] # Default to the first variable in the interest list
+            variable_idx = self.interest[0]
         elif isinstance(variable_idx, str):
             if variable_idx not in self.model.exog_names:
                 raise ValueError(f"Variable name '{variable_idx}' not in exog_names: {self.model.exog_names}")
             variable_idx = self.model.exog_names.index(variable_idx)
-        # variable_idx is now an integer index for self.model.exog
 
-        # Get OLS beta and log_x for the specific variable_idx
-        current_ols_beta = self.ols_results.params[variable_idx]
+        # Get parametric coefficient and log_x for the specific variable_idx
+        current_param_coef = self.parametric_results.params[variable_idx]
         try:
-            # Find position of variable_idx in the model's interest list to get corresponding log_x
             idx_in_model_interest_list = self.model.interest.index(variable_idx)
             current_log_x_bool = self.model.log_x[idx_in_model_interest_list]
         except ValueError:
-            # Should not happen if variable_idx is from self.interest,
-            # but as a fallback if variable_idx was passed freely:
             warnings.warn(f"Variable index {variable_idx} not in model.interest. Defaulting log_x to False for it.")
             current_log_x_bool = False
-
 
         if variable_idx in self.model.binary_vars:
             X_0 = X_points.copy()
@@ -1589,74 +1141,33 @@ class DoublyRobustElasticityEstimatorResults(Results):
             X_0[:, variable_idx] = 0
             X_1[:, variable_idx] = 1
             
-            m_0 = self.nonparam_model.predict(X_0) # Expected 1D array of size num_points
-            m_1 = self.nonparam_model.predict(X_1) # Expected 1D array
+            m_0 = self.nonparam_model.predict(X_0)
+            m_1 = self.nonparam_model.predict(X_1)
             
-            m_0[m_0 == 0] = 1e-9 # Avoid division by zero
-            estimates = np.exp(current_ols_beta) * (m_1 / m_0) - 1
+            m_0[m_0 == 0] = 1e-9
+            estimates = np.exp(current_param_coef) * (m_1 / m_0) - 1
         else:
-            m_at_points = self.nonparam_model.predict(X_points) # Expected 1D array
-            m_prime_at_points = self.nonparam_model.derivative(X_points, variable_idx) # Expected 1D array
+            m_at_points = self.nonparam_model.predict(X_points)
+            m_prime_at_points = self.nonparam_model.derivative(X_points, variable_idx)
 
-            m_at_points[m_at_points == 0] = 1e-9 # Avoid division by zero
+            m_at_points[m_at_points == 0] = 1e-9
             correction = m_prime_at_points / m_at_points
             
             if self.model.elasticity and current_log_x_bool:
-                estimates = current_ols_beta + correction
+                estimates = current_param_coef + correction
             elif not self.model.elasticity and not current_log_x_bool:
-                estimates = current_ols_beta + correction
+                estimates = current_param_coef + correction
             elif self.model.elasticity and not current_log_x_bool:
-                estimates = current_ols_beta + correction * X_points[:, variable_idx]
-            else:  # not self.model.elasticity and current_log_x_bool
+                estimates = current_param_coef + correction * X_points[:, variable_idx]
+            else:
                 x_val_col = X_points[:, variable_idx].copy()
                 x_val_col[x_val_col == 0] = 1e-9
-                estimates = current_ols_beta + correction / x_val_col
+                estimates = current_param_coef + correction / x_val_col
         
-        return estimates if num_points > 1 else estimates[0] # Return scalar if single point input
+        return estimates if num_points > 1 else estimates[0]
 
-
-    def calculate_estimator_at_points_parallel(self, X_points, variable_idx=None, n_jobs=-1, backend='threading'):
-        """Calculate estimator values with parallel processing (pickle-safe)."""
-        import joblib # Moved import here
-        
-        if not isinstance(X_points, np.ndarray):
-            X_points = np.array(X_points)
-        if X_points.ndim == 1: # If a single point is passed
-             X_points = X_points.reshape(1, -1)
-
-        if backend == 'threading' and n_jobs == 1: # No benefit from parallel overhead for 1 job
-            return self.estimate_at_point(X_points, variable_idx)
-        
-        # If estimate_at_point is now fast and vectorized, this parallel map might be slower due to overhead
-        # unless X_points is huge and estimate_at_point still has bottlenecks (e.g. ordinal derivative loops)
-        # For simplicity, let's assume it processes point-by-point for parallel to use the existing structure
-        
-        if backend == 'threading':
-            # For threading, we can still use the new estimate_at_point but apply it per row
-            # if we want to keep the existing joblib structure.
-            # However, if estimate_at_point is vectorized, just call it once.
-            # Let's assume for now the user of parallel wants to parallelize over rows.
-            estimator_values = joblib.Parallel(n_jobs=n_jobs, backend='threading')(
-                joblib.delayed(lambda x_row: self.estimate_at_point(x_row.reshape(1, -1), variable_idx))(x_point_row) 
-                for x_point_row in X_points
-            )
-        else: # multiprocessing
-            # _estimate_single_point_worker expects self (results_obj) to have estimate_at_point
-            # that takes a single point.
-            args = [(x_point_row, self, variable_idx) for x_point_row in X_points]
-            estimator_values = joblib.Parallel(n_jobs=n_jobs, backend='multiprocessing')(
-                joblib.delayed(_estimate_single_point_worker)(arg) for arg in args
-            )
-        
-        return np.array(estimator_values).flatten() # Ensure it's a flat array like other methods
-    
-
-    
     def calculate_estimator_at_points(self, X_points, variable_idx=None):
-        """
-        Calculate estimator values at specific X points.
-        This method is now a direct wrapper for the vectorized estimate_at_point.
-        """
+        """Calculate estimator values at specific X points."""
         return self.estimate_at_point(X_points, variable_idx)
 
     def predict(self, exog=None):
@@ -1664,78 +1175,57 @@ class DoublyRobustElasticityEstimatorResults(Results):
         if exog is None:
             exog = self.model.exog
             
-        # Get the OLS predictions on the log scale
-        log_pred = self.ols_results.predict(exog)
-        
-        # Get the correction terms
-        m_hat = self.nonparam_model.predict(exog)
-        
-        # Return transformed predictions (exponentiated and corrected)
-        return np.exp(log_pred) * m_hat
+        if self.parametric_method == 'ols':
+            # Get the OLS predictions on the log scale
+            log_pred = self.parametric_results.predict(exog)
+            # Return transformed predictions (exponentiated and corrected)
+            return np.exp(log_pred) * self.nonparam_model.predict(exog)
+        else:  # PPML
+            # Get the PPML predictions (already on the level scale)
+            level_pred = self.parametric_results.fittedvalues
+            # Return corrected predictions
+            return level_pred * self.nonparam_model.predict(exog)
 
     def plot_distribution(self, variable_idx=None):
         """Plot the distribution of estimator values."""
-        # Convert variable name to index if needed
         if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
             variable_idx = self.model.exog_names.index(variable_idx)
         elif variable_idx is None:
             variable_idx = self.interest[0]
             
-        # Get the position of this variable in the interest list
         if self.all_variables:
             i = list(self.interest).index(variable_idx)
-            beta_hat = self.beta_hat[variable_idx]
+            param_coef = self.parametric_coef[variable_idx]
             var_name = self.model.exog_names[variable_idx]
         else:
             i = self.interest.index(variable_idx)
-            beta_hat = self.beta_hat[i]
+            param_coef = self.parametric_coef[i]
             var_name = self.model.exog_names[variable_idx]
         
         fig, ax = plt.subplots(figsize=(10, 6))
         
         sns.kdeplot(self.estimator_values[variable_idx], ax=ax)
-        ax.axvline(x=beta_hat, color='red', linestyle='--', label='OLS Estimate')
+        
+        coef_name = "OLS" if self.parametric_method == 'ols' else "PPML"
+        ax.axvline(x=param_coef, color='red', linestyle='--', label=f'{coef_name} Estimate')
         ax.axvline(x=np.mean(self.estimator_values[variable_idx]), color='blue', linestyle='--', 
                   label='Doubly Robust Average')
         ax.axvline(x=self.estimate_at_average(variable_idx), color='green', linestyle='--', 
                   label='Estimate at Average')
         
+        estimator_name = "Estimator 1" if self.parametric_method == 'ols' else "Estimator 2"
         if self.model.elasticity:
-            ax.set_title(f'Distribution of Elasticity Estimates for {var_name}')
+            ax.set_title(f'Distribution of Elasticity Estimates for {var_name} ({estimator_name})')
             ax.set_xlabel('Elasticity')
         else:
-            ax.set_title(f'Distribution of Semi-Elasticity Estimates for {var_name}')
+            ax.set_title(f'Distribution of Semi-Elasticity Estimates for {var_name} ({estimator_name})')
             ax.set_xlabel('Semi-Elasticity')
         
         ax.set_ylabel('Density')
         ax.legend()
         
         return fig
-    
-    def plot_correction(self, variable_idx=None):
-        """Plot the correction term against the regressor of interest."""
-        # Convert variable name to index if needed
-        if isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
-            variable_idx = self.model.exog_names.index(variable_idx)
-        elif variable_idx is None:
-            variable_idx = self.interest[0]
-            
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        x_values = self.model.exog[:, variable_idx]
-        
-        sns.scatterplot(x=x_values, y=self.correction[variable_idx], ax=ax, alpha=0.5)
-        
-        # Add a smoothed line
-        sns.regplot(x=x_values, y=self.correction[variable_idx], ax=ax, scatter=False, 
-                   lowess=True, line_kws={'color': 'red'})
-        
-        ax.set_title(f'Correction Term vs {self.model.exog_names[variable_idx]}')
-        ax.set_xlabel(f'Regressor: {self.model.exog_names[variable_idx]}')
-        ax.set_ylabel('Correction Term')
-        
-        return fig
-    
+
     def plot_bootstrap_distribution(self, statistic='estimate_at_average', variable_idx=None):
         """
         Plot the bootstrap distribution for a given statistic.
@@ -2722,96 +2212,66 @@ if __name__ == "__main__":
     import pandas as pd
     import matplotlib.pyplot as plt
     
-    # Generate some sample data
+    # Generate sample data
     np.random.seed(6699)
-    n = 20000
+    n = 5000
     x1 = np.random.normal(5, 1, n)
+    x2 = x1 ** np.random.normal(1,1,n)
     
     # Create an exponential model
-    y = np.exp(
-        0.5 + 1.2 * x1
-    ) * np.random.uniform(0.5,1.5,n)
+    y = np.exp(0.5 + 1.2 * x1 + np.random.uniform(-1.5*x1**2, 1.5*x1**2, n))
     
-    # Create a DataFrame
-    df = pd.DataFrame({
-        'y': y,
-        'x1': x1,
-    })
+    df = pd.DataFrame({'y': y, 'x1': x1})
     
-    # Fit standard OLS model
-    import statsmodels.api as sm
-    X = sm.add_constant(df[['x1']])
-    ols_mod = sm.OLS(np.log(df['y']), X).fit(cov_type='HC3')
-    print("OLS results:")
-    print(ols_mod.summary())
-
-    # Fit PPML
-    ppml_mod = sm.GLM(df['y'], X, family=sm.families.Poisson()).fit(cov_type='HC3')
-    print("PPML results:")
-    print(ppml_mod.summary())
+    # Compare both estimators
+    print("="*60)
+    print("ESTIMATOR 1 (OLS-based)")
+    print("="*60)
     
-    # Option 1: Fit with asymptotic variance (default when bootstrap=False)
-    print("\n1. Fitting with asymptotic variance calculation:")
-    dre1 = DRE(
-        df['y'],
-        df[['x1']],
-        interest='x1',
-        estimator_type='ols',
-        elasticity=False,
-        density_estimator='kernel',  # Use kernel for speed
-        kernel_params={'degree':2},
-    )
-    dre_results1 = dre1.fit(compute_asymptotic_variance=True)
-    print(dre_results1.summary())
+    dre1 = DRE(df['y'], df[['x1']], interest='x1', estimator_type='ols', 
+               kernel_params={'degree': 2})
+    results1 = dre1.fit(method='ols', compute_asymptotic_variance=True)
+    print(results1.summary())
     
-    # Option 2: Fit with bootstrap (asymptotic variance automatically disabled)
-    print("\n2. Fitting with bootstrap standard errors (asymptotic variance disabled):")
-    dre2 = DRE(
-        df['y'],
-        df[['x1']],
-        interest='x1',
-        estimator_type='ols',
-        elasticity=False,
-        density_estimator='nn',  # This won't be used since asymptotic variance is disabled
-        kernel_params={'degree':2}
-    )
-    # When bootstrap=True, compute_asymptotic_variance defaults to False
-    dre_results2 = dre2.fit(bootstrap=True, bootstrap_reps=100, bootstrap_method='pairs')
-    print(dre_results2.summary())
+    print("\n" + "="*60)
+    print("ESTIMATOR 2 (PPML-based)")
+    print("="*60)
     
-    # Option 3: Explicitly disable asymptotic variance without bootstrap
-    print("\n3. Fitting without asymptotic variance or bootstrap:")
-    dre3 = DRE(
-        df['y'],
-        df[['x1']],
-        interest='x1',
-        estimator_type='ols',
-        elasticity=False,
-        kernel_params={'degree':2}
-    )
-    dre_results3 = dre3.fit(compute_asymptotic_variance=False, bootstrap=False)
-    print(dre_results3.summary())
+    dre2 = DRE(df['y'], df[['x1']], interest='x1', estimator_type='ols', 
+               kernel_params={'degree': 2})
+    results2 = dre2.fit(method='ppml', compute_asymptotic_variance=True)
+    print(results2.summary())
     
-    # Option 4: Neural network density estimation with asymptotic variance
-    print("\n4. Fitting with neural network density estimation:")
-    dre4 = DRE(
-        df['y'],
-        df[['x1']],
-        interest='x1',
-        estimator_type='ols',
-        elasticity=False,
-        density_estimator='nn',
-        density_params={'hidden_layers': [32, 16], 'epochs': 50, 'verbose': 0},
-        kernel_params={'degree':2}
-    )
-    dre_results4 = dre4.fit(compute_asymptotic_variance=True)
-    print(dre_results4.summary())
+    # Plot distributions for comparison
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
-    # Plot distribution of estimates for a specific variable
-    fig = dre_results1.plot_distribution()
+    # Estimator 1 distribution
+    ax1.hist(results1.estimator_values[0], bins=50, alpha=0.7, density=True, label='Estimator 1')
+    ax1.axvline(x=results1.estimate_at_average(0), color='red', linestyle='--', 
+               label=f'Est. at Avg: {results1.estimate_at_average(0):.3f}')
+    ax1.set_title('Estimator 1 (OLS-based)')
+    ax1.set_xlabel('Semi-Elasticity')
+    ax1.set_ylabel('Density')
+    ax1.legend()
+    
+    # Estimator 2 distribution
+    ax2.hist(results2.estimator_values[0], bins=50, alpha=0.7, density=True, label='Estimator 2')
+    ax2.axvline(x=results2.estimate_at_average(0), color='red', linestyle='--', 
+               label=f'Est. at Avg: {results2.estimate_at_average(0):.3f}')
+    ax2.set_title('Estimator 2 (PPML-based)')
+    ax2.set_xlabel('Semi-Elasticity')
+    ax2.set_ylabel('Density')
+    ax2.legend()
+    
+    plt.tight_layout()
     plt.show()
     
-    # Plot correction term for a specific variable
-    fig = dre_results1.plot_correction('x1')
-    plt.show()
+    # Comparison summary
+    print("\n" + "="*60)
+    print("COMPARISON SUMMARY")
+    print("="*60)
+    print(f"Estimator 1 (OLS-based) estimate at average: {results1.estimate_at_average(0):.4f}")
+    print(f"Estimator 2 (PPML-based) estimate at average: {results2.estimate_at_average(0):.4f}")
+    print(f"Standard OLS estimate: {results1.parametric_results.params[0]:.4f}")
+    print(f"Standard PPML estimate: {results2.parametric_results.params[0]:.4f}")
 
