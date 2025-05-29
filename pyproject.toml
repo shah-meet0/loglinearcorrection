@@ -20,6 +20,7 @@ dependencies = [
     "linearmodels (>=6.1,<7.0)",
     "openpyxl (>=3.1.5,<4.0.0)",
     "numdifftools (>=0.9.41,<0.10.0)",
+    "pyhdfe (>=0.2.0,<0.3.0)",
 
 ]
 

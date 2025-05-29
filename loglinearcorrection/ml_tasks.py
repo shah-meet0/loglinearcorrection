@@ -8,5 +8,4 @@
 # 5. Model Saving
 # 6. Model Loading
 # 7. Model Hyperparameter Tuning
-# Author: Meet Shah
 ###########################################################################################################

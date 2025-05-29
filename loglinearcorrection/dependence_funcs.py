@@ -1,6 +1,5 @@
 #################################################################################
 # This file contains functions that are used to generate dependence functions.
-# Author: Meet Shah
 #################################################################################
 
 
@@ -31,3 +30,8 @@ def independent_absolute(X):
 
 def independent_squared(X):
     return X[:, 0] ** 2
+
+def independent_binary_var(var0, var1):
+    def f(X):
+        return np.where(X[:, 0] == 0, var0, var1)
+    return f
