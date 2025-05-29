@@ -19,7 +19,7 @@ import os
 warnings.filterwarnings('ignore')
 
 # Import the estimator classes
-from doubly_robust_elasticity import DoublyRobustElasticityEstimator as DRE
+from loglinearcorrection import DRE
 import statsmodels.api as sm
 
 # Set style for plots
