@@ -1,9 +1,6 @@
-import os
-from loglinearcorrection.data_generating_processes import DGP, MVNDataGenerator, ConstantGenerator, CombinedDataGenerator, IndependentNormErrorGenerator
-from loglinearcorrection.dependence_funcs import independent_absolute, constant_mean, independent_squared
 
 import numpy as np
-from loglinearcorrection.correction_estimator import CorrectedEstimator
+from loglinearcorrection.correction_estimator import DoublyRobustElasticityEstimator
 
 import pandas as pd
 # SET UP DGP
@@ -18,7 +15,7 @@ df = df.dropna()
 print(len(df))
 
 # Extract the columns you want initially
-X_new = df[['RAIL', 'distid', 'year']]
+X_new = df[['distid','RAIL',  'year']]
 
 # Create dummy variables for 'division' and convert to integers
 dist_dummies = pd.get_dummies(X_new['distid'], prefix='distid', drop_first=True).astype(int)
@@ -69,6 +66,9 @@ import statsmodels.api as sm
 # Run the OLS regression
 model = sm.WLS(y, x)
 results = model.fit()
+model = sm.GLM(yexp, x, family=sm.families.Poisson())
+results = model.fit()
+
 
 # Print the summary
 print(results.summary())
@@ -80,10 +80,10 @@ print(x)
 # X needs to include intercept if needed
 # X should be of the form such that log y = Beta * X + u, that is transformations must be applied to it such that log y is linear in the transforms.
 
-model = CorrectedEstimator(yexp, x, correction_model_type='binary', interest=0)
-res = model.fit(params_dict={"degree":3})
+model = DoublyRobustElasticityEstimator(yexp, X_new, estimator_type='nn', interest=1, fe=[0,2])
+res = model.fit()
 
-res.corrected_percentage_change()
+res.summary()
 print(res.test_ppml())
 
 print("hello")
