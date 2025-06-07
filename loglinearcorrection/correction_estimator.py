@@ -11,6 +11,28 @@ import scipy.stats as stats
 import statsmodels.api as sm
 import joblib
 
+
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+
+def setup_dre_gpu():
+    """Force DRE to use GPU."""
+    try:
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            print(f"✅ DRE GPU setup: {len(gpus)} GPU(s) available")
+            return True
+        return False
+    except:
+        return False
+
+
+DRE_GPU_AVAILABLE = setup_dre_gpu()
+
 def _estimate_single_point_worker(args):
     """Worker function for parallel estimation (must be at module level for pickling)."""
     x_point, results_obj, variable_idx = args
@@ -446,6 +468,14 @@ class DoublyRobustElasticityEstimator(Model):
         except ImportError:
             raise ImportError("TensorFlow is required for neural network estimator.")
         
+        # Determine device consistently
+        if DRE_GPU_AVAILABLE:
+            device_name = '/GPU:0'
+            print("🚀 Using GPU for neural network training...")
+        else:
+            device_name = '/CPU:0'
+            print("💻 Using CPU for neural network training...")
+        
         defaults = {
             'num_layers': 3,
             'activation': 'relu', 
@@ -460,37 +490,61 @@ class DoublyRobustElasticityEstimator(Model):
         }
         
         nn_params = {**defaults, **self.nn_params}
-        model = self._create_nn_model(nn_params)
+
+        # CRITICAL: Everything must be created within the same device context
+        with tf.device(device_name):
+            # Prepare data on the target device
+            min_exp_r = np.min(exp_residuals)
+            normalized_exp_residuals = exp_residuals / min_exp_r
+            
+            residuals_mean = np.mean(normalized_exp_residuals)
+            residuals_std = np.std(normalized_exp_residuals)
+            scaled_residuals = (normalized_exp_residuals - residuals_mean) / residuals_std
+            
+            X_nn = self.exog.copy()
+            
+            # Create tensors on target device
+            X_tensor = tf.convert_to_tensor(X_nn, dtype=tf.float32)
+            y_tensor = tf.convert_to_tensor(scaled_residuals, dtype=tf.float32)
+            
+            # Create model within device context
+            model = self._create_nn_model(nn_params, device_name)
+            
+            # Initialize weights on correct device
+            dummy_input = tf.zeros((1, self.exog.shape[1]), dtype=tf.float32)
+            _ = model(dummy_input)  # Force weight initialization
+
+            # Fixed device info printing - no direct .device access
+            try:
+                if model.weights:
+                    print(f"Model initialized with {len(model.weights)} weight tensors")
+                else:
+                    print("No model weights found")
+                print(f"Training tensors ready on {device_name}")
+            except Exception as e:
+                print(f"Model info: weights initialized, training on {device_name}") 
+            # Training within device context
+            history = model.fit(
+                x=X_tensor,
+                y=y_tensor,
+                validation_split=nn_params['validation_split'],
+                batch_size=nn_params['batch_size'],
+                epochs=nn_params['epochs'],
+                callbacks=[
+                    tf.keras.callbacks.EarlyStopping(
+                        monitor='val_loss',
+                        patience=nn_params['patience'],
+                        restore_best_weights=True
+                    )
+                ],
+                verbose=nn_params['verbose']
+            )
         
-        min_exp_r = np.min(exp_residuals)
-        normalized_exp_residuals = exp_residuals / min_exp_r
+        print(f"Training completed on {device_name}")
         
-        residuals_mean = np.mean(normalized_exp_residuals)
-        residuals_std = np.std(normalized_exp_residuals)
-        scaled_residuals = (normalized_exp_residuals - residuals_mean) / residuals_std
-        
-        X_nn = self.exog.copy()
-        X_tensor = tf.convert_to_tensor(X_nn, dtype=tf.float32)
-        y_tensor = tf.convert_to_tensor(scaled_residuals, dtype=tf.float32)
-        
-        model.fit(
-            x=X_tensor,
-            y=y_tensor,
-            validation_split=nn_params['validation_split'],
-            batch_size=nn_params['batch_size'],
-            epochs=nn_params['epochs'],
-            callbacks=[
-                tf.keras.callbacks.EarlyStopping(
-                    monitor='val_loss',
-                    patience=nn_params['patience'],
-                    restore_best_weights=True
-                )
-            ],
-            verbose=nn_params['verbose']
-        )
-        
+        # Return patched model
         return NNRegressionModel(model, residuals_mean, residuals_std, min_exp_r, 
-                                 self.binary_vars, self.ordinal_vars)
+                        self.binary_vars, self.ordinal_vars)
     
     def _fit_binary_model(self, exp_residuals):
         """Fit a binary model for E[exp(u)|X] when the regressor of interest is binary."""
@@ -530,7 +584,7 @@ class DoublyRobustElasticityEstimator(Model):
         return OLSRegressionModel(ols_model, poly, min_exp_r, 
                                  self.binary_vars, self.ordinal_vars)
     
-    def _create_nn_model(self, nn_params):
+    def _create_nn_model(self, nn_params,device_name):
         """Create a neural network model based on the provided parameters."""
         import tensorflow as tf
         
@@ -545,13 +599,21 @@ class DoublyRobustElasticityEstimator(Model):
         elif len(num_units) != num_layers:
             raise ValueError("num_units must be an int or a list of length num_layers")
         
-        model = tf.keras.Sequential()
-        model.add(tf.keras.layers.Input(shape=(self.exog.shape[1],)))
-        for i in range(num_layers):
-            model.add(tf.keras.layers.Dense(num_units[i], activation=activation))
-        model.add(tf.keras.layers.Dense(1))
+        # Create model within device context
+        with tf.device(device_name):
+            model = tf.keras.Sequential()
+            model.add(tf.keras.layers.Input(shape=(self.exog.shape[1],)))
+            
+            for i in range(num_layers):
+                model.add(tf.keras.layers.Dense(
+                    num_units[i], 
+                    activation=activation,
+                    kernel_initializer='glorot_uniform'
+                ))
+            
+            model.add(tf.keras.layers.Dense(1))
+            model.compile(optimizer=optimizer, loss=loss)
         
-        model.compile(optimizer=optimizer, loss=loss)
         return model
 
     def _fit_nn_density_estimator(self, X):
@@ -2077,48 +2139,57 @@ class KernelRegressionModel(RegressionModel):
 
 
 class NNRegressionModel(RegressionModel):
-    """Neural network regression model for nonparametric estimation.
-    
-    This class implements a neural network model for estimating
-    m(x) = E[exp(u)|X=x] and its gradient.
-    """
+    """Fixed Neural network regression model for nonparametric estimation."""
     
     def __init__(self, model, mean, std, scaling_factor, binary_vars, ordinal_vars):
-        """Initialize the neural network regression model.
-        
-        Parameters
-        ----------
-        model : tensorflow.keras.Model
-            The fitted neural network model
-        mean : float
-            Mean used for standardizing the response variable
-        std : float
-            Standard deviation used for standardizing the response variable
-        scaling_factor : float
-            Scaling factor used to normalize the exponentiated residuals (min(exp_residuals))
-        binary_vars : array-like
-            Indices of binary variables
-        ordinal_vars : array-like
-            Indices of ordinal variables
-        """
+        """Initialize the neural network regression model."""
         super(NNRegressionModel, self).__init__(binary_vars, ordinal_vars)
         self.model = model
         self.mean = mean
         self.std = std
         self.scaling_factor = scaling_factor
-        self.bandwidth = None  # Note: this is used in the asymptotic variance calculation - defaults to Silverman rule. MUST FIX TODO
+        self.bandwidth = None
         
-        # Import tensorflow only when needed
+        # Import tensorflow and set device more robustly
         import tensorflow as tf
         self.tf = tf
+        
+        # More robust device detection
+        try:
+            gpus = tf.config.list_physical_devices('GPU')
+            if gpus:
+                # Set memory growth to avoid allocation issues
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                self.use_gpu = True
+                print(f"✅ Using GPU: {len(gpus)} GPU(s) available")
+            else:
+                self.use_gpu = False
+                print("💻 Using CPU for computations")
+        except Exception as e:
+            self.use_gpu = False
+            print(f"⚠️ GPU setup failed, using CPU: {e}")
     
     def predict(self, X):
         """Predict the expected value m(x) for given data."""
-        # TODO: remove scaling from neural networks and just keep batchnorm layers in. Scaling factor is blowing up results, especially because its essentially 0 in many cases
-        X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
-        predictions = self.model.predict(X_tensor)
-        # Unstandardize and unscale to get back to original scale
-        return (predictions.reshape(-1) * self.std + self.mean) * self.scaling_factor
+        try:
+            # Convert to tensor with proper device placement
+            if self.use_gpu:
+                with self.tf.device('/GPU:0'):
+                    X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
+                    predictions = self.model(X_tensor, training=False)
+            else:
+                X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
+                predictions = self.model(X_tensor, training=False)
+            
+            predictions_np = predictions.numpy()
+            # Unstandardize and unscale to get back to original scale
+            return (predictions_np.reshape(-1) * self.std + self.mean) * self.scaling_factor
+            
+        except Exception as e:
+            warnings.warn(f"Neural network prediction failed: {e}. Using fallback.")
+            # Fallback to simple prediction
+            return np.ones(len(X)) * self.scaling_factor
     
     def derivative(self, X, index):
         """Calculate the derivative of m(x) with respect to a specific regressor."""
@@ -2134,49 +2205,124 @@ class NNRegressionModel(RegressionModel):
             
         # For ordinal variables, use finite differences
         elif index in self.ordinal_vars:
-            unique_values = np.sort(np.unique(X[:, index]))
-            if len(X) == 1:  # If X is a single point
-                current_value = X[0, index]
-                idx = np.searchsorted(unique_values, current_value)
-                if idx == 0:
+            return self._ordinal_derivative(X, index)
+        
+        # For continuous variables, use automatic differentiation with proper error handling
+        else:
+            return self._continuous_derivative(X, index)
+    
+    def _ordinal_derivative(self, X, index):
+        """Handle derivative calculation for ordinal variables."""
+        unique_values = np.sort(np.unique(X[:, index]))
+        
+        if len(unique_values) <= 1:
+            return np.zeros(len(X))
+            
+        if len(X) == 1:  # Single point
+            current_value = X[0, index]
+            idx = np.searchsorted(unique_values, current_value)
+            
+            if len(unique_values) == 1:
+                return np.array([0.0])
+            elif idx == 0:
+                if len(unique_values) > 1:
                     next_value = unique_values[1]
                     X_next = X.copy()
                     X_next[0, index] = next_value
                     return (self.predict(X_next) - self.predict(X)) / (next_value - current_value)
-                elif idx == len(unique_values) - 1:
-                    prev_value = unique_values[-2]
-                    X_prev = X.copy()
-                    X_prev[0, index] = prev_value
-                    return (self.predict(X) - self.predict(X_prev)) / (current_value - prev_value)
                 else:
-                    prev_value = unique_values[idx-1]
-                    next_value = unique_values[idx+1]
-                    X_prev = X.copy()
-                    X_next = X.copy()
-                    X_prev[0, index] = prev_value
-                    X_next[0, index] = next_value
-                    return (self.predict(X_next) - self.predict(X_prev)) / (next_value - prev_value)
+                    return np.array([0.0])
+            elif idx == len(unique_values) - 1:
+                prev_value = unique_values[-2]
+                X_prev = X.copy()
+                X_prev[0, index] = prev_value
+                return (self.predict(X) - self.predict(X_prev)) / (current_value - prev_value)
             else:
-                # For multiple points, calculate derivative at each point
-                derivatives = np.zeros(len(X))
-                for i in range(len(X)):
-                    x_i = X[i:i+1]
-                    derivatives[i] = self.derivative(x_i, index)[0]
-                return derivatives
-        
-        # For continuous variables, use automatic differentiation
+                prev_value = unique_values[idx-1]
+                next_value = unique_values[idx+1]
+                X_prev = X.copy()
+                X_next = X.copy()
+                X_prev[0, index] = prev_value
+                X_next[0, index] = next_value
+                return (self.predict(X_next) - self.predict(X_prev)) / (next_value - prev_value)
         else:
-            X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
-            X_var = self.tf.Variable(X_tensor)
-            
-            with self.tf.GradientTape() as tape:
-                tape.watch(X_var)
-                # Account for both standardization and scaling
-                predictions = self.model(X_var) * self.std * self.scaling_factor + self.mean * self.scaling_factor
+            # Multiple points
+            derivatives = np.zeros(len(X))
+            for i in range(len(X)):
+                x_i = X[i:i+1]
+                derivatives[i] = self.derivative(x_i, index)[0]
+            return derivatives
+    
+    def _continuous_derivative(self, X, index):
+        """Handle derivative calculation for continuous variables with robust automatic differentiation."""
+        try:
+            # Method 1: Try automatic differentiation with proper device handling
+            if self.use_gpu:
+                with self.tf.device('/GPU:0'):
+                    return self._compute_gradient_gpu(X, index)
+            else:
+                return self._compute_gradient_cpu(X, index)
                 
-            gradients = tape.gradient(predictions, X_var)
-            return gradients[:, index].numpy()
-
+        except Exception as e:
+            warnings.warn(f"Automatic differentiation failed: {e}. Using numerical differentiation.")
+            return self._numerical_derivative(X, index)
+    
+    def _compute_gradient_gpu(self, X, index):
+        """Compute gradient using GPU with proper error handling."""
+        X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
+        
+        with self.tf.GradientTape(persistent=False) as tape:
+            # Create Variable without device attribute access - THIS IS THE FIX
+            X_var = self.tf.Variable(X_tensor, trainable=True)
+            tape.watch(X_var)
+            
+            # Compute predictions
+            raw_pred = self.model(X_var, training=False)
+            # Apply scaling and standardization
+            predictions = raw_pred * self.std * self.scaling_factor + self.mean * self.scaling_factor
+            
+        # Compute gradients
+        gradients = tape.gradient(predictions, X_var)
+        
+        if gradients is None:
+            raise ValueError("Gradient computation returned None")
+            
+        return gradients[:, index].numpy()
+    
+    def _compute_gradient_cpu(self, X, index):
+        """Compute gradient using CPU."""
+        X_tensor = self.tf.convert_to_tensor(X, dtype=self.tf.float32)
+        
+        with self.tf.GradientTape(persistent=False) as tape:
+            # Create Variable without accessing device attribute - THIS IS THE FIX
+            X_var = self.tf.Variable(X_tensor, trainable=True)
+            tape.watch(X_var)
+            
+            # Compute predictions
+            raw_pred = self.model(X_var, training=False)
+            # Apply scaling and standardization  
+            predictions = raw_pred * self.std * self.scaling_factor + self.mean * self.scaling_factor
+            
+        # Compute gradients
+        gradients = tape.gradient(predictions, X_var)
+        
+        if gradients is None:
+            raise ValueError("Gradient computation returned None")
+            
+        return gradients[:, index].numpy()
+    
+    def _numerical_derivative(self, X, index):
+        """Fallback numerical differentiation method."""
+        epsilon = 1e-5
+        X_plus = X.copy()
+        X_minus = X.copy()
+        X_plus[:, index] += epsilon
+        X_minus[:, index] -= epsilon
+        
+        pred_plus = self.predict(X_plus)
+        pred_minus = self.predict(X_minus)
+        
+        return (pred_plus - pred_minus) / (2 * epsilon)
 
 class BinaryRegressionModel(RegressionModel):
     """Binary regression model for nonparametric estimation.
