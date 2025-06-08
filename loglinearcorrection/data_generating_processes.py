@@ -1,7 +1,6 @@
 ###############################################################################################
 # This module generates various simulated data for the purpose of testing.
 # Each function generates a different type of data.
-# Author: Meet Shah
 ###############################################################################################
 
 import numpy as np
@@ -12,7 +11,7 @@ from .dependence_funcs import constant_mean, constant_variance, constant_varianc
 # Error Generators
 ###############################################################################################
 
-
+# TODO: Implement expectation tracking.
 class _ErrorGenerator:
     """Base class for error generators.
     
@@ -175,7 +174,7 @@ class IndependentLogNormErrorGenerator(_ErrorGenerator):
         """
         n = len(x)
         means = self.mean_fn(x)
-        var = np.diagonal(self.var_fn(x))
+        var = self.var_fn(x)
 
         if len(means) != n:
             raise ValueError(f"Mean function returns vector of length {len(means)} but expected {n}")
@@ -448,7 +447,7 @@ class RCT(DGP):
     receive a treatment with a specified effect.
     """
 
-    def __init__(self, treatment_effect, p_treated, data_generator=ConstantGenerator, betas=None,
+    def __init__(self, treatment_effect, p_treated, data_generator=ConstantGenerator(1), betas=None,
                  error_generator=NormalErrorGenerator(), exponential=False):
         """Initialize the RCT data generating process.
         
