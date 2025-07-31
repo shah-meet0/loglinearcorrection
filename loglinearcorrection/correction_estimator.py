@@ -31,7 +31,7 @@ def setup_dre_gpu():
         return False
 
 
-DRE_GPU_AVAILABLE = setup_dre_gpu()
+DRE_GPU_AVAILABLE = setup_dre_gpu() # This line currently causing TF to always be imported, might want to move it?
 
 def _estimate_single_point_worker(args):
     """Worker function for parallel estimation (must be at module level for pickling)."""
@@ -96,7 +96,7 @@ class DoublyRobustElasticityEstimator(Model):
     """
 
     
-    def __init__(self, endog, exog, interest=None, log_x=False, estimator_type='kernel', 
+    def __init__(self, endog, exog, interest=None, log_x=False, instruments = None, estimator_type='kernel',
                  elasticity=False, kernel_params=None, nn_params=None, 
                  density_estimator='kernel', density_params=None, fe=None):
         """Initialize the doubly robust estimator."""
@@ -104,6 +104,7 @@ class DoublyRobustElasticityEstimator(Model):
         # Store the original data
         self.original_endog = endog
         self.original_exog = exog
+        self.instruments = instruments
         self.fe = fe
         
         # Convert pandas objects to numpy arrays and store names
@@ -162,6 +163,8 @@ class DoublyRobustElasticityEstimator(Model):
             self.log_x = log_x
         else:
             self.log_x = [log_x] * len(self.interest)
+
+        self._handle_instruments()
             
         # Store other parameters
         self.estimator_type = estimator_type.lower()
@@ -223,17 +226,46 @@ class DoublyRobustElasticityEstimator(Model):
         else:
             exog_to_use = self.original_exog.copy()
 
+
+
         exog_to_use = np.delete(exog_to_use, self.fe_indices, axis=1).astype(np.float64)
         combined = np.column_stack([exog_to_use, endog_to_use])
+
+        if self.instruments is not None:
+
+            if isinstance(self.instruments, (pd.Series, pd.DataFrame)):
+                Z = self.instruments.values
+            else:
+                Z = np.asarray(self.instruments)
+
+            if Z.ndim == 1:
+                Z = Z.reshape(-1, 1)
+
+            combined = np.column_stack([combined, Z])
+            iv_len = Z.shape[1]
+        else:
+            iv_len = 0
+
         demeaned = fe_algorithm.residualize(combined)
 
         # Update X and y with demeaned values
-        self.endog = np.exp(demeaned[:, -1])
-        exog = demeaned[:, :-1]
+
+        self.endog = np.exp(demeaned[:, -1 - iv_len])
+        exog = demeaned[:, :-1-iv_len]
+        if iv_len > 0:
+            self.instruments = demeaned[:, -iv_len:]
+
 
         # Check if any exog is all 0:
         zero_cols = np.where(np.all(np.abs(exog) < 1e-6, axis=0))[0]
         self.exog = np.delete(exog, zero_cols, axis=1)
+
+        # Check if any instruments are 0:
+        if self.instruments is not None:
+            zero_instrument_cols = np.where(np.all(np.abs(self.instruments) < 1e-6, axis=0))[0]
+            self.instruments = np.delete(self.instruments, zero_instrument_cols, axis=1)
+            if len(zero_instrument_cols) > 0:
+                print('Removed zero instrument columns:', zero_instrument_cols)
 
         if len(self.endog) < len(self.original_endog):
             print('Some singleton observations dropped. \n'
@@ -277,6 +309,36 @@ class DoublyRobustElasticityEstimator(Model):
                 raise NotImplementedError('Fixed effects not implemented for multiple variables of interest')
 
         print('Fixed effects applied. Variables have been demeaned.')
+
+    def _handle_instruments(self):
+        """Instrument the endogenous variable using instruments and controls (all demeaned)."""
+        if self.instruments is None:
+            return  # no IV logic needed
+
+        if not hasattr(self, 'interest') or len(self.interest) != 1:
+            raise NotImplementedError("Only one endogenous regressor can be instrumented at a time.")
+
+
+        idx_interest = self.interest[0]
+
+        # Extract components
+        y_first_stage = self.exog[:, idx_interest]
+        controls_idx = [i for i in range(self.exog.shape[1]) if i != idx_interest]
+
+        # Build X for first-stage: instruments + controls (all demeaned)
+        X_first_stage = np.column_stack([self.instruments, self.exog[:, controls_idx]])
+
+        # Run first stage
+        first_stage = sm.OLS(y_first_stage, X_first_stage).fit()
+        fitted_vals = first_stage.fittedvalues
+        self.first_stage = first_stage  # Store for later use
+
+        # Replace the endogenous regressor with instrumented version
+        self.exog[:, idx_interest] = fitted_vals
+
+        print(f"Instrumented variable at column {idx_interest}")
+        print(f"First-stage R²: {first_stage.rsquared:.3f}")
+
 
     def _detect_variable_types(self):
         """Detect binary and ordinal variables in the regressor matrix."""
