@@ -409,28 +409,17 @@ class DoublyRobustElasticityEstimator(Model):
         # Step 1: Fit the parametric model
         if method == 'ols':
             kwargs.setdefault("cov_type", 'HC3')
-            if weights is None:
-                parametric_results = sm.OLS(np.log(self.endog), self.exog).fit(**kwargs)
-            else:
-                parametric_results = sm.WLS(np.log(self.endog), self.exog, weights=weights).fit(**kwargs)
-            
+            parametric_results = self._fit_base_ols(weights, **kwargs)
             # Calculate OLS residuals: u_i = log(y_i) - x_i * beta_hat
             residuals = parametric_results.resid
             
         elif method == 'ppml':
             kwargs.setdefault("cov_type", 'HC3')
-            if weights is None:
-                parametric_results = sm.GLM(self.endog, self.exog, 
-                                          family=sm.families.Poisson()).fit(**kwargs)
-            else:
-                parametric_results = sm.GLM(self.endog, self.exog, 
-                                          family=sm.families.Poisson(),
-                                          freq_weights=weights).fit(**kwargs)
-            
+            parametric_results = self._fit_base_ppml(weights, **kwargs)
             # Calculate PPML residuals: u_i = log(y_i) - x_i * gamma_hat
             # fitted_values from GLM are exp(x_i * gamma_hat)
             residuals = np.log(self.endog) - np.log(parametric_results.fittedvalues)
-            
+
         else:
             raise ValueError(f"Method '{method}' not supported. Use 'ols' or 'ppml'.")
             
@@ -503,7 +492,22 @@ class DoublyRobustElasticityEstimator(Model):
             print('Bootstrap completed')
             
         return results
-    
+
+    def _fit_base_ols(self, weights, **kwargs):
+        if weights is None:
+            return sm.OLS(np.log(self.endog), self.exog).fit(**kwargs)
+        else:
+            return sm.WLS(np.log(self.endog), self.exog, weights=weights).fit(**kwargs)
+
+    def _fit_base_ppml(self, weights, **kwargs):
+        if weights is None:
+            parametric_results = sm.GLM(self.endog, self.exog,
+                                        family=sm.families.Poisson()).fit(**kwargs)
+        else:
+            parametric_results = sm.GLM(self.endog, self.exog,
+                                        family=sm.families.Poisson(),
+                                        freq_weights=weights).fit(**kwargs)
+
     def _fit_kernel_model(self, exp_residuals):
         """Fit a local linear kernel regression model for E[exp(u)|X]."""
         var_type = self.kernel_params.get('var_type', 'c' * self.exog.shape[1])
