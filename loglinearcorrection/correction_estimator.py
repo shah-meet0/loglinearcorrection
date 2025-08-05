@@ -31,7 +31,7 @@ def setup_dre_gpu():
         return False
 
 
-DRE_GPU_AVAILABLE = setup_dre_gpu() # This line currently causing TF to always be imported, might want to move it?
+# DRE_GPU_AVAILABLE = setup_dre_gpu() # This line currently causing TF to always be imported, might want to move it?
 
 def _estimate_single_point_worker(args):
     """Worker function for parallel estimation (must be at module level for pickling)."""
@@ -95,8 +95,8 @@ class DoublyRobustElasticityEstimator(Model):
     where \hat\psi(x) is estimated from PPML residuals
     """
 
-    
-    def __init__(self, endog, exog, interest=None, log_x=False, instruments = None, estimator_type='kernel',
+    # TODO: Refactor names so its more consistent
+    def __init__(self, endog, exog, interest=None, endog_x=None, log_x=False, instruments = None, estimator_type='kernel',
                  elasticity=False, kernel_params=None, nn_params=None, 
                  density_estimator='kernel', density_params=None, fe=None):
         """Initialize the doubly robust estimator."""
@@ -139,6 +139,26 @@ class DoublyRobustElasticityEstimator(Model):
                 self.interest = [self._exog_names.index(interest)]
             else:
                 self.interest = [interest]
+
+        if endog_x is None:
+            if instruments is not None:
+                raise ValueError('endog_x must be provided if instruments are specified')
+        else:
+            if isinstance(endog_x, (list, tuple, np.ndarray)):
+                self.endog_x = []
+                for var in endog_x:
+                    if isinstance(var, str) and var in self._exog_names:
+                        self.endog_x.append(self._exog_names.index(var))
+                    elif isinstance(var, (int, np.integer)):
+                        self.endog_x.append(var)
+                    else:
+                        raise ValueError(f"Endogenous variable '{var}' not recognized")
+            elif isinstance(interest, str) and interest in self._exog_names:
+                self.endog_x = [self._exog_names.index(endog_x)]
+            else:
+                self.interest = [endog_x]
+
+
         
         # Process fixed effects if provided
         if fe is not None:
@@ -315,29 +335,25 @@ class DoublyRobustElasticityEstimator(Model):
         if self.instruments is None:
             return  # no IV logic needed
 
-        if not hasattr(self, 'interest') or len(self.interest) != 1:
-            raise NotImplementedError("Only one endogenous regressor can be instrumented at a time.")
-
-
-        idx_interest = self.interest[0]
+        idx_endog = self.endog_x
 
         # Extract components
-        y_first_stage = self.exog[:, idx_interest]
-        controls_idx = [i for i in range(self.exog.shape[1]) if i != idx_interest]
+        controls_idx = [i for i in range(self.exog.shape[1]) if i not in idx_endog]
 
         # Build X for first-stage: instruments + controls (all demeaned)
         X_first_stage = np.column_stack([self.instruments, self.exog[:, controls_idx]])
 
-        # Run first stage
-        first_stage = sm.OLS(y_first_stage, X_first_stage).fit()
-        fitted_vals = first_stage.fittedvalues
-        self.first_stage = first_stage  # Store for later use
+        # For each endogenous regressor, run first stage OLS
+        for i in idx_endog:
+            y_first_stage = self.exog[:, i]
+            reg = sm.OLS(y_first_stage, X_first_stage).fit()
+            fitted_vals = reg.fittedvalues
+            # Replace the endogenous regressor with instrumented version
+            self.exog[:, i] = fitted_vals
 
         # Replace the endogenous regressor with instrumented version
-        self.exog[:, idx_interest] = fitted_vals
 
-        print(f"Instrumented variable at column {idx_interest}")
-        print(f"First-stage R²: {first_stage.rsquared:.3f}")
+        print(f"Instrumented variable at columns {idx_endog}")
 
 
     def _detect_variable_types(self):
