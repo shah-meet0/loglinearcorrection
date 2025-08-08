@@ -175,6 +175,7 @@ class DoublyRobustElasticityEstimator(Model):
         else:
             self.endog = endog
             self.exog = exog
+            self.fe_indices = None
             
         # Process log_x
         if isinstance(log_x, (list, tuple, np.ndarray)):
@@ -327,6 +328,28 @@ class DoublyRobustElasticityEstimator(Model):
                     self.interest = [adjusted_index]
             else:
                 raise NotImplementedError('Fixed effects not implemented for multiple variables of interest')
+
+        # Update endog_x if needed
+        if hasattr(self, 'endog_x'):
+            adjusted_endog_x = []
+
+            for idx in sorted(self.endog_x):
+                adjusted_index= idx
+                for fe_idx in sorted(self.fe_indices):
+                    if fe_idx < idx:
+                        adjusted_index -= 1
+
+                if adjusted_index in zero_cols:
+                    print(f'Endogenous variable {idx} dropped.')
+                    continue
+                else:
+                    for zero_idx in sorted(zero_cols):
+                        if zero_idx < adjusted_index:
+                            adjusted_index -= 1
+                    adjusted_endog_x.append(adjusted_index)
+
+            self.endog_x = adjusted_endog_x
+
 
         print('Fixed effects applied. Variables have been demeaned.')
 
