@@ -546,6 +546,7 @@ class DoublyRobustElasticityEstimator(Model):
             parametric_results = sm.GLM(self.endog, self.exog,
                                         family=sm.families.Poisson(),
                                         freq_weights=weights).fit(**kwargs)
+        return parametric_results
 
     def _fit_kernel_model(self, exp_residuals):
         """Fit a local linear kernel regression model for E[exp(u)|X]."""
