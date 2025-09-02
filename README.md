@@ -6,7 +6,7 @@ Once the package `loglinearcorrection` is installed, you can use `make` to run t
 
 
 ## Installation
-
+pip install git+https://github.com/shah-meet0/loglinearcorrection.git
 
 ## Testing
 
