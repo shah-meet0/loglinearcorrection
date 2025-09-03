@@ -148,7 +148,7 @@ class DoublyRobustElasticityEstimator(Model):
                 self.endog_x = []
                 for var in endog_x:
                     if isinstance(var, str) and var in self._exog_names:
-                        self.endog_x.append(self._exog_names.index(var))
+                        self.endog_x.append(self._exog_names.index(var))g
                     elif isinstance(var, (int, np.integer)):
                         self.endog_x.append(var)
                     else:
@@ -234,7 +234,7 @@ class DoublyRobustElasticityEstimator(Model):
             fe_cols = fe_cols.reshape(-1, 1)
 
         # Create pyhdfe algorithm
-        fe_algorithm = pyhdfe.create(fe_cols)
+        fe_algorithm = pyhdfe.create(fe_cols, drop_singletons=False)
 
         # Apply demeaning to both X and y
         if isinstance(self.original_endog, pd.Series) or isinstance(self.original_endog, pd.DataFrame):
