@@ -148,7 +148,7 @@ class DoublyRobustElasticityEstimator(Model):
                 self.endog_x = []
                 for var in endog_x:
                     if isinstance(var, str) and var in self._exog_names:
-                        self.endog_x.append(self._exog_names.index(var))g
+                        self.endog_x.append(self._exog_names.index(var))
                     elif isinstance(var, (int, np.integer)):
                         self.endog_x.append(var)
                     else:
