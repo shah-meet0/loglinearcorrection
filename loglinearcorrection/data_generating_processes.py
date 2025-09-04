@@ -440,6 +440,10 @@ class DGP:
             y = np.exp(y)
         return y, x, u
 
+    def calculate_true_elasticity(self, X, variable_idx=0):
+        """Calculate true semi-elasticity at points X."""
+        raise NotImplementedError("Subclasses must implement")
+
 class RCT(DGP):
     """Randomized Controlled Trial data generating process.
     
