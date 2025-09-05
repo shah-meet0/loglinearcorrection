@@ -1,7 +1,0 @@
- filter=lfs diff=lfs merge=lfs -text
-schedulesUS.dta filter=lfs diff=lfs merge=lfs -text
-appendix filter=lfs diff=lfs merge=lfs -text
-dataCC_Mex_districts.dta filter=lfs diff=lfs merge=lfs -text
-data_consistentCodes.dta filter=lfs diff=lfs merge=lfs -text
-data_rawCodes.dta filter=lfs diff=lfs merge=lfs -text
-data_rawPreMerge.dta filter=lfs diff=lfs merge=lfs -text
