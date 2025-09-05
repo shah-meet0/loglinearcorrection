@@ -1078,7 +1078,11 @@ class DoublyRobustElasticityEstimatorResults(Results):
         return (lower_bound, upper_bound)
 
     def _bootstrap_standard_errors(self, bootstrap_reps, bootstrap_method, weights, kwargs, method):
-        """Compute bootstrap standard errors."""
+        """Compute bootstrap standard errors.
+        
+        Modified version that stores full DREER objects to enable standard error
+        calculation at arbitrary points.
+        """
         if bootstrap_method != 'pairs':
             raise ValueError("Only 'pairs' bootstrap is available.")
         
@@ -1089,6 +1093,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
         else:
             var_indices = self.interest
             
+        # Store the full DREER objects from bootstrap
+        self.bootstrap_results = []
+        
+        # Also keep the summary statistics for backward compatibility
         bootstrap_estimates_dict = {var_idx: np.zeros((bootstrap_reps, 4)) 
                                    for var_idx in var_indices}
         
@@ -1119,7 +1127,10 @@ class DoublyRobustElasticityEstimatorResults(Results):
             bs_results = bs_model.fit(weights=weights, method=method, bootstrap=False, 
                                     compute_asymptotic_variance=False, **kwargs)
             
-            # Store estimates from this bootstrap replication for each variable
+            # STORE THE FULL DREER OBJECT
+            self.bootstrap_results.append(bs_results)
+            
+            # Also store summary estimates for backward compatibility
             for var_idx in var_indices:
                 if bs_results.all_variables:
                     var_pos = list(bs_results.interest).index(var_idx)
@@ -1145,9 +1156,205 @@ class DoublyRobustElasticityEstimatorResults(Results):
         self.bootstrap_reps = bootstrap_reps
         self.bootstrap_estimates_dict = bootstrap_estimates_dict
         
-        # Calculate bootstrap standard errors for each variable
+        # Calculate bootstrap standard errors for each variable (backward compatibility)
         self.bootstrap_se_dict = {var_idx: np.std(bootstrap_estimates_dict[var_idx], axis=0) 
                                  for var_idx in var_indices}
+
+
+    def bootstrap_standard_error_at_point(self, X_point, variable_idx=None):
+        """Calculate bootstrap standard error at a specific point.
+        
+        This new method uses the stored DREER objects to compute standard errors
+        at arbitrary points.
+        
+        Parameters
+        ----------
+        X_point : array-like of shape (1, d) or (d,)
+            Point at which to compute the standard error
+        variable_idx : int or str, optional
+            Variable for which to compute standard error.
+            If None, uses first variable of interest.
+        
+        Returns
+        -------
+        float
+            Bootstrap standard error at the specified point
+            
+        Raises
+        ------
+        ValueError
+            If bootstrap has not been performed or bootstrap_results not stored
+        """
+        if not self.bootstrap:
+            raise ValueError("Bootstrap standard errors have not been computed. "
+                            "Call fit() with bootstrap=True first.")
+        
+        if not hasattr(self, 'bootstrap_results'):
+            raise ValueError("Bootstrap results not stored. This may be an older "
+                            "bootstrap run. Re-run bootstrap to store full results.")
+        
+        # Handle variable selection
+        if variable_idx is None:
+            variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
+        elif isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
+        
+        # Ensure X_point is properly shaped
+        X_point = np.atleast_2d(X_point)
+        if X_point.shape[0] != 1:
+            X_point = X_point.reshape(1, -1)
+        
+        # Get estimates at this point from all bootstrap samples
+        bootstrap_estimates_at_point = []
+        for bs_result in self.bootstrap_results:
+            try:
+                estimate = bs_result.estimate_at_point(X_point, variable_idx)
+                bootstrap_estimates_at_point.append(estimate)
+            except Exception as e:
+                # Handle cases where bootstrap sample might fail at this point
+                # (e.g., numerical issues)
+                print(f"Warning: Bootstrap sample failed at point: {e}")
+                continue
+        
+        if len(bootstrap_estimates_at_point) == 0:
+            raise ValueError("All bootstrap samples failed at the specified point")
+        
+        # Return standard error
+        return np.std(bootstrap_estimates_at_point)
+
+
+    def bootstrap_confidence_interval_at_point(self, X_point, variable_idx=None, 
+                                              alpha=0.05, method='percentile'):
+        """Calculate bootstrap confidence interval at a specific point.
+        
+        This new method uses the stored DREER objects to compute confidence
+        intervals at arbitrary points.
+        
+        Parameters
+        ----------
+        X_point : array-like of shape (1, d) or (d,)
+            Point at which to compute the confidence interval
+        variable_idx : int or str, optional
+            Variable for which to compute confidence interval.
+            If None, uses first variable of interest.
+        alpha : float, default 0.05
+            Significance level for (1-α)×100% confidence interval
+        method : str, default 'percentile'
+            Method for calculating confidence intervals: 'percentile' or 'normal'
+        
+        Returns
+        -------
+        tuple of float
+            (lower_bound, upper_bound) for the confidence interval
+            
+        Raises
+        ------
+        ValueError
+            If bootstrap has not been performed or bootstrap_results not stored
+        """
+        if not self.bootstrap:
+            raise ValueError("Bootstrap standard errors have not been computed. "
+                            "Call fit() with bootstrap=True first.")
+        
+        if not hasattr(self, 'bootstrap_results'):
+            raise ValueError("Bootstrap results not stored. This may be an older "
+                            "bootstrap run. Re-run bootstrap to store full results.")
+        
+        # Handle variable selection
+        if variable_idx is None:
+            variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
+        elif isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
+        
+        # Ensure X_point is properly shaped
+        X_point = np.atleast_2d(X_point)
+        if X_point.shape[0] != 1:
+            X_point = X_point.reshape(1, -1)
+        
+        # Get estimates at this point from all bootstrap samples
+        bootstrap_estimates_at_point = []
+        for bs_result in self.bootstrap_results:
+            try:
+                estimate = bs_result.estimate_at_point(X_point, variable_idx)
+                bootstrap_estimates_at_point.append(estimate)
+            except Exception:
+                continue
+        
+        if len(bootstrap_estimates_at_point) == 0:
+            raise ValueError("All bootstrap samples failed at the specified point")
+        
+        bootstrap_estimates_at_point = np.array(bootstrap_estimates_at_point)
+        
+        if method == 'percentile':
+            # Percentile method
+            lower = np.percentile(bootstrap_estimates_at_point, 100 * alpha / 2)
+            upper = np.percentile(bootstrap_estimates_at_point, 100 * (1 - alpha / 2))
+            
+        elif method == 'normal':
+            # Normal approximation method
+            point_estimate = self.estimate_at_point(X_point, variable_idx)
+            std_error = np.std(bootstrap_estimates_at_point)
+            z_value = stats.norm.ppf(1 - alpha/2)
+            
+            lower = point_estimate - z_value * std_error
+            upper = point_estimate + z_value * std_error
+            
+        else:
+            raise ValueError(f"Unknown method '{method}'. Use 'percentile' or 'normal'.")
+        
+        return (lower, upper)
+
+
+    def get_bootstrap_distribution_at_point(self, X_point, variable_idx=None):
+        """Get the full bootstrap distribution of estimates at a specific point.
+        
+        Parameters
+        ----------
+        X_point : array-like of shape (1, d) or (d,)
+            Point at which to get the bootstrap distribution
+        variable_idx : int or str, optional
+            Variable for which to get distribution.
+            If None, uses first variable of interest.
+        
+        Returns
+        -------
+        np.ndarray
+            Array of bootstrap estimates at the specified point
+            
+        Raises
+        ------
+        ValueError
+            If bootstrap has not been performed or bootstrap_results not stored
+        """
+        if not self.bootstrap:
+            raise ValueError("Bootstrap standard errors have not been computed. "
+                            "Call fit() with bootstrap=True first.")
+        
+        if not hasattr(self, 'bootstrap_results'):
+            raise ValueError("Bootstrap results not stored. This may be an older "
+                            "bootstrap run. Re-run bootstrap to store full results.")
+        
+        # Handle variable selection
+        if variable_idx is None:
+            variable_idx = self.interest[0] if isinstance(self.interest, list) else self.interest
+        elif isinstance(variable_idx, str) and variable_idx in self.model.exog_names:
+            variable_idx = self.model.exog_names.index(variable_idx)
+        
+        # Ensure X_point is properly shaped
+        X_point = np.atleast_2d(X_point)
+        if X_point.shape[0] != 1:
+            X_point = X_point.reshape(1, -1)
+        
+        # Get estimates at this point from all bootstrap samples
+        bootstrap_estimates_at_point = []
+        for bs_result in self.bootstrap_results:
+            try:
+                estimate = bs_result.estimate_at_point(X_point, variable_idx)
+                bootstrap_estimates_at_point.append(estimate)
+            except Exception:
+                continue
+        
+        return np.array(bootstrap_estimates_at_point)
 
     def summary(self):
         """Provide a summary of the results."""
