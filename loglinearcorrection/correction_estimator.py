@@ -16,22 +16,6 @@ import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
-def setup_dre_gpu():
-    """Force DRE to use GPU."""
-    try:
-        import tensorflow as tf
-        gpus = tf.config.list_physical_devices('GPU')
-        if gpus:
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"✅ DRE GPU setup: {len(gpus)} GPU(s) available")
-            return True
-        return False
-    except:
-        return False
-
-
-# DRE_GPU_AVAILABLE = setup_dre_gpu() # This line currently causing TF to always be imported, might want to move it?
 
 def _estimate_single_point_worker(args):
     """Worker function for parallel estimation (must be at module level for pickling)."""
@@ -574,13 +558,6 @@ class DoublyRobustElasticityEstimator(Model):
         except ImportError:
             raise ImportError("TensorFlow is required for neural network estimator.")
         
-        # Determine device consistently
-        if DRE_GPU_AVAILABLE:
-            device_name = '/GPU:0'
-            print("🚀 Using GPU for neural network training...")
-        else:
-            device_name = '/CPU:0'
-            print("💻 Using CPU for neural network training...")
         
         defaults = {
             'num_layers': 3,
