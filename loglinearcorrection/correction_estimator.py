@@ -558,6 +558,32 @@ class DoublyRobustElasticityEstimator(Model):
         except ImportError:
             raise ImportError("TensorFlow is required for neural network estimator.")
         
+        def setup_dre_gpu():
+
+
+            """Force DRE to use GPU."""
+
+            try:
+                import tensorflow as tf
+                gpus = tf.config.list_physical_devices('GPU')
+
+                if gpus:
+                    for gpu in gpus:
+                        tf.config.experimental.set_memory_growth(gpu, True)
+                    print(f"✅ DRE GPU setup: {len(gpus)} GPU(s) available")
+                    return True
+                return False
+            except:
+                return False
+
+        dre_gpu_available = setup_dre_gpu()
+
+        if dre_gpu_available:
+            device_name = '/GPU:0'
+        else:
+            device_name = '/CPU:0'
+
+
         
         defaults = {
             'num_layers': 3,
