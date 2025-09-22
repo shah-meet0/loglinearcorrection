@@ -1112,6 +1112,11 @@ class DoublyRobustElasticityEstimatorResults(Results):
             indices = np.random.choice(n, size=n, replace=True)
             bs_exog = self.model.exog[indices]
             bs_endog = self.model.endog[indices]
+
+            clean_nn_params = self.model.nn_params.copy()
+            if 'model' in clean_nn_params:
+                del clean_nn_params['model']
+
             
             # Create a new estimator with the resampled data
             bs_model = DoublyRobustElasticityEstimator(
@@ -1122,7 +1127,7 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 estimator_type=self.model.estimator_type,
                 elasticity=self.model.elasticity,
                 kernel_params=self.model.kernel_params,
-                nn_params=self.model.nn_params,
+                nn_params=clean_nn_params,
                 density_estimator=self.model.density_estimator,
                 density_params=self.model.density_params
             )
