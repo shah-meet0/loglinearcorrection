@@ -555,6 +555,7 @@ class DoublyRobustElasticityEstimator(Model):
         """Fit a neural network model for E[exp(u)|X]."""
         try:
             import tensorflow as tf
+            tf.keras.backend.clear_session()
         except ImportError:
             raise ImportError("TensorFlow is required for neural network estimator.")
         
