@@ -1135,9 +1135,17 @@ class DoublyRobustElasticityEstimatorResults(Results):
             # Fit the bootstrapped model with the specified method
             bs_results = bs_model.fit(weights=weights, method=method, bootstrap=False, 
                                     compute_asymptotic_variance=False, **kwargs)
-            
-            # STORE THE FULL DREER OBJECT
-            self.bootstrap_results.append(bs_results)
+
+            # 💡 Create and store the lean result object
+            lean_result = LeanBootstrapResult(
+                parametric_params=bs_results.parametric_results.params,
+                nonparam_model=bs_results.nonparam_model,
+                model_interest_indices=bs_model.interest,
+                model_log_x_flags=bs_model.log_x,
+                model_binary_vars=bs_model.binary_vars
+            )
+            self.bootstrap_results.append(lean_result)
+
             
             # Also store summary estimates for backward compatibility
             for var_idx in var_indices:
@@ -1217,8 +1225,42 @@ class DoublyRobustElasticityEstimatorResults(Results):
         bootstrap_estimates_at_point = []
         for bs_result in self.bootstrap_results:
             try:
-                estimate = bs_result.estimate_at_point(X_point, variable_idx)
-                bootstrap_estimates_at_point.append(estimate)
+                # Reconstruct the elasticity estimate using the lean object
+                current_param_coef = bs_result.parametric_params[variable_idx]
+                
+                try:
+                    # Find if the variable of interest was log-transformed in the bootstrap model
+                    idx_in_model_interest_list = bs_result.model_interest_indices.index(variable_idx)
+                    current_log_x_bool = bs_result.model_log_x_flags[idx_in_model_interest_list]
+                except ValueError:
+                    current_log_x_bool = False
+
+                if variable_idx in bs_result.model_binary_vars:
+                    X_0 = X_point.copy(); X_1 = X_point.copy()
+                    X_0[:, variable_idx] = 0; X_1[:, variable_idx] = 1
+                    m_0 = bs_result.nonparam_model.predict(X_0)
+                    m_1 = bs_result.nonparam_model.predict(X_1)
+                    m_0[m_0 == 0] = 1e-9
+                    estimate = np.exp(current_param_coef) * (m_1 / m_0) - 1
+                else:
+                    m_at_point = bs_result.nonparam_model.predict(X_point)
+                    m_prime_at_point = bs_result.nonparam_model.derivative(X_point, variable_idx)
+                    m_at_point[m_at_point == 0] = 1e-9
+                    correction = m_prime_at_point / m_at_point
+                    
+                    # This logic must exactly match estimate_at_point
+                    if self.model.elasticity and current_log_x_bool:
+                        estimate = current_param_coef + correction
+                    elif not self.model.elasticity and not current_log_x_bool:
+                        estimate = current_param_coef + correction
+                    elif self.model.elasticity and not current_log_x_bool:
+                        estimate = current_param_coef + correction * X_point[:, variable_idx]
+                    else:
+                        x_val_col = X_point[:, variable_idx].copy()
+                        x_val_col[x_val_col == 0] = 1e-9
+                        estimate = current_param_coef + correction / x_val_col
+                
+                bootstrap_estimates_at_point.append(estimate[0])
             except Exception as e:
                 # Handle cases where bootstrap sample might fail at this point
                 # (e.g., numerical issues)
@@ -2964,3 +3006,15 @@ if __name__ == "__main__":
     print(f"Standard OLS estimate: {results1.parametric_results.params[0]:.4f}")
     print(f"Standard PPML estimate: {results2.parametric_results.params[0]:.4f}")
 
+
+from dataclasses import dataclass
+
+# You can add this class to the top of correction_estimator.py
+@dataclass
+class LeanBootstrapResult:
+    """Stores the essential components of a bootstrap replication fit."""
+    parametric_params: np.ndarray
+    nonparam_model: object # This will hold the KernelRegressionModel, NNRegressionModel, etc.
+    model_interest_indices: list
+    model_log_x_flags: list
+    model_binary_vars: np.ndarray
