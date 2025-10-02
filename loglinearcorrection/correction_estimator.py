@@ -141,10 +141,10 @@ class DoublyRobustElasticityEstimator(Model):
                         self.endog_x.append(var)
                     else:
                         raise ValueError(f"Endogenous variable '{var}' not recognized")
-            elif isinstance(interest, str) and interest in self._exog_names:
+            elif isinstance(endog_x, str) and endog_x in self._exog_names:
                 self.endog_x = [self._exog_names.index(endog_x)]
             else:
-                self.interest = [endog_x]
+                self.endog_x = [endog_x]
 
 
         
@@ -281,9 +281,9 @@ class DoublyRobustElasticityEstimator(Model):
             if len(zero_instrument_cols) > 0:
                 print('Removed zero instrument columns:', zero_instrument_cols)
 
-        if len(self.endog) < len(self.original_endog):
-            print('Some singleton observations dropped. \n'
-                  'Please ensure all singleton groups removed prior to estimation if using weights.')
+        # if len(self.endog) < len(self.original_endog):
+        #     print('Some singleton observations dropped. \n'
+        #           'Please ensure all singleton groups removed prior to estimation if using weights.')
 
         # Update exog_names to remove fixed effect variables
         if hasattr(self, '_exog_names'):
