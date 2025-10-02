@@ -211,7 +211,12 @@ class DoublyRobustElasticityEstimator(Model):
         except ImportError:
             raise ImportError("pyhdfe is required for fixed effects estimation. "
                              "Please install pyhdfe package.")
-        
+
+        if self.weights is not None:
+            weights = np.asarray(self.weights).reshape(-1, 1)
+        else:
+            weights = None
+
         # Extract the fixed effects columns
         if isinstance(self.original_exog, pd.DataFrame):
             fe_cols = self.original_exog.iloc[:, self.fe_indices].values
@@ -255,7 +260,7 @@ class DoublyRobustElasticityEstimator(Model):
         else:
             iv_len = 0
 
-        demeaned = fe_algorithm.residualize(combined, weights=self.weights)
+        demeaned = fe_algorithm.residualize(combined, weights=weights)
 
         # Update X and y with demeaned values
 
