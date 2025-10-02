@@ -354,7 +354,7 @@ class DoublyRobustElasticityEstimator(Model):
         if self.weights is None:
             weights = 1.
         else:
-            weights = self.weights
+            weights = np.asarray(self.weights).ravel()
 
         idx_endog = self.endog_x
 
