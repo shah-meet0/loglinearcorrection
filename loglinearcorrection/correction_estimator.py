@@ -67,6 +67,9 @@ class DoublyRobustElasticityEstimator(Model):
         Parameters for the density estimator
     fe : int or list, optional
         Indices of fixed effects variables, defaults to None
+    weights : array-like, optional
+        Weights for weighted least squares, defaults to None
+
         
     Notes
     -----
@@ -82,7 +85,7 @@ class DoublyRobustElasticityEstimator(Model):
     # TODO: Refactor names so its more consistent
     def __init__(self, endog, exog, interest=None, endog_x=None, log_x=False, instruments = None, estimator_type='kernel',
                  elasticity=False, kernel_params=None, nn_params=None, 
-                 density_estimator='kernel', density_params=None, fe=None):
+                 density_estimator='kernel', density_params=None, fe=None, weights=None):
         """Initialize the doubly robust estimator."""
 
         # Store the original data
@@ -90,6 +93,7 @@ class DoublyRobustElasticityEstimator(Model):
         self.original_exog = exog
         self.instruments = instruments
         self.fe = fe
+        self.weights=weights
         
         # Convert pandas objects to numpy arrays and store names
         if isinstance(endog, pd.Series):
@@ -251,7 +255,7 @@ class DoublyRobustElasticityEstimator(Model):
         else:
             iv_len = 0
 
-        demeaned = fe_algorithm.residualize(combined)
+        demeaned = fe_algorithm.residualize(combined, weights=self.weights)
 
         # Update X and y with demeaned values
 
@@ -342,6 +346,11 @@ class DoublyRobustElasticityEstimator(Model):
         if self.instruments is None:
             return  # no IV logic needed
 
+        if self.weights is None:
+            weights = 1.
+        else:
+            weights = self.weights
+
         idx_endog = self.endog_x
 
         # Extract components
@@ -353,7 +362,7 @@ class DoublyRobustElasticityEstimator(Model):
         # For each endogenous regressor, run first stage OLS
         for i in idx_endog:
             y_first_stage = self.exog[:, i]
-            reg = sm.OLS(y_first_stage, X_first_stage).fit()
+            reg = sm.WLS(y_first_stage, X_first_stage, weights).fit()
             fitted_vals = reg.fittedvalues
             # Replace the endogenous regressor with instrumented version
             self.exog[:, i] = fitted_vals
@@ -397,14 +406,12 @@ class DoublyRobustElasticityEstimator(Model):
         """Get the name of the response variable."""
         return self._endog_name
         
-    def fit(self, weights=None, method='ols', bootstrap=False, bootstrap_reps=500, 
+    def fit(self, method='ols', bootstrap=False, bootstrap_reps=500,
         bootstrap_method='pairs', compute_asymptotic_variance=None, **kwargs):
         """Fit the doubly robust estimator.
         
         Parameters
         ----------
-        weights : array-like, optional
-            Weights for weighted least squares, defaults to None
         method : str, optional
             Method to use for the parametric component: 'ols' (Estimator 1) or 'ppml' (Estimator 2)
         bootstrap : bool, optional
@@ -425,6 +432,9 @@ class DoublyRobustElasticityEstimator(Model):
         DoublyRobustElasticityEstimatorResults
             Fitted model results object
         """
+
+        weights = self.weights
+
         # Set default for asymptotic variance computation
         if compute_asymptotic_variance is None:
             compute_asymptotic_variance = not bootstrap
