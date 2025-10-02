@@ -1144,11 +1144,12 @@ class DoublyRobustElasticityEstimatorResults(Results):
                 kernel_params=self.model.kernel_params,
                 nn_params=clean_nn_params,
                 density_estimator=self.model.density_estimator,
-                density_params=self.model.density_params
+                density_params=self.model.density_params,
+                weights = weights
             )
             
             # Fit the bootstrapped model with the specified method
-            bs_results = bs_model.fit(weights=weights, method=method, bootstrap=False, 
+            bs_results = bs_model.fit(method=method, bootstrap=False, 
                                     compute_asymptotic_variance=False, **kwargs)
 
             # 💡 Create and store the lean result object
