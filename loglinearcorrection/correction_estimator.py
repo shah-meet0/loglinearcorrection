@@ -13,8 +13,6 @@ import joblib
 
 
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
 
 
 def _estimate_single_point_worker(args):
@@ -574,30 +572,17 @@ class DoublyRobustElasticityEstimator(Model):
         except ImportError:
             raise ImportError("TensorFlow is required for neural network estimator.")
         
-        def setup_dre_gpu():
 
-
-            """Force DRE to use GPU."""
-
-            try:
-                import tensorflow as tf
-                gpus = tf.config.list_physical_devices('GPU')
-
-                if gpus:
-                    for gpu in gpus:
-                        tf.config.experimental.set_memory_growth(gpu, True)
-                    print(f"✅ DRE GPU setup: {len(gpus)} GPU(s) available")
-                    return True
-                return False
-            except:
-                return False
-
-        dre_gpu_available = setup_dre_gpu()
-
-        if dre_gpu_available:
-            device_name = '/GPU:0'
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            # The worker's environment variable has already selected the correct GPU.
+            # We just need to enable memory growth on the one GPU TensorFlow can see.
+            tf.config.experimental.set_memory_growth(gpus[0], True)
+            device_name = gpus[0].name
+            print(f"✅ NN worker (PID {os.getpid()}) is using device: {device_name}")
         else:
             device_name = '/CPU:0'
+            print(f"💻 NN worker (PID {os.getpid()}) is using CPU.")
 
 
         
