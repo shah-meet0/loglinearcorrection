@@ -571,24 +571,27 @@ class DoublyRobustElasticityEstimator(Model):
             tf.keras.backend.clear_session()
         except ImportError:
             raise ImportError("TensorFlow is required for neural network estimator.")
-        
 
+        # CORRECTED DEVICE LOGIC
         gpus = tf.config.list_physical_devices('GPU')
         if gpus:
             # The worker's environment variable has already selected the correct GPU.
             # We just need to enable memory growth on the one GPU TensorFlow can see.
             tf.config.experimental.set_memory_growth(gpus[0], True)
-            device_name = gpus[0].name
-            print(f"✅ NN worker (PID {os.getpid()}) is using device: {device_name}")
+
+            # *** THIS IS THE FIX ***
+            # Use the simple logical name, not the full physical name.
+            device_name = '/GPU:0' 
+            
+            print(f"✅ NN worker (PID {os.getpid()}) is using device: {gpus[0].name}")
         else:
             device_name = '/CPU:0'
             print(f"💻 NN worker (PID {os.getpid()}) is using CPU.")
 
 
-        
         defaults = {
             'num_layers': 3,
-            'activation': 'relu', 
+            'activation': 'relu',
             'num_units': 64,
             'optimizer': 'adam',
             'loss': 'mean_squared_error',
@@ -601,9 +604,8 @@ class DoublyRobustElasticityEstimator(Model):
         
         nn_params = {**defaults, **self.nn_params}
 
-        # CRITICAL: Everything must be created within the same device context
+        # The rest of the function remains the same...
         with tf.device(device_name):
-            # Prepare data on the target device
             min_exp_r = np.min(exp_residuals)
             normalized_exp_residuals = exp_residuals / min_exp_r
             
@@ -613,27 +615,14 @@ class DoublyRobustElasticityEstimator(Model):
             
             X_nn = self.exog.copy()
             
-            # Create tensors on target device
             X_tensor = tf.convert_to_tensor(X_nn, dtype=tf.float32)
             y_tensor = tf.convert_to_tensor(scaled_residuals, dtype=tf.float32)
             
-            # Create model within device context
             model = self._create_nn_model(nn_params, device_name)
             
-            # Initialize weights on correct device
             dummy_input = tf.zeros((1, self.exog.shape[1]), dtype=tf.float32)
-            _ = model(dummy_input)  # Force weight initialization
+            _ = model(dummy_input)
 
-            # Fixed device info printing - no direct .device access
-            try:
-                if model.weights:
-                    print(f"Model initialized with {len(model.weights)} weight tensors")
-                else:
-                    print("No model weights found")
-                print(f"Training tensors ready on {device_name}")
-            except Exception as e:
-                print(f"Model info: weights initialized, training on {device_name}") 
-            # Training within device context
             history = model.fit(
                 x=X_tensor,
                 y=y_tensor,
@@ -652,9 +641,8 @@ class DoublyRobustElasticityEstimator(Model):
         
         print(f"Training completed on {device_name}")
         
-        # Return patched model
         return NNRegressionModel(model, residuals_mean, residuals_std, min_exp_r, 
-                        self.binary_vars, self.ordinal_vars)
+                                 self.binary_vars, self.ordinal_vars)
     
     def _fit_binary_model(self, exp_residuals):
         """Fit a binary model for E[exp(u)|X] when the regressor of interest is binary."""
