@@ -531,7 +531,7 @@ class DoublyRobustElasticityEstimator(Model):
             
         return results
 
-    def _fit_base_ols(self, weights, **kwargs):
+    def _fit_base_ols(self, weights, **kwargs): #TODO: clean this function
         if weights is None:
             return sm.OLS(np.log(self.endog), self.exog).fit(**kwargs)
         else:
@@ -1188,10 +1188,22 @@ class DoublyRobustElasticityEstimatorResults(Results):
         self.bootstrap = True
         self.bootstrap_reps = bootstrap_reps
         self.bootstrap_estimates_dict = bootstrap_estimates_dict
-        
+
+        bootstrap_se_dict = {}
+
+        for var_idx in var_indices:
+            estimates = bootstrap_estimates_dict[var_idx]
+            param_coef_sd = np.sqrt(np.sum((estimates[:, 0] - self.parametric_coef[var_idx]) ** 2)/(bootstrap_reps - 1)) # De mean coefficient and take std
+            correction_diff = np.sqrt(np.sum((estimates[:, 1] - np.mean(self.correction[var_idx])) ** 2)/(bootstrap_reps-1)) # De mean average correction and take std
+            ae_diff = np.sqrt(np.sum((estimates[:, 2] - self.average_estimate(var_idx))**2)/(bootstrap_reps - 1)) # De mean average estimate and take std
+            ea_diff = np.sqrt(np.sum((estimates[:,3] - self.estimate_at_average(var_idx)) ** 2)/(bootstrap_reps - 1)) # De mean estimate at average and take std
+            # combine all differences
+            ses = np.array([param_coef_sd, correction_diff, ae_diff, ea_diff])
+            bootstrap_se_dict[var_idx] = ses
+
+
         # Calculate bootstrap standard errors for each variable (backward compatibility)
-        self.bootstrap_se_dict = {var_idx: np.std(bootstrap_estimates_dict[var_idx], axis=0) 
-                                 for var_idx in var_indices}
+        self.bootstrap_se_dict = bootstrap_se_dict
 
 
     def bootstrap_standard_error_at_point(self, X_point, variable_idx=None):
