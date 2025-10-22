@@ -170,7 +170,7 @@ def _detect_variable_types(
 
         if n_unique == 2:
             variable_types[col_idx] = "binary"
-        elif n_unique <= 10:
+        elif n_unique <= 10: # not sure whether this is the appropriate logic
             variable_types[col_idx] = "ordinal"
         else:
             variable_types[col_idx] = "continuous"

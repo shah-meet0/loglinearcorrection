@@ -21,7 +21,7 @@ class DoublyRobustElasticityEstimatorModel:
         weights: npt.ArrayLike | None = None,
         fixed_effects: list[str] | list[int] | None = None,
         interest: list[str] | list[int] | None = None,
-        hasconst: bool = True,
+        hasconst: bool = True, # Do we need this?
         **kwargs
     ) -> None:
         """
@@ -105,12 +105,12 @@ class DoublyRobustElasticityEstimatorModel:
         self.endog_names = (
             endog.name if isinstance(endog, pd.Series)
             else endog.columns[0] if isinstance(endog, pd.DataFrame)
-            else None
+            else None #probably should call them x1 to xn
         )
         self.exog_names = (
             exog.columns.tolist() if isinstance(exog, pd.DataFrame)
             else [exog.name] if isinstance(exog, pd.Series)
-            else None
+            else None #probably should call them x1 to xn
         )
 
         # Convert to arrays and validate numeric types
