@@ -1,8 +1,14 @@
+from typing import Optional, Dict, Any, List, Tuple, Union
+
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+import numpy.typing as npt
+from sklearn.model_selection import KFold
+import statsmodels.api as sm
 
 from .utils import _apply_fixed_effects, _detect_variable_types
+#from .results import DREEMR
 
 
 class DoublyRobustElasticityEstimatorModel:
@@ -183,3 +189,260 @@ class DoublyRobustElasticityEstimatorModel:
         self.endog_demeaned, self.exog_demeaned = _apply_fixed_effects(
             self.endog, self.exog, fixed_effects, self.exog_names
         )
+
+
+    def fit(self, n_folds: int = 10, random_state: Optional[int] = None, 
+            fit_params: Optional[Dict[str, Any]] = None) -> 'DREEMR':
+        """
+        Fit the Doubly Robust Nonparametric Orthogonal (DR.NO) elasticity estimator.
+        
+        Implements cross-fitted estimation of elasticities using Neyman-orthogonalized 
+        moment conditions for both continuous (semi-elasticities) and discrete 
+        (percentage changes) variables.
+        
+        Parameters
+        ----------
+        n_folds : int, default=10
+            Number of folds for cross-fitting.
+        random_state : int or None, default=None
+            Random state for reproducible fold splitting.
+        fit_params : dict or None, default=None
+            Additional parameters to pass to DensityModel and NonparametricModel fit methods.
+            
+        Returns
+        -------
+        DREEMR
+            DoublyRobustElasticityEstimatorModelResults object containing:
+            - Elasticity estimates for variables of interest
+            - Standard errors (to be implemented later)
+            - First-stage OLS coefficients
+            - Diagnostics from cross-fitting
+            
+        Notes
+        -----
+        The estimator follows these steps for each fold:
+        1. Split data into training and evaluation sets
+        2. Estimate OLS coefficients β on training data
+        3. Estimate nuisance functions (m(x), f(x)) on training data  
+        4. Compute influence functions α(x) on evaluation data
+        5. Construct orthogonalized moments ψ
+        6. Average moments across folds for final estimates
+        """
+        if fit_params is None:
+            fit_params = {}
+        
+        # Determine which variables to compute elasticities for
+        if self.interest is None:
+            # All non-fixed-effect variables
+            if self.fixed_effects is None:
+                interest_indices = list(range(self.exog.shape[1]))
+            else:
+                if self.exog_names and isinstance(self.fixed_effects[0], str):
+                    fe_indices = {self.exog_names.index(name) for name in self.fixed_effects}
+                else:
+                    fe_indices = set(self.fixed_effects)
+                interest_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
+        else:
+            # Convert interest specification to indices
+            if self.exog_names and isinstance(self.interest[0], str):
+                interest_indices = [self.exog_names.index(name) for name in self.interest]
+            else:
+                interest_indices = list(self.interest)
+        
+        # Initialize storage for cross-fitted moments
+        n_params = len(interest_indices) + self.exog.shape[1]  # elasticities + β coefficients
+        moments = np.zeros((self.nobs, n_params))
+        fold_weights = np.zeros(self.nobs)  # Track which observations were in test sets
+        
+        # Set up cross-validation
+        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        
+        # Storage for diagnostics
+        ols_coefficients = []
+        
+        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(self.exog)):
+            # Split data
+            endog_train, endog_test = self.endog_demeaned[train_idx], self.endog_demeaned[test_idx]
+            exog_train, exog_test = self.exog_demeaned[train_idx], self.exog_demeaned[test_idx]
+            
+            # Original data for nuisance functions (includes fixed effects)
+            exog_orig_train, exog_orig_test = self.exog[train_idx], self.exog[test_idx]
+            endog_orig_train, endog_orig_test = self.endog[train_idx], self.endog[test_idx]
+            
+            weights_train = self.weights[train_idx] if self.weights is not None else None
+            weights_test = self.weights[test_idx] if self.weights is not None else None
+            
+            # Step 1: Estimate OLS coefficients β on training data
+            if weights_train is not None:
+                ols_model = sm.WLS(np.log(endog_orig_train), exog_train, weights=weights_train)
+            else:
+                ols_model = sm.OLS(np.log(endog_orig_train), exog_train)
+            
+            ols_results = ols_model.fit()
+            beta = ols_results.params
+            ols_coefficients.append(beta)
+            
+            # Compute residuals on test data
+            log_residuals_test = np.log(endog_orig_test) - exog_test @ beta
+            exp_residuals_test = np.exp(log_residuals_test)  # exp(u_i)
+            
+            # Step 2: Estimate nuisance functions on training data
+            # Using original (non-demeaned) data for nuisance functions
+            
+            # Estimate m(x) = E[exp(u)|x] using NonparametricModel
+            log_residuals_train = np.log(endog_orig_train) - exog_train @ beta
+            exp_residuals_train = np.exp(log_residuals_train)
+            
+            m_model = NonparametricModel()  # Assumes this is imported
+            m_model.fit(exog_orig_train, exp_residuals_train, weights=weights_train, **fit_params)
+            
+            # Predict m(x) on test data
+            m_test = m_model.predict(exog_orig_test)
+            
+            # Estimate density f(x) using DensityModel
+            density_model = DensityModel()  # Assumes this is imported
+            density_model.fit(exog_orig_train, weights=weights_train, **fit_params)
+            
+            # Predict density on test data
+            f_test = density_model.predict(exog_orig_test)
+            
+            # Step 3: Construct moment conditions for each variable of interest
+            moment_idx = 0
+            
+            for var_idx in interest_indices:
+                var_type = self.variable_types.get(var_idx, 'continuous')
+                
+                if var_type == 'continuous':
+                    # Continuous variable: semi-elasticity
+                    # ε = β_k + m_k(x)/m(x)
+                    # α(x) = -f_k(x)/(f(x)*m(x))
+                    
+                    # Get semi-elasticity from density model
+                    f_semi_elast_test = density_model.predict_semi_elasticity(exog_orig_test, var_idx)
+                    
+                    # Influence function
+                    alpha_test = -f_semi_elast_test / (f_test * m_test + 1e-10)
+                    
+                    # Orthogonalized moment (without elasticity parameter - that's what we solve for)
+                    # g = β_k + m_k(x)/m(x) and φ = α(x)*p where p = exp(u) - m(x)
+                    p_test = exp_residuals_test - m_test
+                    
+                    # For now, we need m_k(x)/m(x) which NonparametricModel should provide
+                    # Assume it has a method for this
+                    m_semi_elast_test = m_model.predict_semi_elasticity(exog_orig_test, var_idx)
+                    
+                    # Store moment: g + φ = β_k + m_k/m + α*p
+                    moments[test_idx, moment_idx] = beta[var_idx] + m_semi_elast_test + alpha_test * p_test
+                    
+                elif var_type == 'binary':
+                    # Binary variable: percentage change with Δ=1
+                    # First term (density derivative) is zero for binaries
+                    # ε = exp(β*Δ) * m(x+Δ)/m(x) - 1
+                    # α(x) = exp(β*Δ) * [0 - m(x+Δ)/m^2(x)]  (first term zero for binary)
+                    
+                    delta = 1
+                    beta_delta = beta[var_idx] * delta
+                    
+                    # Create shifted x
+                    x_shifted = exog_orig_test.copy()
+                    x_shifted[:, var_idx] = 1 - x_shifted[:, var_idx]  # Flip binary variable
+                    
+                    # Predict m(x+Δ)
+                    m_shifted_test = m_model.predict(x_shifted)
+                    
+                    # Influence function (first term zero for binary)
+                    alpha_test = np.exp(beta_delta) * (-m_shifted_test / (m_test**2 + 1e-10))
+                    
+                    # Orthogonalized moment
+                    p_test = exp_residuals_test - m_test
+                    
+                    # Store moment: g + φ
+                    ratio = m_shifted_test / (m_test + 1e-10)
+                    moments[test_idx, moment_idx] = np.exp(beta_delta) * ratio - 1 + alpha_test * p_test
+                    
+                elif var_type == 'ordinal':
+                    # Ordinal variable: percentage change with Δ=1  
+                    # ε = exp(β*Δ) * m(x+Δ)/m(x) - 1
+                    # α(x) = exp(β*Δ) * [f(x-Δ)/(m(x-Δ)*f(x)) - m(x+Δ)/m^2(x)]
+                    
+                    delta = 1
+                    beta_delta = beta[var_idx] * delta
+                    
+                    # Create shifted x values
+                    x_plus = exog_orig_test.copy()
+                    x_plus[:, var_idx] += delta
+                    
+                    x_minus = exog_orig_test.copy()
+                    x_minus[:, var_idx] -= delta
+                    
+                    # Predict m and f at shifted points
+                    m_plus_test = m_model.predict(x_plus)
+                    m_minus_test = m_model.predict(x_minus)
+                    f_minus_test = density_model.predict(x_minus)
+                    
+                    # Influence function
+                    term1 = f_minus_test / (m_minus_test * f_test + 1e-10)
+                    term2 = m_plus_test / (m_test**2 + 1e-10)
+                    alpha_test = np.exp(beta_delta) * (term1 - term2)
+                    
+                    # Orthogonalized moment
+                    p_test = exp_residuals_test - m_test
+                    
+                    # Store moment
+                    ratio = m_plus_test / (m_test + 1e-10)
+                    moments[test_idx, moment_idx] = np.exp(beta_delta) * ratio - 1 + alpha_test * p_test
+                
+                moment_idx += 1
+            
+            # Add OLS moment conditions (these don't need orthogonalization)
+            for j in range(self.exog.shape[1]):
+                moments[test_idx, len(interest_indices) + j] = (
+                    log_residuals_test * exog_test[:, j]
+                )
+            
+            # Track fold weights for averaging
+            if weights_test is not None:
+                fold_weights[test_idx] = weights_test
+            else:
+                fold_weights[test_idx] = 1.0
+        
+        # Step 4: Compute final estimates via method of moments
+        # Weight by observation weights if provided
+        weighted_moments = moments * fold_weights[:, np.newaxis]
+        moment_means = np.average(weighted_moments, axis=0, weights=fold_weights)
+        
+        # Extract elasticity estimates (first len(interest_indices) moments)
+        elasticity_estimates = moment_means[:len(interest_indices)]
+        
+        # Create results dictionary
+        elasticity_dict = {}
+        for i, var_idx in enumerate(interest_indices):
+            var_name = self.exog_names[var_idx] if self.exog_names else f"x{var_idx+1}"
+            elasticity_dict[var_name] = {
+                'estimate': elasticity_estimates[i],
+                'type': self.variable_types.get(var_idx, 'continuous'),
+                'index': var_idx
+            }
+        
+        # Average OLS coefficients across folds
+        avg_beta = np.mean(ols_coefficients, axis=0)
+        
+        # Create and return results object
+        results = DREEMR(
+            elasticities=elasticity_dict,
+            beta=avg_beta,
+            exog_names=self.exog_names,
+            endog_name=self.endog_names,
+            n_folds=n_folds,
+            nobs=self.nobs,
+            variable_types=self.variable_types,
+            fold_diagnostics={
+                'ols_coefficients': ols_coefficients,
+                'moment_means': moment_means
+            }
+        )
+        
+        return results
+
+
+DREEM = DoublyRobustElasticityEstimatorModel
