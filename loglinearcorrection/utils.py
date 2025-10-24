@@ -117,14 +117,14 @@ def _apply_fixed_effects(
 def _detect_variable_types(
     exog: npt.NDArray[np.floating],
     indices: list[int],
-) -> dict[int, Literal["continuous", "binary", "ordinal"]]:
+) -> dict[int, Literal["continuous", "binary"]]:
     """
-    Detect variable types as continuous, binary, or ordinal.
+    Detect whether variables are binary or continuous.
 
     Classifies each variable based on the number of unique values observed.
-    Binary variables have exactly 2 unique values, ordinal variables have
-    between 3 and 10 unique values, and continuous variables have more than
-    10 unique values.
+    Binary variables have exactly 2 unique values, all others are classified
+    as continuous. Ordinal variables must be explicitly specified by the user
+    and are not automatically detected.
 
     Parameters
     ----------
@@ -138,23 +138,25 @@ def _detect_variable_types(
     -------
     variable_types : dict
         Dictionary mapping each variable index to its detected type:
-        'continuous', 'binary', or 'ordinal'.
+        'binary' if exactly 2 unique values, 'continuous' otherwise.
 
     Notes
     -----
-    The classification heuristic is:
+    The classification is simple and deterministic:
 
     - **Binary**: Exactly 2 unique values (e.g., 0/1, True/False)
-    - **Ordinal**: 3-10 unique values (e.g., Likert scales, small categories)
-    - **Continuous**: More than 10 unique values
+    - **Continuous**: All other variables (including those with 3+ unique values)
 
-    This heuristic may misclassify certain edge cases:
+    Ordinal variables are not automatically detected due to the difficulty in
+    reliably distinguishing them from continuous or categorical variables.
+    Users should explicitly specify ordinal variables through the model's
+    `ordinal` parameter based on their domain knowledge.
 
-    - Categorical variables with >10 categories will be labeled continuous
-    - Continuous variables with ≤10 observed values will be labeled ordinal
-
-    Users should verify detected types match their domain knowledge and
-    override if necessary.
+    This approach avoids misclassification issues such as:
+    - Continuous variables with limited observed variation being wrongly
+      classified as ordinal
+    - Ordered categorical variables with many levels (e.g., years of education)
+      being wrongly classified as continuous
 
     Examples
     --------
@@ -162,6 +164,12 @@ def _detect_variable_types(
     >>> types = _detect_variable_types(exog, indices=[0, 1])
     >>> types
     {0: 'binary', 1: 'continuous'}
+    
+    >>> # Variable with 3 unique values is classified as continuous
+    >>> exog = np.array([[1, 0], [2, 1], [3, 0], [2, 1]])
+    >>> types = _detect_variable_types(exog, indices=[0, 1])
+    >>> types
+    {0: 'continuous', 1: 'binary'}
     """
     variable_types = {}
 
@@ -170,8 +178,6 @@ def _detect_variable_types(
 
         if n_unique == 2:
             variable_types[col_idx] = "binary"
-        elif n_unique <= 10: # not sure whether this is the appropriate logic
-            variable_types[col_idx] = "ordinal"
         else:
             variable_types[col_idx] = "continuous"
 

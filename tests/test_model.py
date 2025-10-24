@@ -19,11 +19,9 @@ class TestDoublyRobustElasticityEstimatorModelInit:
         assert model.nobs == 4
         assert model.endog.shape == (4,)
         assert model.exog.shape == (4, 2)
-        assert model.hasconst is True
-        assert model.k_constant == 1
         assert model.weights is None
-        assert model.exog_names is None
-        assert model.endog_names is None
+        assert model.exog_names == ["x1", "x2"]  # Default names
+        assert model.endog_names == "y"  # Default name
 
     def test_initialization_pandas_dataframe(self):
         """Test initialization with pandas DataFrame preserves names."""
@@ -62,38 +60,26 @@ class TestDoublyRobustElasticityEstimatorModelInit:
         assert model.weights is not None
         assert np.array_equal(model.weights, weights)
 
-    def test_hasconst_parameter(self):
-        """Test hasconst parameter affects k_constant."""
-        endog = np.array([1.0, 2.0, 3.0])
-        exog = np.array([[1.0], [2.0], [3.0]])
-
-        model_with_const = DoublyRobustElasticityEstimatorModel(
-            endog, exog, hasconst=True
-        )
-        model_without_const = DoublyRobustElasticityEstimatorModel(
-            endog, exog, hasconst=False
-        )
-
-        assert model_with_const.hasconst is True
-        assert model_with_const.k_constant == 1
-        assert model_without_const.hasconst is False
-        assert model_without_const.k_constant == 0
-
     def test_fixed_effects_and_interest_stored(self):
-        """Test fixed_effects and interest parameters are stored."""
+        """Test fixed_effects, interest, and ordinal parameters are stored."""
         endog = np.array([1.0, 2.0, 3.0, 4.0])
         exog = pd.DataFrame({
             "x1": [1.0, 2.0, 3.0, 4.0],
             "fe": [0, 0, 1, 1],
-            "x2": [2.0, 3.0, 4.0, 5.0]
+            "x2": [2.0, 3.0, 4.0, 5.0],
+            "x3": [1, 2, 3, 2]
         })
 
         model = DoublyRobustElasticityEstimatorModel(
-            endog, exog, fixed_effects=["fe"], interest=["x1"]
+            endog, exog, 
+            fixed_effects=["fe"], 
+            interest=["x1"],
+            ordinal=["x3"]
         )
 
         assert model.fixed_effects == ["fe"]
         assert model.interest == ["x1"]
+        assert model.ordinal == ["x3"]
 
     def test_non_numeric_endog_raises_error(self):
         """Test that non-numeric endog raises ValueError."""
@@ -216,6 +202,29 @@ class TestDoublyRobustElasticityEstimatorModelInit:
         np.testing.assert_array_equal(call_args[0], endog)
         assert call_args[2] == ["fe"]  # fixed_effects
         assert call_args[3] == ["x1", "fe"]  # exog_names
+    
+    @patch("loglinearcorrection.model._detect_variable_types")
+    @patch("loglinearcorrection.model._apply_fixed_effects")
+    def test_apply_fixed_effects_with_default_names(
+        self, mock_apply_fe, mock_detect_types
+    ):
+        """Test that _apply_fixed_effects receives correct default names."""
+        mock_detect_types.return_value = {0: "continuous"}
+        endog_demeaned = np.array([0.5, 1.5, 2.5])
+        exog_demeaned = np.array([[0.5, 1.0], [1.5, 1.0], [2.5, 1.0]])
+        mock_apply_fe.return_value = (endog_demeaned, exog_demeaned)
+
+        endog = np.array([1.0, 2.0, 3.0])
+        exog = np.array([[1.0, 0], [2.0, 0], [3.0, 1]])
+
+        model = DoublyRobustElasticityEstimatorModel(
+            endog, exog, fixed_effects=[1]
+        )
+
+        mock_apply_fe.assert_called_once()
+        call_args = mock_apply_fe.call_args[0]
+        # Check that default names were passed
+        assert call_args[3] == ["x1", "x2"]  # default exog_names
 
     @patch("loglinearcorrection.model._detect_variable_types")
     @patch("loglinearcorrection.model._apply_fixed_effects")
@@ -305,7 +314,7 @@ class TestDoublyRobustElasticityEstimatorModelInit:
         self, mock_apply_fe, mock_detect_types
     ):
         """Test that detected variable types are stored."""
-        expected_types = {0: "binary", 1: "continuous", 2: "ordinal"}
+        expected_types = {0: "binary", 1: "continuous", 2: "continuous"}
         mock_detect_types.return_value = expected_types
         mock_apply_fe.return_value = (
             np.array([1.0, 2.0, 3.0]),
@@ -318,6 +327,119 @@ class TestDoublyRobustElasticityEstimatorModelInit:
         model = DoublyRobustElasticityEstimatorModel(endog, exog)
 
         assert model.variable_types == expected_types
+    
+    @patch("loglinearcorrection.model._detect_variable_types")
+    @patch("loglinearcorrection.model._apply_fixed_effects")
+    def test_ordinal_override(
+        self, mock_apply_fe, mock_detect_types
+    ):
+        """Test that ordinal parameter overrides detected types except for binary."""
+        # Initial detection says one binary, rest continuous
+        mock_detect_types.return_value = {0: "continuous", 1: "continuous", 2: "binary"}
+        mock_apply_fe.return_value = (
+            np.array([1.0, 2.0, 3.0]),
+            np.array([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]])
+        )
+
+        endog = np.array([1.0, 2.0, 3.0])
+        exog = pd.DataFrame({
+            "x1": [3, 5, 7],
+            "x2": [1.5, 2.5, 3.5],
+            "x3": [0, 1, 0]
+        })
+
+        model = DoublyRobustElasticityEstimatorModel(
+            endog, exog, ordinal=["x1", "x3"]  # Try to set both as ordinal
+        )
+
+        # x1 (index 0) should be ordinal as it wasn't binary
+        assert model.variable_types[0] == "ordinal"
+        # x2 (index 1) should remain continuous
+        assert model.variable_types[1] == "continuous"
+        # x3 (index 2) should remain binary despite ordinal specification
+        assert model.variable_types[2] == "binary"
+    
+    @patch("loglinearcorrection.model._detect_variable_types")
+    @patch("loglinearcorrection.model._apply_fixed_effects")
+    def test_binary_takes_precedence_over_ordinal(
+        self, mock_apply_fe, mock_detect_types
+    ):
+        """Test that binary classification takes precedence over ordinal specification."""
+        mock_detect_types.return_value = {0: "binary", 1: "continuous"}
+        mock_apply_fe.return_value = (
+            np.array([1.0, 2.0, 3.0, 4.0]),
+            np.array([[0, 1.5], [1, 2.5], [0, 3.5], [1, 4.5]])
+        )
+
+        endog = np.array([1.0, 2.0, 3.0, 4.0])
+        exog = np.array([[0, 1.5], [1, 2.5], [0, 3.5], [1, 4.5]])
+
+        # Try to override binary variable to ordinal
+        model = DoublyRobustElasticityEstimatorModel(
+            endog, exog, ordinal=[0]
+        )
+
+        # Should remain binary
+        assert model.variable_types[0] == "binary"
+        assert model.variable_types[1] == "continuous"
+    
+    @patch("loglinearcorrection.model._detect_variable_types")
+    @patch("loglinearcorrection.model._apply_fixed_effects")
+    def test_ordinal_with_indices(
+        self, mock_apply_fe, mock_detect_types
+    ):
+        """Test ordinal specification using integer indices."""
+        mock_detect_types.return_value = {0: "continuous", 1: "binary"}
+        mock_apply_fe.return_value = (
+            np.array([1.0, 2.0, 3.0]),
+            np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0]])
+        )
+
+        endog = np.array([1.0, 2.0, 3.0])
+        exog = np.array([[3, 0], [5, 1], [7, 0]])
+
+        model = DoublyRobustElasticityEstimatorModel(
+            endog, exog, ordinal=[0, 1]  # Try to set both as ordinal
+        )
+
+        # Index 0 should become ordinal (was continuous)
+        assert model.variable_types[0] == "ordinal"
+        # Index 1 should remain binary (takes precedence)
+        assert model.variable_types[1] == "binary"
+    
+    @patch("loglinearcorrection.model._detect_variable_types")
+    @patch("loglinearcorrection.model._apply_fixed_effects")
+    def test_ordinal_ignores_fixed_effects(
+        self, mock_apply_fe, mock_detect_types
+    ):
+        """Test that ordinal specification ignores fixed effects columns."""
+        # Only non-FE columns in variable_types
+        mock_detect_types.return_value = {0: "continuous", 2: "continuous"}
+        mock_apply_fe.return_value = (
+            np.array([1.0, 2.0, 3.0]),
+            np.array([[1.0, 3.0], [2.0, 4.0], [3.0, 5.0]])
+        )
+
+        endog = np.array([1.0, 2.0, 3.0])
+        exog = pd.DataFrame({
+            "x1": [1, 2, 3],
+            "fe": [0, 0, 1],
+            "x2": [3, 4, 5]
+        })
+
+        # Try to set fe column as ordinal (should be ignored)
+        model = DoublyRobustElasticityEstimatorModel(
+            endog, exog, 
+            fixed_effects=["fe"],
+            ordinal=["fe", "x1"]
+        )
+
+        # fe (index 1) should not be in variable_types
+        assert 1 not in model.variable_types
+        # x1 (index 0) should be ordinal
+        assert model.variable_types[0] == "ordinal"
+        # x2 (index 2) should remain continuous
+        assert model.variable_types[2] == "continuous"
 
     def test_dataframe_with_single_column(self):
         """Test initialization with single-column DataFrame."""
@@ -411,4 +533,43 @@ class TestEdgeCasesAndIntegration:
         model = DoublyRobustElasticityEstimatorModel(endog, exog)
 
         assert model.endog_names == "y"
-        assert model.exog_names is None
+        assert model.exog_names == ["x1"]  # Default name for single column
+    
+    def test_default_names_multiple_columns(self):
+        """Test default naming for multiple columns in numpy array."""
+        endog = np.array([1.0, 2.0, 3.0])
+        exog = np.array([[1.0, 2.0, 3.0], [2.0, 3.0, 4.0], [3.0, 4.0, 5.0]])
+
+        model = DoublyRobustElasticityEstimatorModel(endog, exog)
+
+        assert model.endog_names == "y"
+        assert model.exog_names == ["x1", "x2", "x3"]
+    
+    def test_default_names_single_column(self):
+        """Test default naming for single column numpy array."""
+        endog = np.array([1.0, 2.0, 3.0])
+        exog = np.array([1.0, 2.0, 3.0])  # 1D array
+
+        model = DoublyRobustElasticityEstimatorModel(endog, exog)
+
+        assert model.endog_names == "y"
+        assert model.exog_names == ["x1"]
+    
+    def test_default_names_with_fixed_effects_reference(self):
+        """Test that default names work correctly with fixed effects references."""
+        endog = np.array([1.0, 2.0, 3.0, 4.0])
+        exog = np.array([
+            [1.0, 0, 2.0],
+            [2.0, 0, 3.0],
+            [3.0, 1, 4.0],
+            [4.0, 1, 5.0]
+        ])
+
+        # Even with integer indices for fixed effects, names should be generated
+        model = DoublyRobustElasticityEstimatorModel(
+            endog, exog, fixed_effects=[1]
+        )
+
+        assert model.endog_names == "y"
+        assert model.exog_names == ["x1", "x2", "x3"]
+        assert model.fixed_effects == [1]

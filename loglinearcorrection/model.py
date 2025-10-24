@@ -21,7 +21,7 @@ class DoublyRobustElasticityEstimatorModel:
         weights: npt.ArrayLike | None = None,
         fixed_effects: list[str] | list[int] | None = None,
         interest: list[str] | list[int] | None = None,
-        hasconst: bool = True, # Do we need this?
+        ordinal: list[str] | list[int] | None = None,
         **kwargs
     ) -> None:
         """
@@ -43,8 +43,14 @@ class DoublyRobustElasticityEstimatorModel:
         interest : list of str or list of int, optional
             Variable names (if `exog` is DataFrame) or column indices indicating
             variables of primary interest.
-        hasconst : bool, default True
-            Whether the model includes a constant term.
+        ordinal : list of str or list of int, optional
+            Variable names (if `exog` is DataFrame) or column indices indicating
+            which variables should be treated as ordinal. Variables not specified
+            as ordinal will be automatically classified as either binary (if they
+            have exactly 2 unique values) or continuous (otherwise). Note that
+            variables with exactly 2 unique values will remain classified as binary
+            even if specified in the ordinal parameter, as binary is a special case
+            that requires specific handling.
         **kwargs
             Additional keyword arguments (reserved for future use).
 
@@ -56,25 +62,26 @@ class DoublyRobustElasticityEstimatorModel:
             Original independent variables as 2-D array.
         weights : ndarray or None
             Observation weights.
-        endog_names : str or None
-            Name of dependent variable if available from input.
-        exog_names : list of str or None
-            Names of independent variables if available from input.
+        endog_names : str
+            Name of dependent variable (from input or default "y").
+        exog_names : list of str
+            Names of independent variables (from input or default "x1", "x2", ...).
         endog_demeaned : ndarray
             Dependent variable after fixed effects transformation.
         exog_demeaned : ndarray
             Independent variables after fixed effects transformation.
         variable_types : dict
             Mapping of variable indices/names to detected types ('continuous',
-            'binary', 'ordinal') for non-fixed-effect variables.
+            'binary', 'ordinal') for non-fixed-effect variables. Binary variables
+            are automatically detected (exactly 2 unique values), ordinal must be
+            explicitly specified via the `ordinal` parameter, and all others are
+            treated as continuous.
         fixed_effects : list or None
             Fixed effects specification.
         interest : list or None
             Variables of interest specification.
-        hasconst : bool
-            Whether model includes constant.
-        k_constant : int
-            Number of constants (1 if hasconst else 0).
+        ordinal : list or None
+            Ordinal variables specification.
         nobs : int
             Number of observations.
 
@@ -87,35 +94,48 @@ class DoublyRobustElasticityEstimatorModel:
         -----
         The initialization performs the following operations:
 
-        1. Extracts and stores variable names from pandas objects if provided
+        1. Extracts and stores variable names from pandas objects if provided,
+           or generates default names ("y" for endog, "x1", "x2", ... for exog)
         2. Converts all inputs to numpy arrays and validates numeric types
-        3. Detects variable types (continuous, binary, ordinal) for non-fixed-
-           effect variables using :func:`_detect_variable_types`
+        3. Detects variable types for non-fixed-effect variables:
+           - Binary: Automatically detected when exactly 2 unique values (takes
+             precedence over ordinal specification)
+           - Ordinal: Must be explicitly specified via `ordinal` parameter
+           - Continuous: All other variables
         4. Applies within-group demeaning for fixed effects using
            :func:`_apply_fixed_effects`
         5. Stores both original and transformed data for estimation
+        
+        Variable type detection is important for proper handling in elasticity
+        estimation. Users should carefully specify ordinal variables based on
+        their domain knowledge, as automatic detection can be unreliable. Binary
+        detection takes precedence to ensure proper handling of dichotomous
+        variables.
         """
         # Store specifications
         self.fixed_effects = fixed_effects
         self.interest = interest
-        self.hasconst = hasconst
-        self.k_constant = int(hasconst)
+        self.ordinal = ordinal
 
-        # Extract names from pandas objects
+        # Extract names from pandas objects or generate defaults
         self.endog_names = (
             endog.name if isinstance(endog, pd.Series)
             else endog.columns[0] if isinstance(endog, pd.DataFrame)
-            else None #probably should call them x1 to xn
+            else "y"
         )
+        
+        # Convert to array first to get shape for default naming
+        exog_arr = np.asarray(exog)
+        n_vars = exog_arr.shape[1] if exog_arr.ndim == 2 else 1
+        
         self.exog_names = (
             exog.columns.tolist() if isinstance(exog, pd.DataFrame)
             else [exog.name] if isinstance(exog, pd.Series)
-            else None #probably should call them x1 to xn
+            else [f"x{i+1}" for i in range(n_vars)]
         )
 
         # Convert to arrays and validate numeric types
         endog_arr = np.asarray(endog)
-        exog_arr = np.asarray(exog)
         weights_arr = np.asarray(weights) if weights is not None else None
 
         if not np.issubdtype(endog_arr.dtype, np.number):
@@ -145,6 +165,19 @@ class DoublyRobustElasticityEstimatorModel:
         self.variable_types = _detect_variable_types(
             self.exog[:, non_fe_indices], non_fe_indices
         )
+        
+        # Override with explicit ordinal specification (but respect binary detection)
+        if ordinal is not None:
+            if self.exog_names and isinstance(ordinal[0], str):
+                ordinal_indices = [self.exog_names.index(name) for name in ordinal]
+            else:
+                ordinal_indices = list(ordinal)
+            
+            for idx in ordinal_indices:
+                if idx in self.variable_types:  # Only if not a fixed effect
+                    # Only override to ordinal if not already detected as binary
+                    if self.variable_types[idx] != "binary":
+                        self.variable_types[idx] = "ordinal"
 
         # Apply fixed effects transformation
         self.endog_demeaned, self.exog_demeaned = _apply_fixed_effects(
