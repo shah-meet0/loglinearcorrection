@@ -8,7 +8,7 @@ import statsmodels.api as sm
 
 from .utils import _apply_fixed_effects, _detect_variable_types
 from .nonparametric import NPModel, NPModelResults
-#from .results import DREEMR
+from .results import DREEMR
 #from .density import DensityModel, DensityModelResults
 
 
