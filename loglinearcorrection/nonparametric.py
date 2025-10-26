@@ -16,17 +16,67 @@ class NPModelResults:
 
     def __init__(self, model: NPModel, x: npt.ArrayLike, y: npt.ArrayLike):
         self.model = model.model
+        self.parent_model = model  # Store parent NPModel to access variable_types
         self.x = x
         self.y = y
 
-    def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float_]:
+    def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
         pass
 
-    def derivative(self, x: npt.NDArray[np.float_], var_index: int) -> npt.NDArray[np.float_]:
+    def derivative(self, x: npt.NDArray[np.float64], var_index: int) -> npt.NDArray[np.float64]:
         pass
 
-    def second_derivative(self, x: npt.NDArray[np.float_], var_index: int) -> npt.NDArray[np.float_]:
+    def second_derivative(self, x: npt.NDArray[np.float64], var_index: int) -> npt.NDArray[np.float64]:
         pass
+    
+    def predict_semi_elasticity(self, x: npt.ArrayLike, var_index: int) -> npt.NDArray[np.float64]:
+        """
+        Compute semi-elasticity m_k(x)/m(x) where m_k is the derivative w.r.t. variable k.
+        
+        Only valid for continuous variables. For binary or ordinal variables, use 
+        predict with shifted x values to compute percentage changes.
+        
+        Parameters
+        ----------
+        x : array_like
+            Points at which to evaluate semi-elasticity, shape (n_samples, n_features)
+        var_index : int
+            Index of variable for which to compute the semi-elasticity
+            
+        Returns
+        -------
+        ndarray
+            Semi-elasticity values m_k(x)/m(x), shape (n_samples,)
+            
+        Raises
+        ------
+        ValueError
+            If var_index corresponds to a binary or ordinal variable
+        ZeroDivisionError
+            If m(x) equals zero for any observation
+            
+        Notes
+        -----
+        The semi-elasticity represents the proportional change in m(x) with respect 
+        to a unit change in variable k. It is computed as the ratio of the partial 
+        derivative to the function value. This is only meaningful for continuous 
+        variables where derivatives exist.
+        
+        For discrete variables (binary/ordinal), percentage changes should be computed
+        as [m(x + Δ) - m(x)] / m(x) using the predict method with shifted inputs.
+        """
+        # Check if this is being called on a non-continuous variable
+        if hasattr(self, 'parent_model') and hasattr(self.parent_model, 'variable_types'):
+            var_type = self.parent_model.variable_types.get(var_index, 'continuous')
+            if var_type in ['binary', 'ordinal']:
+                raise ValueError(
+                    f"predict_semi_elasticity called on {var_type} variable at index {var_index}. "
+                    f"For {var_type} variables, compute percentage changes using predict() with shifted x values."
+                )
+        
+        m_x = self.predict(x)
+        m_k_x = self.derivative(x, var_index)
+        return m_k_x / m_x
 
 
 
@@ -196,13 +246,13 @@ class NNModelResults(NPModelResults):
         super().__init__(model, x, y)
         pass
 
-    def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float_]:
+    def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
         pass
 
-    def derivative(self, x: npt.NDArray[np.float_], var_index: int) -> npt.NDArray[np.float_]:
+    def derivative(self, x: npt.NDArray[np.float64], var_index: int) -> npt.NDArray[np.float64]:
         pass
 
-    def second_derivative(self, x: npt.NDArray[np.float_], var_index: int) -> npt.NDArray[np.float_]:
+    def second_derivative(self, x: npt.NDArray[np.float64], var_index: int) -> npt.NDArray[np.float64]:
         pass
 
 class NNModelScoreResults(NNModelResults):

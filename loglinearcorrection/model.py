@@ -3,12 +3,13 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-import numpy.typing as npt
 from sklearn.model_selection import KFold
 import statsmodels.api as sm
 
 from .utils import _apply_fixed_effects, _detect_variable_types
+from .nonparametric import NPModel, NPModelResults
 #from .results import DREEMR
+#from .density import DensityModel, DensityModelResults
 
 
 class DoublyRobustElasticityEstimatorModel:
@@ -207,7 +208,7 @@ class DoublyRobustElasticityEstimatorModel:
         random_state : int or None, default=None
             Random state for reproducible fold splitting.
         fit_params : dict or None, default=None
-            Additional parameters to pass to DensityModel and NonparametricModel fit methods.
+            Additional parameters to pass to NPModel and DensityModel fit methods.
             
         Returns
         -------
@@ -216,7 +217,8 @@ class DoublyRobustElasticityEstimatorModel:
             - Elasticity estimates for variables of interest
             - Standard errors (to be implemented later)
             - First-stage OLS coefficients
-            - Diagnostics from cross-fitting
+            - Diagnostics from cross-fitting including NPModelResults and 
+              DensityModelResults objects for each fold
             
         Notes
         -----
@@ -259,6 +261,10 @@ class DoublyRobustElasticityEstimatorModel:
         
         # Storage for diagnostics
         ols_coefficients = []
+        m_results_folds = []  # NPModelResults objects for each fold
+        f_results_folds = []  # DensityModelResults objects for each fold
+        alpha_x_folds = []  # α(x) arrays for each fold
+        theta_x_folds = []  # θ(x) arrays for each fold
         
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(self.exog)):
             # Split data
@@ -289,25 +295,30 @@ class DoublyRobustElasticityEstimatorModel:
             # Step 2: Estimate nuisance functions on training data
             # Using original (non-demeaned) data for nuisance functions
             
-            # Estimate m(x) = E[exp(u)|x] using NonparametricModel
+            # Estimate m(x) = E[exp(u)|x] using NPModel
             log_residuals_train = np.log(endog_orig_train) - exog_train @ beta
             exp_residuals_train = np.exp(log_residuals_train)
             
-            m_model = NonparametricModel()  # Assumes this is imported
-            m_model.fit(exog_orig_train, exp_residuals_train, weights=weights_train, **fit_params)
+            # Create NPModel with variable types
+            m_model = NPModel(variable_types=self.variable_types, params=fit_params)
+            m_results = m_model.fit(exog_orig_train, exp_residuals_train)
+            m_results_folds.append(m_results)
             
             # Predict m(x) on test data
-            m_test = m_model.predict(exog_orig_test)
+            m_test = m_results.predict(exog_orig_test)
             
             # Estimate density f(x) using DensityModel
-            density_model = DensityModel()  # Assumes this is imported
-            density_model.fit(exog_orig_train, weights=weights_train, **fit_params)
+            density_model = DensityModel()
+            f_results = density_model.fit(exog_orig_train, weights=weights_train, **fit_params)
+            f_results_folds.append(f_results)
             
             # Predict density on test data
-            f_test = density_model.predict(exog_orig_test)
+            f_test = f_results.predict(exog_orig_test)
             
             # Step 3: Construct moment conditions for each variable of interest
             moment_idx = 0
+            fold_alpha_x = []  # α(x) for this fold
+            fold_theta_x = []  # θ(x) for this fold
             
             for var_idx in interest_indices:
                 var_type = self.variable_types.get(var_idx, 'continuous')
@@ -318,21 +329,25 @@ class DoublyRobustElasticityEstimatorModel:
                     # α(x) = -f_k(x)/(f(x)*m(x))
                     
                     # Get semi-elasticity from density model
-                    f_semi_elast_test = density_model.predict_semi_elasticity(exog_orig_test, var_idx)
+                    f_semi_elast_test = f_results.predict_semi_elasticity(exog_orig_test, var_idx)
                     
                     # Influence function
                     alpha_test = -f_semi_elast_test / (f_test * m_test + 1e-10)
+                    fold_alpha_x.append(alpha_test)
                     
                     # Orthogonalized moment (without elasticity parameter - that's what we solve for)
                     # g = β_k + m_k(x)/m(x) and φ = α(x)*p where p = exp(u) - m(x)
                     p_test = exp_residuals_test - m_test
                     
-                    # For now, we need m_k(x)/m(x) which NonparametricModel should provide
-                    # Assume it has a method for this
-                    m_semi_elast_test = m_model.predict_semi_elasticity(exog_orig_test, var_idx)
+                    # Get m_k(x)/m(x) from NPModelResults
+                    m_semi_elast_test = m_results.predict_semi_elasticity(exog_orig_test, var_idx)
+                    
+                    # θ(x) = β_k + m_k/m
+                    theta_test = beta[var_idx] + m_semi_elast_test
+                    fold_theta_x.append(theta_test)
                     
                     # Store moment: g + φ = β_k + m_k/m + α*p
-                    moments[test_idx, moment_idx] = beta[var_idx] + m_semi_elast_test + alpha_test * p_test
+                    moments[test_idx, moment_idx] = theta_test + alpha_test * p_test
                     
                 elif var_type == 'binary':
                     # Binary variable: percentage change with Δ=1
@@ -348,17 +363,22 @@ class DoublyRobustElasticityEstimatorModel:
                     x_shifted[:, var_idx] = 1 - x_shifted[:, var_idx]  # Flip binary variable
                     
                     # Predict m(x+Δ)
-                    m_shifted_test = m_model.predict(x_shifted)
+                    m_shifted_test = m_results.predict(x_shifted)
                     
                     # Influence function (first term zero for binary)
                     alpha_test = np.exp(beta_delta) * (-m_shifted_test / (m_test**2 + 1e-10))
+                    fold_alpha_x.append(alpha_test)
                     
                     # Orthogonalized moment
                     p_test = exp_residuals_test - m_test
                     
-                    # Store moment: g + φ
+                    # θ(x) = exp(β*Δ) * m(x+Δ)/m(x) - 1
                     ratio = m_shifted_test / (m_test + 1e-10)
-                    moments[test_idx, moment_idx] = np.exp(beta_delta) * ratio - 1 + alpha_test * p_test
+                    theta_test = np.exp(beta_delta) * ratio - 1
+                    fold_theta_x.append(theta_test)
+                    
+                    # Store moment: g + φ
+                    moments[test_idx, moment_idx] = theta_test + alpha_test * p_test
                     
                 elif var_type == 'ordinal':
                     # Ordinal variable: percentage change with Δ=1  
@@ -376,23 +396,32 @@ class DoublyRobustElasticityEstimatorModel:
                     x_minus[:, var_idx] -= delta
                     
                     # Predict m and f at shifted points
-                    m_plus_test = m_model.predict(x_plus)
-                    m_minus_test = m_model.predict(x_minus)
-                    f_minus_test = density_model.predict(x_minus)
+                    m_plus_test = m_results.predict(x_plus)
+                    m_minus_test = m_results.predict(x_minus)
+                    f_minus_test = f_results.predict(x_minus)
                     
                     # Influence function
                     term1 = f_minus_test / (m_minus_test * f_test + 1e-10)
                     term2 = m_plus_test / (m_test**2 + 1e-10)
                     alpha_test = np.exp(beta_delta) * (term1 - term2)
+                    fold_alpha_x.append(alpha_test)
                     
                     # Orthogonalized moment
                     p_test = exp_residuals_test - m_test
                     
-                    # Store moment
+                    # θ(x) = exp(β*Δ) * m(x+Δ)/m(x) - 1
                     ratio = m_plus_test / (m_test + 1e-10)
-                    moments[test_idx, moment_idx] = np.exp(beta_delta) * ratio - 1 + alpha_test * p_test
+                    theta_test = np.exp(beta_delta) * ratio - 1
+                    fold_theta_x.append(theta_test)
+                    
+                    # Store moment
+                    moments[test_idx, moment_idx] = theta_test + alpha_test * p_test
                 
                 moment_idx += 1
+            
+            # Store fold diagnostics
+            alpha_x_folds.append(np.column_stack(fold_alpha_x) if fold_alpha_x else np.array([]))
+            theta_x_folds.append(np.column_stack(fold_theta_x) if fold_theta_x else np.array([]))
             
             # Add OLS moment conditions (these don't need orthogonalization)
             for j in range(self.exog.shape[1]):
@@ -438,7 +467,11 @@ class DoublyRobustElasticityEstimatorModel:
             variable_types=self.variable_types,
             fold_diagnostics={
                 'ols_coefficients': ols_coefficients,
-                'moment_means': moment_means
+                'moment_means': moment_means,
+                'm_results': m_results_folds,  # NPModelResults objects
+                'f_results': f_results_folds,  # DensityModelResults objects
+                'alpha_x': alpha_x_folds,  # α(x) arrays
+                'theta_x': theta_x_folds   # θ(x) arrays
             }
         )
         
