@@ -55,7 +55,9 @@ class FeedForwardNNModel(nn.Module):
         p = float(config.get("dropout", 0.0))
 
         hidden_act = act_map[config["activation"]]
+
         for h in config["hidden_layers"]:
+            layers.append(nn.BatchNorm1d(in_dim))
             layers.append(nn.Linear(in_dim, h, bias=bias))
             layers.append(hidden_act())
             if p > 0:
@@ -122,4 +124,3 @@ class SlicedScoreMatchingLoss(nn.Module):
             jvp = (grad_hv * v).sum(dim=feat_dims)  # per-sample
             loss = loss + 0.5 * (hv ** 2) + jvp
         return loss.mean() / self.M
-
