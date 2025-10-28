@@ -14,18 +14,16 @@ class NPModel:
 
 class NPModelResults:
 
-    def __init__(self, model: NPModel, x: npt.ArrayLike, y: npt.ArrayLike, **metrics):
+    def __init__(self, model: NPModel, **metrics):
         self.model = model.model
-        self.parent_model = model  # Store parent NPModel to access variable_types
-        self.x = x
-        self.y = y
+        self.variable_types = model.variable_types
         self.metrics = metrics
 
 
 class NPModelResultsNuisance(NPModelResults):
 
-    def __init__(self, model: NPModel, x: npt.ArrayLike, y: npt.ArrayLike, **metrics):
-        super().__init__(model, x, y, **metrics)
+    def __init__(self, model: NPModel, **metrics):
+        super().__init__(model, **metrics)
         pass
 
     def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
@@ -89,8 +87,8 @@ class NPModelResultsNuisance(NPModelResults):
 
 class NPModelResultsDensity(NPModelResults):
 
-    def __init__(self, model: NPModel, x: npt.ArrayLike, y: npt.ArrayLike, **metrics):
-        super().__init__(model, x, y, **metrics)
+    def __init__(self, model: NPModel, **metrics):
+        super().__init__(model, **metrics)
         pass
 
     def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
@@ -461,7 +459,7 @@ class NNModelDensity(NNModel):
 
         base = {**shared_defaults, **shared}
         cfg_score = {**base, **score}
-        cfg_cond = {**base, **cond, 'output_activation': 'softmax'}  # cond always softmax output
+        cfg_cond = {**base, **cond, 'output_activation': 'identity'}  # cond always identity
 
         def _validate(cfg, name):
             hl = cfg.get("hidden_layers")
@@ -526,7 +524,19 @@ class NNModelDensity(NNModel):
         cond_dims, cond_meta = dims_dict["cond"]
 
         model_score = self._fit_score_model(X=X, dims=score_dims, meta=score_meta, arch_cfg = score_arch_cfg,fit_cfg=score_fit_cfg)
-        model_cond = self._fit_conditional_model(X, cond_dims, cond_meta, cond_arch_cfg, cond_fit_cfg)
+        model_cond = self._fit_conditional_model(X=X, dims=cond_dims, meta=cond_meta, arch_cfg=cond_arch_cfg, fit_cfg=cond_fit_cfg)
+
+        self.model = {
+            "score": (model_score, score_meta),
+            "cond": (model_cond, cond_meta)
+        }
+
+        return NNModelDensityResults(
+            self,
+            X,
+            y,
+            **{}
+        )
 
 
     def _fit_score_model(self, X, dims,meta, arch_cfg, fit_cfg):
@@ -679,10 +689,160 @@ class NNModelDensity(NNModel):
 
         return model
 
-
-
     def _fit_conditional_model(self, X, dims, meta, arch_cfg, fit_cfg):
-        pass
+        """
+        Train a joint conditional classifier over interested *binary* variables.
+
+        Input  = X without interested discrete dims
+        Target = class id for joint state of interested binary dims
+        Output = logits over all joint states (len(meta['combos']))
+        """
+
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset, Subset
+        from loglinearcorrection.neural_network_models import FeedForwardNNModel, NullNN
+
+        # no discrete vars to model
+        if dims["output_size"] == 0 or len(meta.get("interest_disc_indices", [])) == 0:
+            return NullNN()
+
+        interest = meta["interest_disc_indices"]
+        combos = meta["combos"]  # (K, k_disc)
+        enc = meta["combo_encoder"]  # tuple -> class id
+        K = combos.shape[0]
+
+        # build inputs X_other and labels y
+        X = np.asarray(X, dtype=np.float32)
+        d = X.shape[1]
+        mask_other = np.ones(d, dtype=bool)
+        mask_other[interest] = False
+
+        X_in = X[:, mask_other]
+        Z = X[:, interest].astype(int)
+        # Combines for eg (1,1,1) -> class 7
+        y = np.array([enc[tuple(z.tolist())] if tuple(z.tolist()) in enc else -1 for z in Z], dtype=np.int64)
+
+
+        # filter out unknown labels (shouldn't happen if combos built from data)
+        keep = (y >= 0)
+        X_in = X_in[keep]
+        y = y[keep]
+        n = X_in.shape[0]
+
+        if n == 0:
+            return NullNN()
+
+        device = getattr(self, "device", torch.device("cpu"))
+
+        # model
+        cfg = {**arch_cfg, **{"input_size": dims["input_size"], "output_size": dims["output_size"],
+                              "output_activation": "identity"}}
+        model = FeedForwardNNModel(cfg).to(device)
+
+        # loss with optional class weights for imbalance
+        class_weights = fit_cfg.get("class_weights", None)
+        if class_weights is None:
+            # inverse frequency
+            counts = np.bincount(y, minlength=K).astype(np.float32)
+            cw = counts.max() / np.maximum(counts, 1.0)
+            class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
+        else:
+            class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+        # split
+        val_frac = float(fit_cfg.get("val_frac", 0.2))
+        n_val = int(n * val_frac)
+        perm = np.random.permutation(n)
+        val_idx = perm[:n_val]
+        tr_idx = perm[n_val:] if n_val > 0 else np.arange(n)
+
+        # dataloaders
+        pin = (device.type == "cuda")
+        bs = int(fit_cfg.get("batch_size", 128))
+        nw = int(fit_cfg.get("num_workers", 0))
+        ds = TensorDataset(torch.as_tensor(X_in, dtype=torch.float32), torch.as_tensor(y, dtype=torch.long))
+
+        dl_tr = DataLoader(Subset(ds, torch.as_tensor(tr_idx)), batch_size=bs,
+                           shuffle=bool(fit_cfg.get("shuffle", True)),
+                           num_workers=nw, pin_memory=pin, drop_last=False)
+        dl_va = (DataLoader(Subset(ds, torch.as_tensor(val_idx)), batch_size=bs, shuffle=False,
+                            num_workers=nw, pin_memory=pin, drop_last=False) if n_val > 0 else None)
+
+        # optimizer
+        opt = torch.optim.AdamW(model.parameters(),
+                                lr=float(fit_cfg.get("learning_rate", 1e-3)),
+                                weight_decay=float(fit_cfg.get("weight_decay", 0.0)))
+        grad_clip = fit_cfg.get("grad_clip_norm", None)
+        patience = int(fit_cfg.get("patience", 10))
+        min_delta = float(fit_cfg.get("min_delta", 0.0))
+        epochs = int(fit_cfg.get("epochs", 100))
+        verbose = bool(fit_cfg.get("verbose", True))
+
+        best_loss = float("inf")
+        best_state = None
+        bad = 0
+        log_every = max(1, epochs // 10)
+
+        for ep in range(1, epochs + 1):
+            # train
+            model.train()
+            tr_sum = tr_cnt = 0
+            for xb, yb in dl_tr:
+                xb = xb.to(device, non_blocking=pin)
+                yb = yb.to(device, non_blocking=pin)
+                opt.zero_grad(set_to_none=True)
+                logits = model(xb)  # (B, K)
+                loss = criterion(logits, yb)
+                loss.backward()
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                opt.step()
+                bs_ = xb.size(0)
+                tr_sum += float(loss.detach()) * bs_
+                tr_cnt += bs_
+            tr_loss = tr_sum / max(tr_cnt, 1)
+
+            # validate
+            if dl_va is not None:
+                model.eval()
+                va_sum = va_cnt = 0
+                with torch.no_grad():
+                    for xb, yb in dl_va:
+                        xb = xb.to(device, non_blocking=pin)
+                        yb = yb.to(device, non_blocking=pin)
+                        logits = model(xb)
+                        l = criterion(logits, yb)
+                        bs_ = xb.size(0)
+                        va_sum += float(l) * bs_
+                        va_cnt += bs_
+                va_loss = va_sum / max(va_cnt, 1)
+
+                improved = va_loss + min_delta < best_loss
+                if improved:
+                    best_loss = va_loss
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+
+                if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
+                    print(f"[Cond ep {ep:>3}/{epochs}] train={tr_loss:.6f} val={va_loss:.6f}{' *' if improved else ''}")
+
+                if bad >= patience:
+                    if verbose:
+                        print(f"Early stopping cond head at epoch {ep} (best val={best_loss:.6f}).")
+                    break
+            else:
+                if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
+                    print(f"[Cond ep {ep:>3}/{epochs}] train={tr_loss:.6f}")
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        return model
+
 
     def _infer_dims(self, X: np.ndarray, interest: list[int]):
         """
@@ -785,12 +945,58 @@ class NNModelDensity(NNModel):
 
 
 class NNModelDensityResults(NPModelResultsDensity):
-    def __init__(self, model: NNModelDensity, x: npt.ArrayLike, y: npt.ArrayLike):
-        super().__init__(model, x, y)
+    def __init__(self, model: NNModelDensity, **metrics):
+        super().__init__(model, **metrics)
         pass
 
 
 class NNModelNuisanceResults(NPModelResultsNuisance):
-    def __init__(self, model: NNModelNuisance, x: npt.ArrayLike, y: npt.ArrayLike, **metrics):
-        super().__init__(model, x, y, **metrics)
-        pass
+    def __init__(self, model: NNModelNuisance, **metrics):
+        super().__init__(model, **metrics)
+        self.device = model.device
+
+    def predict(self, X: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        import torch
+        self.model.eval()
+        device = self.device
+        x_tensor = torch.as_tensor(X, dtype=torch.float32).to(device)
+        with torch.no_grad():
+            preds = self.model(x_tensor)
+        return preds.detach().cpu().numpy()
+
+    def derivative(self, X: npt.ArrayLike, interest_continuous) -> tuple[
+        npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """
+        Returns (pred, grad) where:
+          pred[i] = m(x_i)
+          grad[i, k] = ∂m(x_i)/∂x_k  for k in interest_continuous
+        """
+        import torch, numpy as np
+        self.model.eval()
+
+        xt = torch.tensor(X, dtype=torch.float32, device=self.device, requires_grad=True)
+        yhat = self.model(xt)
+
+        if yhat.ndim == 1 or (yhat.ndim == 2 and yhat.shape[1] == 1):
+            ysc = yhat.squeeze(-1)
+            grads_all = torch.autograd.grad(
+                ysc, xt,
+                grad_outputs=torch.ones_like(ysc),
+                create_graph=False, retain_graph=False
+            )[0]
+            G = grads_all[:, interest_continuous]  # (n, K)
+            preds = ysc.detach().cpu().numpy()  # (n,)
+            grads = G.detach().cpu().numpy()  # (n, K)
+            return preds, grads
+        else:
+            outs = yhat.shape[1]
+            cols = []
+            for o in range(outs):
+                g_all = torch.autograd.grad(
+                    yhat[:, o].sum(), xt, create_graph=False, retain_graph=True
+                )[0]
+                cols.append(g_all[:, interest_continuous].unsqueeze(1))  # (n,1,K)
+            G = torch.cat(cols, dim=1)  # (n, q, K)
+            preds = yhat.detach().cpu().numpy()  # (n, q)
+            grads = G.detach().cpu().numpy()  # (n, q, K)
+            return preds, grads
