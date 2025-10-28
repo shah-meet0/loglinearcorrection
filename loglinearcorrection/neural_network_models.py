@@ -57,7 +57,6 @@ class FeedForwardNNModel(nn.Module):
         hidden_act = act_map[config["activation"]]
 
         for h in config["hidden_layers"]:
-            layers.append(nn.BatchNorm1d(in_dim))
             layers.append(nn.Linear(in_dim, h, bias=bias))
             layers.append(hidden_act())
             if p > 0:
@@ -124,3 +123,62 @@ class SlicedScoreMatchingLoss(nn.Module):
             jvp = (grad_hv * v).sum(dim=feat_dims)  # per-sample
             loss = loss + 0.5 * (hv ** 2) + jvp
         return loss.mean() / self.M
+
+
+class NullNN(nn.Module):
+    def __init__(self, input_size=0, output_size=0):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        self.present = False
+
+    def forward(self, x):
+        if self.output_size == 0:
+            # return zero scalar or zero tensor matching expected shape
+            return torch.zeros((x.size(0), 1), device=x.device)
+        return torch.zeros((x.size(0), self.output_size), device=x.device)
+
+
+class ScoreMatchingLossRestricted(nn.Module):
+    """
+    Score matching on a subset of continuous coordinates.
+
+    Input:  x ∈ R^{n×d}  (all features)
+    Model:  h(x) ∈ R^{n×|I|}  (scores for interest coords only, in the same order)
+    Loss:   E[ 0.5 * ||h(x)||^2 + sum_{i∈I} ∂ h_i(x) / ∂ x_i ]
+    """
+    def __init__(self, interest: list[int]):
+        super().__init__()
+        self.register_buffer("interest_idx", torch.tensor(interest, dtype=torch.long))
+
+    @torch.enable_grad()
+    def forward(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        if self.interest_idx.numel() == 0:
+            return torch.zeros((), device=x.device, dtype=x.dtype)
+
+        x = x.detach().requires_grad_(True)
+        h = model(x)                              # (n, |I|)
+        if h.dim() != 2 or h.size(1) != self.interest_idx.numel():
+            raise ValueError("model(x) must have shape (n, |interest|) in the same order as interest.")
+
+        # 0.5 * ||h||^2 per-sample
+        sq = 0.5 * (h * h).sum(dim=1)            # (n,)
+
+        # divergence restricted to interest: sum_i ∂h_i/∂x_i
+        # compute per-output gradient wrt corresponding input coord
+        div_terms = []
+
+        # Compute the parital derivatives for each interest variable
+        for out_j, var_k in enumerate(self.interest_idx.tolist()):
+            g = torch.autograd.grad(
+                h[:, out_j].sum(),               # scalar
+                x,
+                create_graph=True,
+                retain_graph=True,
+                allow_unused=False
+            )[0][:, var_k]                        # (n,)
+            div_terms.append(g)
+        div = torch.stack(div_terms, dim=1).sum(dim=1)  # (n,)
+
+        loss = (sq + div).mean()
+        return loss

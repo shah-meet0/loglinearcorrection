@@ -421,16 +421,374 @@ class NNModelDensity(NNModel):
     def __init__(self, variable_types: dict, **params):
         super().__init__(variable_types, build_now=False, **params)
 
+    def _parse_params(self) -> dict:
+        """
+        Parse architecture hyperparameters for both network heads:
+          - shared  : defaults applied to all heads
+          - score   : overrides for the score network
+          - cond    : overrides for the conditional density network
 
-    def fit(self, x: npt.ArrayLike, y: npt.ArrayLike, **fit_params) -> "NNModelDensityResults":
-        return super().fit(x, y, **fit_params)
+        Expected self.params structure:
+        {
+          "shared": {...},    # defaults for both heads
+          "score":  {...},    # optional overrides
+          "cond":   {...}     # optional overrides
+        }
+
+        Does NOT require or inject input/output sizes.
+        These are added later when data dimensions are known.
+
+        Returns
+        -------
+        dict
+            {"score": cfg_score, "cond": cfg_cond}
+        """
+        if not hasattr(self, "params") or not isinstance(self.params, dict):
+            raise ValueError("self.params must be a dict")
+
+        shared_defaults = {
+            "hidden_layers": [32, 32, 32],
+            "activation": "relu",
+            "output_activation": "identity",
+            "dropout": 0.0,
+            "bias": True,
+            "weight_init": "default",
+        }
+
+        shared = self.params.get("shared", {})
+        score = self.params.get("score", {})
+        cond = self.params.get("cond", {})
+
+        base = {**shared_defaults, **shared}
+        cfg_score = {**base, **score}
+        cfg_cond = {**base, **cond, 'output_activation': 'softmax'}  # cond always softmax output
+
+        def _validate(cfg, name):
+            hl = cfg.get("hidden_layers")
+            if not (isinstance(hl, list) and all(isinstance(n, int) and n > 0 for n in hl)):
+                raise ValueError(f"{name}.hidden_layers must be list of positive ints")
+            if cfg["activation"] not in {"relu", "tanh", "sigmoid", "leaky_relu"}:
+                raise ValueError(f"{name}.activation invalid")
+            if cfg["output_activation"] not in {"identity","relu","tanh","sigmoid","softmax","log_softmax"}:
+                raise ValueError(f"{name}.output_activation invalid")
+            d = cfg["dropout"]
+            if not (isinstance(d, (int,float)) and 0.0 <= d < 1.0):
+                raise ValueError(f"{name}.dropout in [0,1)")
+            if cfg["weight_init"] not in {"default","xavier_uniform","xavier_normal","kaiming_uniform","kaiming_normal"}:
+                raise ValueError(f"{name}.weight_init invalid")
+            if not isinstance(cfg["bias"], bool):
+                raise ValueError(f"{name}.bias must be bool")
+
+        _validate(cfg_score, "score")
+        _validate(cfg_cond, "cond")
+
+        return {"score": cfg_score, "cond": cfg_cond}
+
+    def fit(
+            self, X, y=None, *,
+            interest: list[int] | None = None,
+            # shared defaults
+            epochs: int = 100,
+            batch_size: int = 128,
+            learning_rate: float = 1e-3,
+            weight_decay: float = 0.0,
+            val_frac: float = 0.2,
+            patience: int = 10,
+            min_delta: float = 0.0,
+            grad_clip_norm: float | None = None,
+            num_workers: int = 0,
+            shuffle: bool = True,
+            verbose: bool = True,
+            **kwargs
+    ):
+
+        import torch
+        from loglinearcorrection.neural_network_models import FeedForwardNNModel
+
+        shared = {
+            "epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate,
+            "weight_decay": weight_decay, "val_frac": val_frac, "patience": patience,
+            "min_delta": min_delta, "grad_clip_norm": grad_clip_norm,
+            "num_workers": num_workers, "shuffle": shuffle, "verbose": verbose,
+        }
+
+        score_kw, cond_kw = self._split_head_kwargs(kwargs)
+        score_fit_cfg = {**shared, **score_kw}
+        cond_fit_cfg = {**shared, **cond_kw}
+
+        arch_config = self._parse_params()
+        score_arch_cfg = arch_config["score"]
+        cond_arch_cfg = arch_config["cond"]
+
+        dims_dict = self._infer_dims(X, interest)
+
+        score_dims, score_meta = dims_dict["score"]
+        cond_dims, cond_meta = dims_dict["cond"]
+
+        model_score = self._fit_score_model(X=X, dims=score_dims, meta=score_meta, arch_cfg = score_arch_cfg,fit_cfg=score_fit_cfg)
+        model_cond = self._fit_conditional_model(X, cond_dims, cond_meta, cond_arch_cfg, cond_fit_cfg)
+
+
+    def _fit_score_model(self, X, dims,meta, arch_cfg, fit_cfg):
+        """
+        Train a score network on all inputs X to predict scores for interested
+        continuous coordinates only.
+
+        Parameters
+        ----------
+        X : array-like, shape (n, d)
+        dims : dict with keys:
+            - "input_size": int
+            - "output_size": int
+        meta : dict with keys:
+            - "interest_cont_indices": list[int]  # order matches model outputs
+        arch_cfg : dict  # hyperparameters for FeedForwardNNModel
+        fit_cfg : dict   # training hyperparameters:
+            epochs, batch_size, learning_rate, weight_decay, val_frac,
+            patience, min_delta, grad_clip_norm, num_workers, shuffle, verbose
+
+        Returns
+        -------
+        nn.Module
+            Trained score model (or NullNN if no outputs requested).
+        """
+
+        import torch
+        from torch.utils.data import DataLoader, TensorDataset, Subset
+        from loglinearcorrection.neural_network_models import FeedForwardNNModel, NullNN, ScoreMatchingLossRestricted
+
+        if dims["output_size"] == 0:
+            return NullNN()
+
+        interest_idx = meta.get("interest_cont_indices", [])
+        if len(interest_idx) != dims["output_size"]:
+            raise ValueError("meta['interest_cont_indices'] size must match dims['output_size'].")
+
+        device = getattr(self, "device", torch.device("cpu"))
+        X = torch.as_tensor(X, dtype=torch.float32)
+        n = X.size(0)
+
+        # model
+        cfg = {**arch_cfg, **dims}
+        model = FeedForwardNNModel(cfg).to(device)
+
+        # loss
+        loss_fn = ScoreMatchingLossRestricted(interest=interest_idx).to(device)
+
+        # data split
+        val_frac = float(fit_cfg.get("val_frac", 0.2))
+        n_val = int(n * val_frac)
+        perm = torch.randperm(n)
+        val_idx = perm[:n_val]
+        tr_idx = perm[n_val:] if n_val > 0 else torch.arange(n)
+
+        ds = TensorDataset(X)
+        pin = (device.type == "cuda")
+        bs = int(fit_cfg.get("batch_size", 128))
+        nw = int(fit_cfg.get("num_workers", 0))
+
+        dl_tr = DataLoader(
+            Subset(ds, tr_idx),
+            batch_size=bs,
+            shuffle=bool(fit_cfg.get("shuffle", True)),
+            num_workers=nw,
+            pin_memory=pin,
+            drop_last=False,
+        )
+        dl_va = (
+            DataLoader(
+                Subset(ds, val_idx),
+                batch_size=bs,
+                shuffle=False,
+                num_workers=nw,
+                pin_memory=pin,
+                drop_last=False,
+            )
+            if n_val > 0 else None
+        )
+
+        # optimizer
+        opt = torch.optim.AdamW(
+            model.parameters(),
+            lr=float(fit_cfg.get("learning_rate", 1e-3)),
+            weight_decay=float(fit_cfg.get("weight_decay", 0.0)),
+        )
+        grad_clip = fit_cfg.get("grad_clip_norm", None)
+        patience = int(fit_cfg.get("patience", 10))
+        min_delta = float(fit_cfg.get("min_delta", 0.0))
+        epochs = int(fit_cfg.get("epochs", 100))
+        verbose = bool(fit_cfg.get("verbose", True))
+
+        best_loss = float("inf")
+        best_state = None
+        bad = 0
+        log_every = max(1, epochs // 10)
+
+        for ep in range(1, epochs + 1):
+            # ---- train
+            model.train()
+            tr_sum = tr_cnt = 0
+            for (xb,) in dl_tr:
+                xb = xb.to(device, non_blocking=pin)
+                opt.zero_grad(set_to_none=True)
+                loss = loss_fn(model, xb)
+                loss.backward()
+                if grad_clip:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                opt.step()
+                bs_ = xb.size(0)
+                tr_sum += float(loss.detach()) * bs_
+                tr_cnt += bs_
+            tr_loss = tr_sum / max(tr_cnt, 1)
+
+            # ---- validate
+            if dl_va is not None:
+                model.eval()
+                va_sum = va_cnt = 0
+                with torch.enable_grad():  # need grads for score-matching val
+                    for (xb,) in dl_va:
+                        xb = xb.to(device, non_blocking=pin).detach().requires_grad_(True)
+                        l = loss_fn(model, xb).detach()
+                        bs_ = xb.size(0)
+                        va_sum += float(l) * bs_
+                        va_cnt += bs_
+                va_loss = va_sum / max(va_cnt, 1)
+
+                improved = va_loss + min_delta < best_loss
+                if improved:
+                    best_loss = va_loss
+                    best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                    bad = 0
+                else:
+                    bad += 1
+
+                if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
+                    print(
+                        f"[Score ep {ep:>3}/{epochs}] train={tr_loss:.6f} val={va_loss:.6f}{' *' if improved else ''}")
+
+                if bad >= patience:
+                    if verbose:
+                        print(f"Early stopping score head at epoch {ep} (best val={best_loss:.6f}).")
+                    break
+            else:
+                if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
+                    print(f"[Score ep {ep:>3}/{epochs}] train={tr_loss:.6f}")
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        return model
 
 
 
-class NNModelScoreResults(NPModelResultsDensity):
-    def __init__(self, model: NNModelScore, x: npt.ArrayLike, y: npt.ArrayLike):
+    def _fit_conditional_model(self, X, dims, meta, arch_cfg, fit_cfg):
+        pass
+
+    def _infer_dims(self, X: np.ndarray, interest: list[int]):
+        """
+        Determine input/output sizes for:
+          - score network: input = all X, output = interested continuous coords
+          - conditional network: input = X without interested coords,
+            output = number of unique joint states over interested discrete coords
+
+        Parameters
+        ----------
+        X : np.ndarray, shape (n, d)
+        interest : list[int]
+
+        Returns
+        -------
+        dict
+            {
+              "score": {
+                "input_size": int,
+                "output_size": int,
+                "interest_cont_indices": list[int]
+              },
+              "cond": {
+                "input_size": int,
+                "output_size": int,
+                "interest_disc_indices": list[int],
+                "combos": np.ndarray,            # shape (n_unique, k_disc)
+                "combo_encoder": dict[tuple,int] # mapping state -> class id
+              }
+            }
+        """
+        X = np.asarray(X)
+        n, d = X.shape
+        interest = list(interest)
+
+        # classify variables
+        def is_cont(j):
+            t = self.variable_types.get(j, "continuous")
+            return t == "continuous"
+
+        def is_disc(j):
+            t = self.variable_types.get(j, "continuous")
+            return t in ("binary", "ordinal")
+
+        # score head
+        cont_interest = [j for j in interest if is_cont(j)]
+        score_cfg = {
+            "input_size": d,
+            "output_size": len(cont_interest)
+        }
+
+        score_meta = {"interest_cont_indices": cont_interest}
+
+        # conditional head
+        disc_interest = [j for j in interest if is_disc(j)]
+        if len(disc_interest) > 0:
+            Z = X[:, disc_interest]
+            # ensure integer encoding for uniqueness; safe cast if already ints
+            if not np.issubdtype(Z.dtype, np.integer):
+                Z = Z.astype(int)
+            # unique joint states
+            combos, inv = np.unique(Z, axis=0, return_inverse=True)
+            # build encoder
+            encoder = {tuple(state.tolist()): k for k, state in enumerate(combos)}
+            cond_out = combos.shape[0]
+        else:
+            combos = np.empty((0, 0), dtype=int)
+            encoder = {}
+            cond_out = 0
+
+        cond_cfg = {
+            "input_size": d - len(disc_interest),
+            "output_size": cond_out
+        }
+
+        cond_meta = {
+            "interest_disc_indices": disc_interest,
+            "combos": combos,
+            "combo_encoder": encoder
+        }
+
+        return {"score": (score_cfg, score_meta), "cond": (cond_cfg, cond_meta)}
+
+
+
+
+
+    def _split_head_kwargs(self, kw: dict) -> tuple[dict, dict]:
+        score_kw, cond_kw = {}, {}
+        for k, v in kw.items():
+            if k.startswith("score__"):
+                score_kw[k[len("score__"):]] = v
+            elif k.startswith("cond__"):
+                cond_kw[k[len("cond__"):]] = v
+            else:
+                raise ValueError(f"Unknown kwarg '{k}'. Use 'score__' or 'cond__' prefix.")
+        return score_kw, cond_kw
+
+
+
+
+class NNModelDensityResults(NPModelResultsDensity):
+    def __init__(self, model: NNModelDensity, x: npt.ArrayLike, y: npt.ArrayLike):
         super().__init__(model, x, y)
         pass
+
 
 class NNModelNuisanceResults(NPModelResultsNuisance):
     def __init__(self, model: NNModelNuisance, x: npt.ArrayLike, y: npt.ArrayLike, **metrics):
