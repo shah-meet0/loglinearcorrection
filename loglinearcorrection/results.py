@@ -5,10 +5,6 @@ from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 
-if TYPE_CHECKING:
-    from .variance import VarianceModelResults
-
-
 class DoublyRobustElasticityEstimatorModelResults:
     """
     Results container for the Doubly Robust Elasticity Estimator.

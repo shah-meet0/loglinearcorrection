@@ -29,60 +29,58 @@ class NPModelResultsNuisance(NPModelResults):
     def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
         pass
 
-    def derivative(self, x: npt.NDArray[np.float64], var_index: int) -> npt.NDArray[np.float64]:
+    def derivative(self, x: npt.NDArray[np.float64], var_index: list[int]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         pass
 
-    def second_derivative(self, x: npt.NDArray[np.float64], var_index: int) -> npt.NDArray[np.float64]:
-        pass
     
-    def predict_semi_elasticity(self, x: npt.ArrayLike, var_index: int) -> npt.NDArray[np.float64]:
-        """
-        Compute semi-elasticity m_k(x)/m(x) where m_k is the derivative w.r.t. variable k.
-        
-        Only valid for continuous variables. For binary or ordinal variables, use 
-        predict with shifted x values to compute percentage changes.
-        
-        Parameters
-        ----------
-        x : array_like
-            Points at which to evaluate semi-elasticity, shape (n_samples, n_features)
-        var_index : int
-            Index of variable for which to compute the semi-elasticity
-            
-        Returns
-        -------
-        ndarray
-            Semi-elasticity values m_k(x)/m(x), shape (n_samples,)
-            
-        Raises
-        ------
-        ValueError
-            If var_index corresponds to a binary or ordinal variable
-        ZeroDivisionError
-            If m(x) equals zero for any observation
-            
-        Notes
-        -----
-        The semi-elasticity represents the proportional change in m(x) with respect 
-        to a unit change in variable k. It is computed as the ratio of the partial 
-        derivative to the function value. This is only meaningful for continuous 
-        variables where derivatives exist.
-        
-        For discrete variables (binary/ordinal), percentage changes should be computed
-        as [m(x + Δ) - m(x)] / m(x) using the predict method with shifted inputs.
-        """
-        # Check if this is being called on a non-continuous variable
-        if hasattr(self, 'parent_model') and hasattr(self.parent_model, 'variable_types'):
-            var_type = self.parent_model.variable_types.get(var_index, 'continuous')
-            if var_type in ['binary', 'ordinal']:
-                raise ValueError(
-                    f"predict_semi_elasticity called on {var_type} variable at index {var_index}. "
-                    f"For {var_type} variables, compute percentage changes using predict() with shifted x values."
-                )
-        
-        m_x = self.predict(x)
-        m_k_x = self.derivative(x, var_index)
-        return m_k_x / m_x
+    # def predict_semi_elasticity(self, x: npt.ArrayLike, var_index: int) -> npt.NDArray[np.float64]:
+    #     """
+    #     Compute semi-elasticity m_k(x)/m(x) where m_k is the derivative w.r.t. variable k.
+    #
+    #     Only valid for continuous variables. For binary or ordinal variables, use
+    #     predict with shifted x values to compute percentage changes.
+    #
+    #     Parameters
+    #     ----------
+    #     x : array_like
+    #         Points at which to evaluate semi-elasticity, shape (n_samples, n_features)
+    #     var_index : int
+    #         Index of variable for which to compute the semi-elasticity
+    #
+    #     Returns
+    #     -------
+    #     ndarray
+    #         Semi-elasticity values m_k(x)/m(x), shape (n_samples,)
+    #
+    #     Raises
+    #     ------
+    #     ValueError
+    #         If var_index corresponds to a binary or ordinal variable
+    #     ZeroDivisionError
+    #         If m(x) equals zero for any observation
+    #
+    #     Notes
+    #     -----
+    #     The semi-elasticity represents the proportional change in m(x) with respect
+    #     to a unit change in variable k. It is computed as the ratio of the partial
+    #     derivative to the function value. This is only meaningful for continuous
+    #     variables where derivatives exist.
+    #
+    #     For discrete variables (binary/ordinal), percentage changes should be computed
+    #     as [m(x + Δ) - m(x)] / m(x) using the predict method with shifted inputs.
+    #     """
+    #     # Check if this is being called on a non-continuous variable
+    #     if hasattr(self, 'parent_model') and hasattr(self.parent_model, 'variable_types'):
+    #         var_type = self.parent_model.variable_types.get(var_index, 'continuous')
+    #         if var_type in ['binary', 'ordinal']:
+    #             raise ValueError(
+    #                 f"predict_semi_elasticity called on {var_type} variable at index {var_index}. "
+    #                 f"For {var_type} variables, compute percentage changes using predict() with shifted x values."
+    #             )
+    #
+    #     m_x = self.predict(x)
+    #     m_k_x = self.derivative(x, var_index)
+    #     return m_k_x / m_x
 
 
 class NPModelResultsDensity(NPModelResults):
@@ -92,11 +90,33 @@ class NPModelResultsDensity(NPModelResults):
         pass
 
     def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        # should return f'(x)/f(x) for all continuous variables of interest
+        # not sure about discrete variables here yet
         pass
 
 
 class NNModel(NPModel):
+    """
+    Base neural network model wrapper for nuisance and density models.
+    Handles device selection, model construction, parameter parsing,
+    and training configuration. Subclasses implement the actual
+    training and loss functions.
+    """
     def __init__(self, variable_types: dict, build_now=True, **params):
+        """
+                Initialize the NNModel.
+
+                Parameters
+                ----------
+                variable_types : dict
+                    Mapping from variable index → {'continuous','binary','ordinal'}.
+                    Used by subclasses to interpret model outputs.
+                build_now : bool, default=True
+                    If True, the network architecture is constructed immediately.
+                    If False, creation is deferred (used in two-head density model).
+                **params : dict
+                    Raw hyperparameter dictionary passed to `_parse_params()`.
+                """
         import torch
         super().__init__(variable_types, **params)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -122,7 +142,7 @@ class NNModel(NPModel):
 
         metrics = {'final_epoch_loss': float('nan'), 'val_loss': float('nan')}  # Placeholder for actual metrics
 
-        return NPModelResults(self, x, y, **metrics)
+        return NPModelResults(self, **metrics)
 
     def training_step(self, batch):
         pass
@@ -255,10 +275,20 @@ class NNModel(NPModel):
         }
 
 
-
 class NNModelNuisance(NNModel):
-
+    """
+        Supervised nuisance regression model m(x) with PyTorch training loop.
+        Supports early stopping, gradient clipping, and GPU execution.
+        """
     def __init__(self, variable_types: dict, **params):
+        """
+                Parameters
+                ----------
+                variable_types : dict
+                    Map {col_index: 'continuous'|'binary'|'ordinal'}.
+                **params : dict
+                    Architecture hyperparameters consumed by `_parse_params()`.
+                """
         super().__init__(variable_types, build_now=True, **params)
 
     def fit(self, X, y, *,
@@ -276,6 +306,36 @@ class NNModelNuisance(NNModel):
             train_idx=None,
             val_idx=None,
     ) -> "NNModelResults":
+        """
+           Train m(x) via MSE on (X, y), with optional fixed split or random split.
+
+           Parameters
+           ----------
+           X : array_like, shape (n, d)
+               Features.
+           y : array_like, shape (n,) or (n,1)
+               Targets; reshaped to (n,1) internally.
+           epochs, batch_size, learning_rate, weight_decay : see base.
+           val_frac : float
+               Fraction for validation if indices not provided.
+           patience, min_delta : int, float
+               Early stopping control on validation loss.
+           grad_clip_norm : float or None
+               Clip gradient global norm if set.
+           num_workers : int
+               DataLoader workers.
+           shuffle : bool
+               Shuffle training subset per epoch.
+           verbose : bool
+               Print training logs if True.
+           train_idx, val_idx : array_like or None
+               Predefined index splits. If both None, a random split is used.
+
+           Returns
+           -------
+           NNModelNuisanceResults
+               Fitted model with metrics and inference APIs.
+        """
 
         import torch
         from torch.utils.data import DataLoader, TensorDataset, Subset
@@ -383,16 +443,23 @@ class NNModelNuisance(NNModel):
 
         return NNModelNuisanceResults(
             self,
-            X.cpu().numpy(),
-            y.cpu().numpy(),
             **{"val_loss": best_loss if best_state is not None else None}
         )
 
     # ---------- PER-BATCH LOSS: TRAIN ----------
     def training_step(self, batch):
         """
-        One training step for supervised nuisance model (MSE).
-        Expects batch = (xb, yb). Returns scalar loss tensor.
+            One supervised training step with MSE loss.
+
+            Parameters
+            ----------
+            batch : tuple
+                (xb, yb) tensors.
+
+            Returns
+            -------
+            torch.Tensor
+                Scalar MSE loss.
         """
         import torch
         import torch.nn.functional as F
@@ -416,7 +483,36 @@ class NNModelNuisance(NNModel):
 
 
 class NNModelDensity(NNModel):
+    """
+    Density model with two networks:
+      - score_model: estimates ∇_{cont} log f(x) on selected continuous coords
+      - cond_model : estimates p(z_disc | x_other) over joint discrete states
+    Builds, trains, and returns results with unified alpha() access.
+    """
     def __init__(self, variable_types: dict, **params):
+        """
+        Parameters
+        ----------
+        variable_types : dict
+           Map {col_index: 'continuous'|'binary'|'ordinal'}.
+        **params : dict
+           Nested configs for shared/score/cond heads, parsed by `_parse_params()`.
+
+        Parse architecture hyperparameters for score and cond networks.
+
+        Expected structure
+        ------------------
+        {
+          "shared": {...},    # defaults applied to both heads
+          "score":  {...},    # overrides for score_model
+          "cond":   {...}     # overrides for cond_model
+        }
+
+        Returns
+        -------
+        dict
+            {"score": cfg_score, "cond": cfg_cond} with validated fields.
+       """
         super().__init__(variable_types, build_now=False, **params)
 
     def _parse_params(self) -> dict:
@@ -445,10 +541,10 @@ class NNModelDensity(NNModel):
             raise ValueError("self.params must be a dict")
 
         shared_defaults = {
-            "hidden_layers": [32, 32, 32],
-            "activation": "relu",
+            "hidden_layers": [1028, 1028, 1028, 1028],
+            "activation": "leaky_relu",
             "output_activation": "identity",
-            "dropout": 0.0,
+            "dropout": 0.2,
             "bias": True,
             "weight_init": "default",
         }
@@ -487,21 +583,39 @@ class NNModelDensity(NNModel):
             interest: list[int] | None = None,
             # shared defaults
             epochs: int = 100,
-            batch_size: int = 128,
+            batch_size: int = 256,
             learning_rate: float = 1e-3,
-            weight_decay: float = 0.0,
+            weight_decay: float = 1e-3,
             val_frac: float = 0.2,
-            patience: int = 10,
+            patience: int = 20,
             min_delta: float = 0.0,
             grad_clip_norm: float | None = None,
             num_workers: int = 0,
             shuffle: bool = True,
             verbose: bool = True,
             **kwargs
-    ):
+    ) -> "NNModelDensityResults":
+        """
+           Fit score_model and cond_model using provided interest indices.
 
-        import torch
-        from loglinearcorrection.neural_network_models import FeedForwardNNModel
+           Parameters
+           ----------
+           X : array_like, shape (n, d)
+               Inputs for density modeling.
+           y : ignored
+               Present for API symmetry.
+           interest : list[int] or None
+               Variables of interest; partitioned into continuous vs discrete.
+           epochs, batch_size, learning_rate, weight_decay, val_frac, patience,
+           min_delta, grad_clip_norm, num_workers, shuffle, verbose : see base.
+           **kwargs : dict
+               Head-specific kwargs using prefixes 'score__' and 'cond__'.
+
+           Returns
+           -------
+           NNModelDensityResults
+               Trained density results with score/cond access.
+           """
 
         shared = {
             "epochs": epochs, "batch_size": batch_size, "learning_rate": learning_rate,
@@ -523,21 +637,18 @@ class NNModelDensity(NNModel):
         score_dims, score_meta = dims_dict["score"]
         cond_dims, cond_meta = dims_dict["cond"]
 
-        model_score = self._fit_score_model(X=X, dims=score_dims, meta=score_meta, arch_cfg = score_arch_cfg,fit_cfg=score_fit_cfg)
-        model_cond = self._fit_conditional_model(X=X, dims=cond_dims, meta=cond_meta, arch_cfg=cond_arch_cfg, fit_cfg=cond_fit_cfg)
+        score_model = self._fit_score_model(X=X, dims=score_dims, meta=score_meta, arch_cfg = score_arch_cfg,fit_cfg=score_fit_cfg)
+        cond_model = self._fit_conditional_model(X=X, dims=cond_dims, meta=cond_meta, arch_cfg=cond_arch_cfg, fit_cfg=cond_fit_cfg)
 
         self.model = {
-            "score": (model_score, score_meta),
-            "cond": (model_cond, cond_meta)
+            "score": (score_model, score_meta),
+            "cond": (cond_model, cond_meta)
         }
 
         return NNModelDensityResults(
             self,
-            X,
-            y,
             **{}
         )
-
 
     def _fit_score_model(self, X, dims,meta, arch_cfg, fit_cfg):
         """
@@ -931,7 +1042,27 @@ class NNModelDensity(NNModel):
 
 
     def _split_head_kwargs(self, kw: dict) -> tuple[dict, dict]:
+        """
+            Split kwargs by head prefix.
+
+            Parameters
+            ----------
+            kw : dict
+                Possibly prefixed kwargs.
+
+            Returns
+            -------
+            (dict, dict)
+                (score_kwargs, cond_kwargs) with prefixes stripped.
+
+            Raises
+            ------
+            ValueError
+                On unknown, unprefixed keys.
+        """
         score_kw, cond_kw = {}, {}
+        if len(kw) == 0:
+            return score_kw, cond_kw
         for k, v in kw.items():
             if k.startswith("score__"):
                 score_kw[k[len("score__"):]] = v
@@ -947,7 +1078,49 @@ class NNModelDensity(NNModel):
 class NNModelDensityResults(NPModelResultsDensity):
     def __init__(self, model: NNModelDensity, **metrics):
         super().__init__(model, **metrics)
-        pass
+        self.device = model.device
+
+    def alpha_weight(self, X: npt.ArrayLike, var_index: list[int]) -> npt.NDArray[np.float64]:
+        """
+        For each requested index in 'indices':
+          - if continuous-interest: return score f'(x)/f(x) for that coord
+          - if discrete-interest:   return 0  (placeholder)
+        Order is preserved. Mixed lists are allowed.
+        """
+        import torch
+
+        if not var_index:
+            raise ValueError("indices must be non-empty.")
+
+        # unpack models + metadata
+        score_model, score_meta = self.model["score"]
+        cond_model, cond_meta = self.model["cond"]
+
+        cont_int = list(score_meta.get("interest_cont_indices", []))
+        disc_int = list(cond_meta.get("interest_disc_indices", []))
+
+        idxs = [int(i) for i in var_index]
+
+        # compute scores once if any cont index requested
+        need_scores = any(i in cont_int for i in idxs)
+        scores = None
+        if need_scores:
+            Xt = torch.as_tensor(np.asarray(X, dtype=np.float32), dtype=torch.float32, device=self.device)
+            score_model.eval()
+            with torch.no_grad():
+                scores = score_model(Xt).detach().cpu().numpy()  # shape (n, |cont_int|)
+
+        n = np.asarray(X).shape[0]
+        cols = []
+        for k in idxs:
+            if k in cont_int:
+                cols.append(scores[:, cont_int.index(k)])
+            elif k in disc_int:
+                cols.append(np.zeros(n, dtype=np.float64))
+            else:
+                raise ValueError(f"index {k} not in continuous-interest or discrete-interest sets")
+
+        return np.column_stack(cols).astype(np.float64)
 
 
 class NNModelNuisanceResults(NPModelResultsNuisance):
@@ -964,14 +1137,15 @@ class NNModelNuisanceResults(NPModelResultsNuisance):
             preds = self.model(x_tensor)
         return preds.detach().cpu().numpy()
 
-    def derivative(self, X: npt.ArrayLike, interest_continuous) -> tuple[
+    def derivative(self, X: npt.ArrayLike, var_index) -> tuple[
         npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        # this should eventually return m(1,x) and m(0,x) for binary variables (grad=m(1,x), pred=m(0,x)), so correction= grad/pred similar to continuous case
         """
         Returns (pred, grad) where:
           pred[i] = m(x_i)
           grad[i, k] = ∂m(x_i)/∂x_k  for k in interest_continuous
         """
-        import torch, numpy as np
+        import torch
         self.model.eval()
 
         xt = torch.tensor(X, dtype=torch.float32, device=self.device, requires_grad=True)
@@ -984,7 +1158,7 @@ class NNModelNuisanceResults(NPModelResultsNuisance):
                 grad_outputs=torch.ones_like(ysc),
                 create_graph=False, retain_graph=False
             )[0]
-            G = grads_all[:, interest_continuous]  # (n, K)
+            G = grads_all[:, var_index]  # (n, K)
             preds = ysc.detach().cpu().numpy()  # (n,)
             grads = G.detach().cpu().numpy()  # (n, K)
             return preds, grads
@@ -995,7 +1169,7 @@ class NNModelNuisanceResults(NPModelResultsNuisance):
                 g_all = torch.autograd.grad(
                     yhat[:, o].sum(), xt, create_graph=False, retain_graph=True
                 )[0]
-                cols.append(g_all[:, interest_continuous].unsqueeze(1))  # (n,1,K)
+                cols.append(g_all[:, var_index].unsqueeze(1))  # (n,1,K)
             G = torch.cat(cols, dim=1)  # (n, q, K)
             preds = yhat.detach().cpu().numpy()  # (n, q)
             grads = G.detach().cpu().numpy()  # (n, q, K)

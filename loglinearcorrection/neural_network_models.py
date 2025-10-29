@@ -141,18 +141,40 @@ class NullNN(nn.Module):
 
 class ScoreMatchingLossRestricted(nn.Module):
     """
-    Score matching on a subset of continuous coordinates.
+    Exact Hyvärinen score-matching loss restricted to selected coordinates.
 
-    Input:  x ∈ R^{n×d}  (all features)
-    Model:  h(x) ∈ R^{n×|I|}  (scores for interest coords only, in the same order)
-    Loss:   E[ 0.5 * ||h(x)||^2 + sum_{i∈I} ∂ h_i(x) / ∂ x_i ]
+    For interest index set I:
+        J(h) = E_x[ 0.5 * sum_{i in I} h_i(x)^2 + sum_{i in I} ∂h_i/∂x_i ].
+
+    The model must output h(x) ∈ R^{|I|} with columns ordered as `interest`.
     """
     def __init__(self, interest: list[int]):
+        """
+           Parameters
+           ----------
+           interest : list[int]
+               Indices of continuous variables whose score coordinates are modeled.
+        """
         super().__init__()
         self.register_buffer("interest_idx", torch.tensor(interest, dtype=torch.long))
 
     @torch.enable_grad()
     def forward(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute restricted Hyvärinen loss on a batch.
+
+        Parameters
+        ----------
+        model : nn.Module
+            Score model, output shape (n, |I|) in `interest` order.
+        x : torch.Tensor, shape (n, d)
+            Inputs with requires_grad True inside.
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar loss (mean over batch).
+        """
         if self.interest_idx.numel() == 0:
             return torch.zeros((), device=x.device, dtype=x.dtype)
 
