@@ -857,7 +857,8 @@ class NNModelDensity(NNModel):
             # inverse frequency
             counts = np.bincount(y, minlength=K).astype(np.float32)
             cw = counts.max() / np.maximum(counts, 1.0)
-            class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
+            # class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
+            class_weights = torch.ones(K, dtype=torch.float32, device=device)
         else:
             class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
         criterion = nn.CrossEntropyLoss(weight=class_weights)
