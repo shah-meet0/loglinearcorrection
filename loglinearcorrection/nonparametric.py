@@ -541,7 +541,7 @@ class NNModelDensity(NNModel):
             raise ValueError("self.params must be a dict")
 
         shared_defaults = {
-            "hidden_layers": [1028, 1028, 1028, 1028],
+            "hidden_layers": [1028, 1028, 1028, 1028, 1028],
             "activation": "leaky_relu",
             "output_activation": "identity",
             "dropout": 0.2,
@@ -1039,8 +1039,6 @@ class NNModelDensity(NNModel):
 
 
 
-
-
     def _split_head_kwargs(self, kw: dict) -> tuple[dict, dict]:
         """
             Split kwargs by head prefix.
@@ -1103,6 +1101,8 @@ class NNModelDensityResults(NPModelResultsDensity):
 
         # compute scores once if any cont index requested
         need_scores = any(i in cont_int for i in idxs)
+        need_cond = any(i in disc_int for i in idxs)
+
         scores = None
         if need_scores:
             Xt = torch.as_tensor(np.asarray(X, dtype=np.float32), dtype=torch.float32, device=self.device)
@@ -1110,17 +1110,55 @@ class NNModelDensityResults(NPModelResultsDensity):
             with torch.no_grad():
                 scores = score_model(Xt).detach().cpu().numpy()  # shape (n, |cont_int|)
 
+        conds = None
+        discrete_x = None
+        original_encoding = None
+        if need_cond:
+            Z = np.asarray(X, dtype=np.float32)
+            Z = np.delete(Z, disc_int, axis=1)  # remove interested discrete cols
+            discrete_x = np.asarray(X, dtype=np.int64)[:, disc_int]
+            classes = [tuple(row.tolist()) for row in discrete_x]
+            original_encoding  = [cond_meta['combo_encoder'].get(k, -99) for k in classes]
+            if -99 in original_encoding:
+                raise ValueError("Some discrete variable combinations not seen during training.")
+            Zt = torch.as_tensor(Z, dtype=torch.float32, device=self.device)
+            cond_model.eval()
+            with torch.no_grad():
+                probs = torch.softmax(cond_model(Zt), dim=1).detach().cpu().numpy()  # shape (n, num_classes)
+
         n = np.asarray(X).shape[0]
         cols = []
         for k in idxs:
             if k in cont_int:
                 cols.append(scores[:, cont_int.index(k)])
             elif k in disc_int:
-                cols.append(np.zeros(n, dtype=np.float64))
+                cols.append(self.get_prob_discrete(probs, discrete_x, original_encoding, k))
             else:
                 raise ValueError(f"index {k} not in continuous-interest or discrete-interest sets")
 
         return np.column_stack(cols).astype(np.float64)
+
+    def get_prob_discrete(self, probs: np.ndarray, discrete_x, original_encoding, var_index: int) -> np.ndarray:
+        cond_meta = self.model["cond"][1]
+        n = probs.shape[0]
+        disc_int = cond_meta.get("interest_disc_indices", [])
+
+        if not np.issubdtype(discrete_x.dtype, np.integer):
+            discrete_x = discrete_x.astype(int)
+
+        discrete_x_bit_flip = discrete_x.copy()
+        discrete_x_bit_flip[:, disc_int.index(var_index)] = 1 - discrete_x_bit_flip[:, disc_int.index(var_index)]
+
+        new_encoding = [cond_meta['combo_encoder'].get(tuple(row.tolist()), -99) for row in discrete_x_bit_flip]
+
+        rows = np.arange(n)
+        p = probs[rows, original_encoding]
+        p_flip = probs[rows, new_encoding]
+        probs = p / (p + p_flip)
+
+        return probs.astype(np.float64)
+
+
 
 
 class NNModelNuisanceResults(NPModelResultsNuisance):
@@ -1135,6 +1173,7 @@ class NNModelNuisanceResults(NPModelResultsNuisance):
         x_tensor = torch.as_tensor(X, dtype=torch.float32).to(device)
         with torch.no_grad():
             preds = self.model(x_tensor)
+        preds = preds.squeeze(-1) if preds.ndim == 2 and preds.shape[1] == 1 else preds
         return preds.detach().cpu().numpy()
 
     def derivative(self, X: npt.ArrayLike, var_index) -> tuple[

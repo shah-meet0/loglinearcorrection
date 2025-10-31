@@ -292,6 +292,7 @@ class DoublyRobustElasticityEstimatorModel:
             # Compute residuals on test data
             log_residuals_test = np.log(endog_orig_test) - exog_test @ beta
             exp_residuals_test = np.exp(log_residuals_test)  # exp(u_i)
+
             
             # Step 2: Estimate nuisance functions on training data
             # Using original (non-demeaned) data for nuisance functions
@@ -299,6 +300,7 @@ class DoublyRobustElasticityEstimatorModel:
             # Estimate m(x) = E[exp(u)|x] using NPModel
             log_residuals_train = np.log(endog_orig_train) - exog_train @ beta
             exp_residuals_train = np.exp(log_residuals_train)
+
 
 
             # Create NPModel with variable types
@@ -310,6 +312,7 @@ class DoublyRobustElasticityEstimatorModel:
             # Predict m(x) on test data
             # m_prime_test = m'(x) for continuous interest variables, mhat = m(x) for all interest variables, mgrad = m(x+delta) for discrete interest variables
             m_test, m_prime_test = m_results.derivative(exog_orig_test, interest_indices)
+            p_test = exp_residuals_test - m_test
 
 
             
@@ -335,6 +338,8 @@ class DoublyRobustElasticityEstimatorModel:
             for moment_idx, var_idx in enumerate(interest_indices):
                 # i is where we'll get results for that var_idx
                 var_type = self.variable_types.get(var_idx, 'continuous')
+                # g = β_k + m_k(x)/m(x) and φ = α(x)*p where p = exp(u) - m(x)
+
                 
                 if var_type == 'continuous':
                     # Continuous variable: semi-elasticity
@@ -347,10 +352,6 @@ class DoublyRobustElasticityEstimatorModel:
                     # Influence function
                     alpha_test = -alpha_weight / (m_test + 1e-10)
                     fold_alpha_x.append(alpha_test)
-                    
-                    # Orthogonalized moment (without elasticity parameter - that's what we solve for)
-                    # g = β_k + m_k(x)/m(x) and φ = α(x)*p where p = exp(u) - m(x)
-                    p_test = exp_residuals_test - m_test
                     
                     # Get m_k(x)/m(x) from NPModelResults
                     m_semi_elast_test = m_prime_test[:, moment_idx]/(m_test + 1e-10)
@@ -392,10 +393,23 @@ class DoublyRobustElasticityEstimatorModel:
                     
                     # Store moment: g + φ
 
-                    theta_test = 0
-                    alpha_test = 0
-                    p_test = 0
+                    exog_test_flip = exog_orig_test.copy()
+                    exog_test_flip[:, var_idx] = 1 - exog_test_flip[:, var_idx]  # Flip binary variable
+                    m_shifted_test = m_results.predict(exog_test_flip)
+                    probability_var = alpha_weights[:, moment_idx]
+
+                    alpha_0 = (1 - exog_orig_test[:, var_idx].astype(np.int64)) * m_shifted_test/(m_test**2 * probability_var) # m1/m0**2 * I(X=0)/P(X=0)
+                    alpha_1 = (exog_orig_test[:, var_idx].astype(np.int64))/(probability_var * m_shifted_test) # 1/(m0*P(X=1)) * I(X=1)
+
+                    correction_0 = (1- exog_orig_test[:, var_idx].astype(np.int64)) * m_shifted_test/m_test # m1/m0 * I(X=0)
+                    correction_1 = (exog_orig_test[:, var_idx].astype(np.int64)) * m_test/m_shifted_test  # m1/m0 * I(X=1)
+
+                    theta_test = np.exp(beta[var_idx]) * (correction_1 + correction_0) - 1
+                    alpha_test = np.exp(beta[var_idx]) * (alpha_1 - alpha_0)
+
                     moments[test_idx, moment_idx] = theta_test + alpha_test * p_test
+                    fold_theta_x.append(theta_test)
+                    fold_alpha_x.append(alpha_test)
                     
                 elif var_type == 'ordinal':
                     # # Ordinal variable: percentage change with Δ=1
