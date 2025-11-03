@@ -392,7 +392,9 @@ class DoublyRobustElasticityEstimatorModel:
         if m_params is None:
             m_params = {'arch_params': {'hidden_layers': [512, 512, 512],
                                         'input_size': 0,
-                                        'output_size': 0},
+                                        'output_size': 0,
+                                        'output_activation': 'relu'
+                                        },
                         'fit_params': {}}
 
         for key in m_params.keys():
@@ -403,9 +405,10 @@ class DoublyRobustElasticityEstimatorModel:
             m_params['fit_params'] = {}
 
         if 'arch_params' not in m_params:
-            m_params['arch_params'] = {'hidden_layers': [256, 256, 256],
+            m_params['arch_params'] = {'hidden_layers': [512, 512, 512],
                                        'input_size': 0,
-                                       'output_size': 0}
+                                       'output_size': 0,
+                                       'output_activation': 'relu'}
 
         m_params['arch_params']['input_size'] = self.exog.shape[1]
         m_params['arch_params']['output_size'] = 1
