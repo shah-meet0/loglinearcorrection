@@ -312,6 +312,10 @@ class DoublyRobustElasticityEstimatorModel:
             # Predict m(x) on test data
             # m_prime_test = m'(x) for continuous interest variables, mhat = m(x) for all interest variables, mgrad = m(x+delta) for discrete interest variables
             m_test, m_prime_test = m_results.derivative(exog_orig_test, interest_indices)
+
+            if any(m_test <= 0):
+                raise ValueError("Predicted m(x) has non-positive values, cannot proceed with estimation.")
+
             p_test = exp_residuals_test - m_test
 
 
@@ -350,11 +354,11 @@ class DoublyRobustElasticityEstimatorModel:
                     alpha_weight = alpha_weights[:, moment_idx]
 
                     # Influence function
-                    alpha_test = -alpha_weight / (m_test + 1e-10)
+                    alpha_test = -alpha_weight / (m_test)
                     fold_alpha_x.append(alpha_test)
                     
                     # Get m_k(x)/m(x) from NPModelResults
-                    m_semi_elast_test = m_prime_test[:, moment_idx]/(m_test + 1e-10)
+                    m_semi_elast_test = m_prime_test[:, moment_idx]/(m_test)
                     
                     # θ(x) = β_k + m_k/m
                     theta_test = beta[var_idx] + m_semi_elast_test
@@ -364,34 +368,6 @@ class DoublyRobustElasticityEstimatorModel:
                     moments[test_idx, moment_idx] = theta_test + alpha_test * p_test
                     
                 elif var_type == 'binary':
-                    # Binary variable: percentage change with Δ=1
-                    # First term (density derivative) is zero for binaries
-                    # ε = exp(β*Δ) * m(x+Δ)/m(x) - 1
-                    # α(x) = exp(β*Δ) * [0 - m(x+Δ)/m^2(x)]  (first term zero for binary)
-                    
-                    # delta = 1
-                    # beta_delta = beta[var_idx] * delta
-                    #
-                    # # Create shifted x
-                    # x_shifted = exog_orig_test.copy()
-                    # x_shifted[:, var_idx] = 1 - x_shifted[:, var_idx]  # Flip binary variable
-                    #
-                    # # Predict m(x+Δ)
-                    # m_shifted_test = m_results.predict(x_shifted)
-                    #
-                    # # Influence function (first term zero for binary)
-                    # alpha_test = np.exp(beta_delta) * (-m_shifted_test / (m_test**2 + 1e-10))
-                    # fold_alpha_x.append(alpha_test)
-                    #
-                    # # Orthogonalized moment
-                    # p_test = exp_residuals_test - m_test
-                    #
-                    # # θ(x) = exp(β*Δ) * m(x+Δ)/m(x) - 1
-                    # ratio = m_shifted_test / (m_test + 1e-10)
-                    # theta_test = np.exp(beta_delta) * ratio - 1
-                    # fold_theta_x.append(theta_test)
-                    
-                    # Store moment: g + φ
 
                     exog_test_flip = exog_orig_test.copy()
                     exog_test_flip[:, var_idx] = 1 - exog_test_flip[:, var_idx]  # Flip binary variable

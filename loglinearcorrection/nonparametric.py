@@ -26,10 +26,10 @@ class NPModelResultsNuisance(NPModelResults):
         super().__init__(model, **metrics)
         pass
 
-    def predict(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+    def predict(self, X: npt.ArrayLike) -> npt.NDArray[np.float64]:
         pass
 
-    def derivative(self, x: npt.NDArray[np.float64], var_index: list[int]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    def derivative(self, X: npt.NDArray[np.float64], var_index: list[int]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
         pass
 
     
@@ -305,7 +305,7 @@ class NNModelNuisance(NNModel):
             verbose: bool = True,
             train_idx=None,
             val_idx=None,
-    ) -> "NNModelResults":
+    ) -> "NNModelNuisanceResults":
         """
            Train m(x) via MSE on (X, y), with optional fixed split or random split.
 
@@ -867,10 +867,6 @@ class NNModelDensity(NNModel):
         # loss with optional class weights for imbalance
         class_weights = fit_cfg.get("class_weights", None)
         if class_weights is None:
-            # inverse frequency
-            counts = np.bincount(y, minlength=K).astype(np.float32)
-            cw = counts.max() / np.maximum(counts, 1.0)
-            # class_weights = torch.tensor(cw, dtype=torch.float32, device=device)
             class_weights = torch.ones(K, dtype=torch.float32, device=device)
         else:
             class_weights = torch.tensor(class_weights, dtype=torch.float32, device=device)
@@ -1195,9 +1191,8 @@ class NNModelNuisanceResults(NPModelResultsNuisance):
         preds = preds.squeeze(-1) if preds.ndim == 2 and preds.shape[1] == 1 else preds
         return preds.detach().cpu().numpy()
 
-    def derivative(self, X: npt.ArrayLike, var_index) -> tuple[
+    def derivative(self, X: npt.ArrayLike, var_index:npt.ArrayLike) -> tuple[
         npt.NDArray[np.float64], npt.NDArray[np.float64]]:
-        # this should eventually return m(1,x) and m(0,x) for binary variables (grad=m(1,x), pred=m(0,x)), so correction= grad/pred similar to continuous case
         """
         Returns (pred, grad) where:
           pred[i] = m(x_i)
