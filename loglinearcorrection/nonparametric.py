@@ -225,7 +225,7 @@ class NNModel(NPModel):
         if parsed["activation"] not in {"relu", "tanh", "sigmoid", "leaky_relu"}:
             raise ValueError("Unsupported activation function")
 
-        if parsed["output_activation"] not in {"identity", "relu", "tanh", "sigmoid", "softmax", "log_softmax"}:
+        if parsed["output_activation"] not in {"identity", "softplus", "relu", "tanh", "sigmoid", "softmax", "log_softmax"}:
             raise ValueError("Unsupported output activation function")
 
         if not (0.0 <= parsed["dropout"] < 1.0):

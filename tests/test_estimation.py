@@ -39,7 +39,7 @@ model = DREEM(
 
 arch_params_m = {
     'hidden_layers': [1028, 1028, 1028, 1028],
-    'output_activation': 'softplus'
+    'output_activation': 'relu'
 }
 fit_params_m = {
     "epochs": 200,

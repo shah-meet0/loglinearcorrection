@@ -44,6 +44,7 @@ class FeedForwardNNModel(nn.Module):
             "tanh": nn.Tanh,
             "sigmoid": nn.Sigmoid,
             "leaky_relu": nn.LeakyReLU,
+            "softplus": nn.Softplus,
             "identity": nn.Identity,
             "softmax": lambda: nn.Softmax(dim=1),
             "log_softmax": lambda: nn.LogSoftmax(dim=1),
