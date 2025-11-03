@@ -359,21 +359,28 @@ class NNModelNuisance(NNModel):
                 (perm[:n_val], perm[n_val:]) if n_val > 0 else (torch.empty(0, dtype=torch.long), torch.arange(N))
             )
 
-        ds = TensorDataset(X, y)
+        X_tr, y_tr = X[train_idx], y[train_idx]
+        X_va, y_va = X[val_idx], y[val_idx]
+
+        ds_tr = TensorDataset(X_tr, y_tr)
+        ds_va = TensorDataset(X_va, y_va)
+
         dl_tr = DataLoader(
-            Subset(ds, train_idx),
+            ds_tr,
             batch_size=batch_size,
             shuffle=shuffle,
             num_workers=num_workers,
+            persistent_workers=(pin and num_workers > 0),
             pin_memory=pin,
             drop_last=False,
         )
         dl_va = (
             DataLoader(
-                Subset(ds, val_idx),
+                ds_va,
                 batch_size=batch_size,
                 shuffle=False,
                 num_workers=num_workers,
+                persistent_workers=(pin and num_workers > 0),
                 pin_memory=pin,
                 drop_last=False,
             )
@@ -686,8 +693,7 @@ class NNModelDensity(NNModel):
             raise ValueError("meta['interest_cont_indices'] size must match dims['output_size'].")
 
         device = getattr(self, "device", torch.device("cpu"))
-        X = torch.as_tensor(X, dtype=torch.float32)
-        n = X.size(0)
+        n = X.shape[0]
 
         # model
         cfg = {**arch_cfg, **dims}
@@ -703,26 +709,33 @@ class NNModelDensity(NNModel):
         val_idx = perm[:n_val]
         tr_idx = perm[n_val:] if n_val > 0 else torch.arange(n)
 
-        ds = TensorDataset(X)
+        X_tr = torch.as_tensor(X[tr_idx], dtype=torch.float32)
+        X_va = torch.as_tensor(X[val_idx], dtype=torch.float32) if n_val > 0 else None
+
+        ds_tr = TensorDataset(X_tr)
+        ds_va = TensorDataset(X_va) if n_val > 0 else None
+
         pin = (device.type == "cuda")
         bs = int(fit_cfg.get("batch_size", 128))
         nw = int(fit_cfg.get("num_workers", 0))
 
         dl_tr = DataLoader(
-            Subset(ds, tr_idx),
+            ds_tr,
             batch_size=bs,
             shuffle=bool(fit_cfg.get("shuffle", True)),
             num_workers=nw,
             pin_memory=pin,
+            persistent_workers=(pin and nw > 0),
             drop_last=False,
         )
         dl_va = (
             DataLoader(
-                Subset(ds, val_idx),
+                ds_va,
                 batch_size=bs,
                 shuffle=False,
                 num_workers=nw,
                 pin_memory=pin,
+                persistent_workers=(pin and nw > 0),
                 drop_last=False,
             )
             if n_val > 0 else None
@@ -874,13 +887,18 @@ class NNModelDensity(NNModel):
         pin = (device.type == "cuda")
         bs = int(fit_cfg.get("batch_size", 128))
         nw = int(fit_cfg.get("num_workers", 0))
-        ds = TensorDataset(torch.as_tensor(X_in, dtype=torch.float32), torch.as_tensor(y, dtype=torch.long))
 
-        dl_tr = DataLoader(Subset(ds, torch.as_tensor(tr_idx)), batch_size=bs,
+        X_tr, y_tr = X_in[tr_idx], y[tr_idx]
+        X_va, y_va = X_in[val_idx], y[val_idx]
+
+        ds_tr = TensorDataset(torch.as_tensor(X_tr, dtype=torch.float32), torch.as_tensor(y_tr, dtype=torch.long))
+        ds_va = TensorDataset(torch.as_tensor(X_va, dtype=torch.float32), torch.as_tensor(y_va, dtype=torch.long))
+
+        dl_tr = DataLoader(ds_tr, batch_size=bs,
                            shuffle=bool(fit_cfg.get("shuffle", True)),
-                           num_workers=nw, pin_memory=pin, drop_last=False)
-        dl_va = (DataLoader(Subset(ds, torch.as_tensor(val_idx)), batch_size=bs, shuffle=False,
-                            num_workers=nw, pin_memory=pin, drop_last=False) if n_val > 0 else None)
+                           num_workers=nw, pin_memory=pin, persistent_workers=(pin and nw > 0), drop_last=False)
+        dl_va = (DataLoader(ds_va, batch_size=bs, shuffle=False,
+                            num_workers=nw, pin_memory=pin, persistent_workers=(pin and nw > 0), drop_last=False) if n_val > 0 else None)
 
         # optimizer
         opt = torch.optim.AdamW(model.parameters(),
