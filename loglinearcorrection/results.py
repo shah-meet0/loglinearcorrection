@@ -4,6 +4,7 @@ Results classes for the doubly robust elasticity estimator.
 from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
+import pandas as pd
 
 class DoublyRobustElasticityEstimatorModelResults:
     """
@@ -64,18 +65,20 @@ class DoublyRobustElasticityEstimatorModelResults:
     get_elasticity(var_name)
         Get elasticity estimate and standard error for a variable
     """
-    
+
     def __init__(
         self,
-        elasticities: Dict[str, Dict[str, Any]],
+        elasticities: Union[pd.DataFrame, npt.NDArray[np.float64]],
         beta: npt.NDArray[np.float64],
         exog_names: List[str],
         endog_name: str,
         n_folds: int,
         nobs: int,
         variable_types: Dict[int, str],
-        fold_diagnostics: Dict[str, Any],
-        var_params: Optional[Dict[str, Any]] = None
+        interest_indices: List[int],
+        fold_results: List[Dict],
+        moments: npt.NDArray[np.float64],
+        fold_weights: npt.NDArray[np.float64]
     ):
         self.elasticities = elasticities
         self.beta = beta
@@ -84,103 +87,86 @@ class DoublyRobustElasticityEstimatorModelResults:
         self.n_folds = n_folds
         self.nobs = nobs
         self.variable_types = variable_types
-        self.fold_diagnostics = fold_diagnostics
-        self.var_params = var_params or {}
+        self.interest_indices = interest_indices
+        self.fold_results = fold_results
+        self.moments = moments
+        self.fold_weights = fold_weights
+        self._is_pandas = isinstance(elasticities, pd.DataFrame)
         
-        # Lazy computation of standard errors
+        # Will be populated by compute_variances()
         self._standard_errors = None
+        self._variance_matrix = None
         self._confidence_intervals = None
-        self._variance_results = None
     
     @property
     def standard_errors(self) -> npt.NDArray[np.float64]:
-        """
-        Compute standard errors using variance estimator.
-        
-        Lazily computed on first access using the variance estimation
-        module and stored for subsequent use.
-        
-        Returns
-        -------
-        ndarray
-            Standard errors for elasticity estimates
-        """
+        """Get standard errors (computed if not already done)."""
         if self._standard_errors is None:
-            self._compute_variance(self.var_params)
+            self.compute_variances()
         return self._standard_errors
     
     @property
     def confidence_intervals(self) -> Dict[str, tuple]:
-        """
-        Compute 95% confidence intervals for elasticities.
-        
-        Returns
-        -------
-        dict
-            Mapping from variable names to (lower, upper) confidence bounds
-        """
+        """Get 95% confidence intervals."""
         if self._confidence_intervals is None:
-            self._compute_variance(self.var_params)
+            self.compute_variances()
         return self._confidence_intervals
     
-    def _compute_variance(self, var_params: Optional[Dict[str, Any]] = None) -> None:
-        """
-        Compute variance estimates using VarianceModel.
+    def compute_variances(self) -> None:
+        """Compute variance-covariance matrix and standard errors."""
+        if self._standard_errors is not None:
+            return  # Already computed
+            
+        w = self.fold_weights.reshape(-1, 1)
+        W = w / w.sum()
+        V = self.moments.T @ (W * self.moments)
         
-        Uses the VarianceModel class to compute standard errors
-        based on the cross-fitted influence functions stored in
-        fold_diagnostics.
+        self._variance_matrix = V
+        elasticity_variances = np.diag(V)[:len(self.interest_indices)]
+        self._standard_errors = np.sqrt(elasticity_variances / self.nobs)
         
-        Parameters
-        ----------
-        var_params : dict, optional
-            Parameters to pass to VarianceModel constructor:
-            - method: str, default='influence'
-            - Additional method-specific parameters
-        """
-        try:
-            from .variance import VarianceModel
+        # Compute confidence intervals
+        from scipy import stats
+        z_score = stats.norm.ppf(0.975)
+        
+        self._confidence_intervals = {}
+        if self._is_pandas:
+            self.elasticities['std_err'] = self._standard_errors
+            for i, var_name in enumerate(self.elasticities.index):
+                estimate = self.elasticities.loc[var_name, 'estimate']
+                se = self._standard_errors[i]
+                self._confidence_intervals[var_name] = (
+                    estimate - z_score * se,
+                    estimate + z_score * se
+                )
+        else:
+            for i, idx in enumerate(self.interest_indices):
+                var_name = self.exog_names[idx]
+                estimate = self.elasticities[i]
+                se = self._standard_errors[i]
+                self._confidence_intervals[var_name] = (
+                    estimate - z_score * se,
+                    estimate + z_score * se
+                )
+
+    def get_elasticity(self, var_name: str) -> tuple[float, float]:
+        """Get elasticity estimate and standard error for a variable."""
+        if self._standard_errors is None:
+            self.compute_variances()
             
-            # Default variance parameters
-            if var_params is None:
-                var_params = {}
-            
-            # Create variance model
-            var_model = VarianceModel(**var_params)
-            
-            # Fit variance model
-            var_results = var_model.fit(
-                fold_diagnostics=self.fold_diagnostics,
-                n_folds=self.n_folds,
-                nobs=self.nobs,
-                elasticities=self.elasticities,
-                weights=getattr(self, 'weights', None)
-            )
-            
-            # Store results
-            self._variance_results = var_results
-            self._standard_errors = var_results.standard_errors
-            
-            # Extract confidence intervals
-            self._confidence_intervals = {}
-            for var_name in self.elasticities:
-                ci_info = var_results.confidence_intervals.get(var_name, {})
-                lower = ci_info.get('lower', np.nan)
-                upper = ci_info.get('upper', np.nan)
-                self._confidence_intervals[var_name] = (lower, upper)
-                
-        except ImportError:
-            # Fallback if variance module not implemented
-            import warnings
-            warnings.warn(
-                "variance.py module not found. Standard errors not available. "
-                "Implement VarianceModel class for inference.",
-                UserWarning
-            )
-            self._standard_errors = np.full(len(self.elasticities), np.nan)
-            self._confidence_intervals = {
-                name: (np.nan, np.nan) for name in self.elasticities
-            }
+        if self._is_pandas:
+            if var_name not in self.elasticities.index:
+                raise KeyError(f"Variable '{var_name}' not found")
+            row = self.elasticities.loc[var_name]
+            return row['estimate'], row['std_err']
+        else:
+            if var_name not in self.exog_names:
+                raise KeyError(f"Variable '{var_name}' not found")
+            idx = self.exog_names.index(var_name)
+            if idx not in self.interest_indices:
+                raise KeyError(f"Variable '{var_name}' not in interest variables")
+            pos = self.interest_indices.index(idx)
+            return self.elasticities[pos], self._standard_errors[pos]
     
     def predict_semi_elasticity(
         self, 
@@ -223,26 +209,19 @@ class DoublyRobustElasticityEstimatorModelResults:
             x = x.reshape(1, -1)
         
         # Find which variable in the interest set this corresponds to
-        interest_vars = list(self.elasticities.keys())
-        var_name = self.exog_names[var_index] if var_index < len(self.exog_names) else None
-        
-        if var_name not in interest_vars:
+        if var_index not in self.interest_indices:
             raise ValueError(f"Variable at index {var_index} not in interest variables")
-        
-        # Get position in interest variables
-        interest_position = interest_vars.index(var_name)
+        interest_position = self.interest_indices.index(var_index)
         
         # If requested and available, use stored theta values
-        if use_stored_theta and len(self.fold_diagnostics.get('theta_x', [])) > 0:
-            # Average stored theta values across folds for this variable
+        if use_stored_theta and len(self.fold_results) > 0:
             theta_values = []
-            for theta_fold in self.fold_diagnostics['theta_x']:
+            for fold in self.fold_results:
+                theta_fold = fold['theta_x']
                 if theta_fold.size > 0 and interest_position < theta_fold.shape[1]:
+                    # Note: This would need proper indexing to match x to test points
                     theta_values.append(theta_fold[:, interest_position])
-            
             if theta_values:
-                # Note: This assumes x corresponds to the original test points
-                # In practice, would need to match/interpolate points
                 return np.mean(theta_values, axis=0)
         
         # Otherwise, compute theta(x) using the fitted nuisance functions
@@ -251,7 +230,8 @@ class DoublyRobustElasticityEstimatorModelResults:
         # Average theta computations across folds
         theta_predictions = []
         
-        for m_results in self.fold_diagnostics['m_results']:
+        for fold in self.fold_results:
+            m_results = fold['m_results']
             if var_type == 'continuous':
                 # θ(x) = β_k + m_k(x)/m(x)
                 m_x = m_results.predict(x)
@@ -341,41 +321,19 @@ class DoublyRobustElasticityEstimatorModelResults:
         if x.ndim == 1:
             x = x.reshape(1, -1)
         
-        # Get log predictions
         log_pred = self.predict_log_y(x)
         
         # Average m(x) predictions across folds
         m_predictions = []
-        for m_results in self.fold_diagnostics['m_results']:
-            m_predictions.append(m_results.predict(x))
+        for fold in self.fold_results:
+            m_predictions.append(fold['m_results'].predict(x))
         m_x = np.mean(m_predictions, axis=0)
         
-        # Return exp(β·x) * m(x)
         return np.exp(log_pred) * m_x
     
-    @property
-    def variance_results(self) -> Optional['VarianceModelResults']:
-        """
-        Get the full variance model results object.
-        
-        Returns
-        -------
-        VarianceModelResults or None
-            Full variance results if computed, None otherwise
-        """
-        if self._variance_results is None and self._standard_errors is None:
-            # Trigger computation if not yet done
-            self._compute_variance(self.var_params)
-        return self._variance_results
 
-    
     def summary(self) -> None:
-        """
-        Print summary of estimation results.
-        
-        Displays elasticity estimates, standard errors, and confidence
-        intervals in a formatted table.
-        """
+        """Print summary of estimation results."""
         print("=" * 70)
         print(f"Doubly Robust Elasticity Estimator Results")
         print(f"Dependent variable: {self.endog_name}")
@@ -388,21 +346,30 @@ class DoublyRobustElasticityEstimatorModelResults:
         print(f"{'Variable':<20} {'Type':<12} {'Estimate':<12} {'Std. Error':<12} {'95% CI':<20}")
         print("-" * 70)
         
-        for var_name, var_info in self.elasticities.items():
-            estimate = var_info['estimate']
-            var_type = var_info['type']
-            
-            # Get standard error and CI
-            try:
-                _, se = self.get_elasticity(var_name)
+        if self._is_pandas:
+            for var_name in self.elasticities.index:
+                row = self.elasticities.loc[var_name]
+                estimate = row['estimate']
+                var_type = row['type']
+                se = row.get('std_err', np.nan)
+                
                 ci = self.confidence_intervals.get(var_name, (np.nan, np.nan))
                 ci_str = f"[{ci[0]:.4f}, {ci[1]:.4f}]" if not np.isnan(ci[0]) else "N/A"
                 se_str = f"{se:.4f}" if not np.isnan(se) else "N/A"
-            except:
-                se_str = "N/A"
-                ci_str = "N/A"
-            
-            print(f"{var_name:<20} {var_type:<12} {estimate:>11.4f} {se_str:>12} {ci_str:<20}")
+                
+                print(f"{var_name:<20} {var_type:<12} {estimate:>11.4f} {se_str:>12} {ci_str:<20}")
+        else:
+            for i, idx in enumerate(self.interest_indices):
+                var_name = self.exog_names[idx]
+                estimate = self.elasticities[i]
+                var_type = self.variable_types.get(idx, 'continuous')
+                se = self._standard_errors[i] if self._standard_errors is not None else np.nan
+                
+                ci = self.confidence_intervals.get(var_name, (np.nan, np.nan))
+                ci_str = f"[{ci[0]:.4f}, {ci[1]:.4f}]" if not np.isnan(ci[0]) else "N/A"
+                se_str = f"{se:.4f}" if not np.isnan(se) else "N/A"
+                
+                print(f"{var_name:<20} {var_type:<12} {estimate:>11.4f} {se_str:>12} {ci_str:<20}")
         
         print("-" * 70)
         print()
@@ -411,10 +378,10 @@ class DoublyRobustElasticityEstimatorModelResults:
         for i, name in enumerate(self.exog_names):
             print(f"{name:<20} {self.beta[i]:>11.4f}")
         print("=" * 70)
-    
+
     def __repr__(self) -> str:
         """String representation of results."""
-        n_vars = len(self.elasticities)
+        n_vars = len(self.interest_indices)
         return (
             f"DoublyRobustElasticityEstimatorModelResults("
             f"n_vars={n_vars}, nobs={self.nobs}, n_folds={self.n_folds})"
