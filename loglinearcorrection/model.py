@@ -6,7 +6,7 @@ import pandas as pd
 from sklearn.model_selection import KFold
 import statsmodels.api as sm
 
-from .utils import _apply_fixed_effects, _detect_variable_types
+from .utils import _apply_fixed_effects, _detect_variable_types, _delete_redundant, _initialize_fixed_effects, _adjust_names_after_deletion, _adjust_indices_after_deletion, _redundant_columns
 from .nonparametric import NNModelNuisance, NNModelDensity
 from .results import DREEMR
 #from .density import DensityModel, DensityModelResults
@@ -73,10 +73,6 @@ class DoublyRobustElasticityEstimatorModel:
             Name of dependent variable (from input or default "y").
         exog_names : list of str
             Names of independent variables (from input or default "x1", "x2", ...).
-        endog_demeaned : ndarray
-            Dependent variable after fixed effects transformation.
-        exog_demeaned : ndarray
-            Independent variables after fixed effects transformation.
         variable_types : dict
             Mapping of variable indices/names to detected types ('continuous',
             'binary', 'ordinal') for non-fixed-effect variables. Binary variables
@@ -109,9 +105,7 @@ class DoublyRobustElasticityEstimatorModel:
              precedence over ordinal specification)
            - Ordinal: Must be explicitly specified via `ordinal` parameter
            - Continuous: All other variables
-        4. Applies within-group demeaning for fixed effects using
-           :func:`_apply_fixed_effects`
-        5. Stores both original and transformed data for estimation
+        4. Stores both original data for estimation
         
         Variable type detection is important for proper handling in elasticity
         estimation. Users should carefully specify ordinal variables based on
@@ -120,8 +114,6 @@ class DoublyRobustElasticityEstimatorModel:
         variables.
         """
         # Store specifications
-        self.fixed_effects = fixed_effects
-        self.interest = interest
         self.ordinal = ordinal
 
         # Extract names from pandas objects or generate defaults
@@ -161,16 +153,36 @@ class DoublyRobustElasticityEstimatorModel:
         # Identify non-fixed-effect variable indices
         if fixed_effects is None:
             non_fe_indices = list(range(self.exog.shape[1]))
+            self.fe_indices = []
+            self.fixed_effects = None
         else:
             if self.exog_names and isinstance(fixed_effects[0], str):
-                fe_indices = {self.exog_names.index(name) for name in fixed_effects}
+                fe_indices = [self.exog_names.index(name) for name in fixed_effects]
             else:
-                fe_indices = set(fixed_effects)
+                fe_indices = list(set(fixed_effects))
+
+            self.fe_indices = fe_indices
+            self.fixed_effects = _initialize_fixed_effects(self.exog[:, fe_indices])
             non_fe_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
 
-        # Detect variable types for non-fixed-effect variables
+        # Adjust interest based on fe_indices
+        self.exog = self.exog[:, non_fe_indices]
+        adjusted_exog_names: list[str] = [self.exog_names[i] for i in non_fe_indices]
+        self.exog_names: list[str] = adjusted_exog_names
+        self.interest = self._parse_interest(interest, non_fe_indices)
+
+        # FIGURE OUT REDUNDANT INDICES, PASS PARAMS TO FIT METHODS
+        if self.fixed_effects is not None:
+            endog_demeaned, exog_demeaned = _apply_fixed_effects(self.endog, self.exog, self.fixed_effects)
+            redundant_idx = _redundant_columns(exog_demeaned)
+            print("Redundant columns after applying fixed effects:", [self.exog_names[i] for i in redundant_idx])
+            self.exog = _delete_redundant(exog_demeaned, redundant_idx)
+            self.exog_names = _adjust_names_after_deletion(self.exog_names, redundant_idx)
+            self.interest = _adjust_indices_after_deletion(self.interest, redundant_idx)
+
+        # Detect variable types for interest variables
         self.variable_types = _detect_variable_types(
-            self.exog[:, non_fe_indices], non_fe_indices
+            self.exog, self.interest
         )
         
         # Override with explicit ordinal specification (but respect binary detection)
@@ -185,11 +197,6 @@ class DoublyRobustElasticityEstimatorModel:
                     # Only override to ordinal if not already detected as binary
                     if self.variable_types[idx] != "binary":
                         self.variable_types[idx] = "ordinal"
-
-        # Apply fixed effects transformation
-        self.endog_demeaned, self.exog_demeaned = _apply_fixed_effects(
-            self.endog, self.exog, fixed_effects, self.exog_names
-        )
 
 
     def fit(self, n_folds: int = 5, random_state: Optional[int] = None,
@@ -267,30 +274,48 @@ class DoublyRobustElasticityEstimatorModel:
         theta_x_folds = []  # θ(x) arrays for each fold
         
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(self.exog)):
-            # Split data
-            endog_train, endog_test = self.endog_demeaned[train_idx], self.endog_demeaned[test_idx]
-            exog_train, exog_test = self.exog_demeaned[train_idx], self.exog_demeaned[test_idx]
-            
-            # Original data for nuisance functions (includes fixed effects)
-            # Need to remove fe from here
-            exog_orig_train, exog_orig_test = self.exog[train_idx], self.exog[test_idx]
-            endog_orig_train, endog_orig_test = self.endog[train_idx], self.endog[test_idx]
-            
-            weights_train = self.weights[train_idx] if self.weights is not None else None
-            weights_test = self.weights[test_idx] if self.weights is not None else None
+
+            weight_fold = np.ones(self.nobs)
+            weight_fold[test_idx] = 0
+            if self.weights is not None:
+                weight_fold = weight_fold * self.weights
+
+            if self.fixed_effects is not None:
+                endog_demeaned, exog_demeaned = _apply_fixed_effects(np.log(self.endog), self.exog,
+                                                                     algorithm=self.fixed_effects, weights=weight_fold.reshape(-1,1))
+
+                exog_ols_train = exog_demeaned[train_idx]
+                exog_ols_test = exog_demeaned[test_idx]
+                log_endog_ols_train = endog_demeaned[train_idx]
+                log_endog_ols_test = endog_demeaned[test_idx]
+
+                exog_train = self.exog[train_idx]
+                exog_test = self.exog[test_idx]
+
+            else:
+
+                exog_ols_train = self.exog[train_idx]
+                exog_ols_test = self.exog[test_idx]
+                log_endog_ols_train = np.log(self.endog[train_idx])
+                log_endog_ols_test = np.log(self.endog[test_idx])
+                exog_train = self.exog[train_idx]
+                exog_test = self.exog[test_idx]
+
+            weights_train = weight_fold[train_idx] if self.weights is not None else None
+
             
             # Step 1: Estimate OLS coefficients β on training data
             if weights_train is not None:
-                ols_model = sm.WLS(np.log(endog_orig_train), exog_train, weights=weights_train)
+                ols_model = sm.WLS(log_endog_ols_train, exog_train, weights=weights_train)
             else:
-                ols_model = sm.OLS(np.log(endog_orig_train), exog_train)
+                ols_model = sm.OLS(log_endog_ols_train, exog_train)
             
             ols_results = ols_model.fit()
             beta = ols_results.params
             ols_coefficients.append(beta)
             
             # Compute residuals on test data
-            log_residuals_test = np.log(endog_orig_test) - exog_test @ beta
+            log_residuals_test = log_endog_ols_test - exog_ols_test @ beta
             exp_residuals_test = np.exp(log_residuals_test)  # exp(u_i)
 
             
@@ -298,7 +323,7 @@ class DoublyRobustElasticityEstimatorModel:
             # Using original (non-demeaned) data for nuisance functions
             
             # Estimate m(x) = E[exp(u)|x] using NPModel
-            log_residuals_train = np.log(endog_orig_train) - exog_train @ beta
+            log_residuals_train = ols_results.resid
             exp_residuals_train = np.exp(log_residuals_train)
 
 
@@ -306,12 +331,12 @@ class DoublyRobustElasticityEstimatorModel:
             # Create NPModel with variable types
             print('Training Nuisance Model for fold', fold_idx+1)
             m_model = NNModelNuisance(variable_types=self.variable_types, **m_params['arch_params'])
-            m_results = m_model.fit(exog_orig_train, exp_residuals_train, **m_params['fit_params'])
+            m_results = m_model.fit(exog_train, exp_residuals_train, **m_params['fit_params'])
             m_results_folds.append(m_results)
             
             # Predict m(x) on test data
             # m_prime_test = m'(x) for continuous interest variables, mhat = m(x) for all interest variables, mgrad = m(x+delta) for discrete interest variables
-            m_test, m_prime_test = m_results.derivative(exog_orig_test, interest_indices)
+            m_test, m_prime_test = m_results.derivative(exog_test, interest_indices)
 
             if any(m_test <= 0):
                 raise ValueError("Predicted m(x) has non-positive values, cannot proceed with estimation.")
@@ -323,11 +348,11 @@ class DoublyRobustElasticityEstimatorModel:
             # Estimate density f(x) using DensityModel
             print('Training Density Model for fold', fold_idx+1)
             density_model = NNModelDensity(variable_types=self.variable_types, **density_params['arch_params'])
-            f_results = density_model.fit(exog_orig_train, interest=interest_indices, **density_params['fit_params'])
+            f_results = density_model.fit(exog_train, interest=interest_indices, **density_params['fit_params'])
             f_results_folds.append(f_results)
 
             # alpha_weight = f'(x)/f(x) for continuous interest variables, no idea for binary yet
-            alpha_weights = f_results.alpha_weight(exog_orig_test, interest_indices)
+            alpha_weights = f_results.alpha_weight(exog_test, interest_indices)
             
             # Step 3: Construct moment conditions for each variable of interest
             fold_alpha_x = []  # α(x) for this fold
@@ -369,16 +394,16 @@ class DoublyRobustElasticityEstimatorModel:
                     
                 elif var_type == 'binary':
 
-                    exog_test_flip = exog_orig_test.copy()
+                    exog_test_flip = exog_test.copy()
                     exog_test_flip[:, var_idx] = 1 - exog_test_flip[:, var_idx]  # Flip binary variable
                     m_shifted_test = m_results.predict(exog_test_flip)
                     probability_var = alpha_weights[:, moment_idx]
 
-                    alpha_0 = (1 - exog_orig_test[:, var_idx].astype(np.int64)) * m_shifted_test/(m_test**2 * probability_var) # m1/m0**2 * I(X=0)/P(X=0)
-                    alpha_1 = (exog_orig_test[:, var_idx].astype(np.int64))/(probability_var * m_shifted_test) # 1/(m0*P(X=1)) * I(X=1)
+                    alpha_0 = (1 - exog_test[:, var_idx].astype(np.int64)) * m_shifted_test/(m_test**2 * probability_var) # m1/m0**2 * I(X=0)/P(X=0)
+                    alpha_1 = (exog_test[:, var_idx].astype(np.int64))/(probability_var * m_shifted_test) # 1/(m0*P(X=1)) * I(X=1)
 
-                    correction_0 = (1- exog_orig_test[:, var_idx].astype(np.int64)) * m_shifted_test/m_test # m1/m0 * I(X=0)
-                    correction_1 = (exog_orig_test[:, var_idx].astype(np.int64)) * m_test/m_shifted_test  # m1/m0 * I(X=1)
+                    correction_0 = (1- exog_test[:, var_idx].astype(np.int64)) * m_shifted_test/m_test # m1/m0 * I(X=0)
+                    correction_1 = (exog_test[:, var_idx].astype(np.int64)) * m_test/m_shifted_test  # m1/m0 * I(X=1)
 
                     theta_test = np.exp(beta[var_idx]) * (correction_1 + correction_0) - 1
                     alpha_test = np.exp(beta[var_idx]) * (alpha_1 - alpha_0)
@@ -431,16 +456,11 @@ class DoublyRobustElasticityEstimatorModel:
             # Store fold diagnostics
             alpha_x_folds.append(np.column_stack(fold_alpha_x) if fold_alpha_x else np.array([]))
             theta_x_folds.append(np.column_stack(fold_theta_x) if fold_theta_x else np.array([]))
-            
-            # Add OLS moment conditions (these don't need orthogonalization)
-            for j in range(self.exog.shape[1]):
-                moments[test_idx, len(interest_indices) + j] = (
-                    log_residuals_test * exog_test[:, j]
-                )
-            
+
+
             # Track fold weights for averaging
-            if weights_test is not None:
-                fold_weights[test_idx] = weights_test
+            if self.weights is not None:
+                fold_weights[test_idx] = self.weights[test_idx]
             else:
                 fold_weights[test_idx] = 1.0
         
@@ -511,7 +531,7 @@ class DoublyRobustElasticityEstimatorModel:
                                        'input_size': 0,
                                        'output_size': 0}
 
-        m_params['arch_params']['input_size'] = self.exog_demeaned.shape[1]
+        m_params['arch_params']['input_size'] = self.exog.shape[1]
         m_params['arch_params']['output_size'] = 1
 
         return m_params
@@ -543,6 +563,23 @@ class DoublyRobustElasticityEstimatorModel:
             density_params['fit_params'] = {}
 
         return density_params
+
+    def _parse_interest(self, interest, non_fe_indices):
+        if interest is None:
+            interest = [i for i in range(len(non_fe_indices))]
+        else:
+            if isinstance(interest, int) or isinstance(interest, str):
+                interest = [interest]
+            elif not isinstance(interest, list):
+                raise ValueError("interest must be an int, str, or list of int/str")
+
+            if self.exog_names and isinstance(interest[0], str):
+                interest = [self.exog_names.index(name) for name in interest if name in self.exog_names]
+            interest = [non_fe_indices.index(i) for i in interest if i in non_fe_indices]
+
+        return interest
+
+
 
 
 DREEM = DoublyRobustElasticityEstimatorModel

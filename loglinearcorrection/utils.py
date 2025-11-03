@@ -2,12 +2,28 @@ import numpy as np
 import numpy.typing as npt
 from typing import Literal
 
+import pyhdfe
+
+
+def _initialize_fixed_effects(fixed_effect_columns:npt.NDArray) -> pyhdfe.Algorithm:
+    try:
+        import pyhdfe
+    except ImportError:
+        raise ImportError(
+            "pyhdfe is required for fixed effects estimation. "
+            "Install with: pip install pyhdfe"
+        )
+
+    # Create pyhdfe algorithm and apply demeaning
+    algorithm = pyhdfe.create(fixed_effect_columns, drop_singletons=False)
+    return algorithm
+
 
 def _apply_fixed_effects(
     endog: npt.NDArray[np.floating],
     exog: npt.NDArray[np.floating],
-    fixed_effects: list[str] | list[int] | None,
-    exog_names: list[str] | None = None,
+    algorithm,
+    weights:npt.NDArray[np.floating] = None
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
     """
     Apply within-group demeaning transformation for fixed effects.
@@ -71,41 +87,12 @@ def _apply_fixed_effects(
     >>> exog = np.array([[1.0, 0.0], [2.0, 0.0], [3.0, 1.0], [4.0, 1.0]])
     >>> endog_dm, exog_dm = _apply_fixed_effects(endog, exog, [1])
     """
-    if fixed_effects is None:
-        return endog.copy(), exog.copy()
+    if algorithm is None:
+        return endog, exog
 
-    try:
-        import pyhdfe
-    except ImportError:
-        raise ImportError(
-            "pyhdfe is required for fixed effects estimation. "
-            "Install with: pip install pyhdfe"
-        )
-
-    # Resolve fixed effects indices
-    if isinstance(fixed_effects[0], str):
-        if exog_names is None:
-            raise ValueError(
-                "exog_names must be provided when fixed_effects contains strings"
-            )
-        fe_indices = [exog_names.index(name) for name in fixed_effects]
-    else:
-        fe_indices = list(fixed_effects)
-
-    # Extract fixed effects columns
-    fe_cols = exog[:, fe_indices]
-    if fe_cols.ndim == 1:
-        fe_cols = fe_cols.reshape(-1, 1)
-
-    # Extract non-fixed-effects columns
-    non_fe_indices = [i for i in range(exog.shape[1]) if i not in fe_indices]
-    exog_non_fe = exog[:, non_fe_indices]
-
-    # Create pyhdfe algorithm and apply demeaning
-    algorithm = pyhdfe.create(fe_cols, drop_singletons=False)
     endog_reshaped = endog.reshape(-1, 1)
-    combined = np.column_stack([exog_non_fe, endog_reshaped])
-    demeaned = algorithm.residualize(combined)
+    combined = np.column_stack([exog, endog_reshaped])
+    demeaned = algorithm.residualize(combined, weights=weights)
 
     # Split back into exog and endog
     exog_demeaned = demeaned[:, :-1]
@@ -113,6 +100,125 @@ def _apply_fixed_effects(
 
     return endog_demeaned, exog_demeaned
 
+def _redundant_columns(exog_demeaned: npt.NDArray[np.floating]) -> npt.NDArray[np.integer]:
+    """
+    Identify redundant columns in demeaned exogenous variables.
+
+    Redundant columns are those that are constant (zero variance)
+    after demeaning, which can occur when fixed effects perfectly
+    predict certain variables.
+
+    Parameters
+    ----------
+    exog_demeaned : ndarray
+        Demeaned independent variables of shape (nobs, k_vars).
+
+    Returns
+    -------
+    redundant_indices : ndarray
+        Indices of redundant columns in `exog_demeaned`.
+
+    Examples
+    --------
+    >>> exog_dm = np.array([[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]])
+    >>> redundant_idxs = _redundant_columns(exog_dm)
+    >>> redundant_idxs
+    array([0])
+    """
+    redundant_indices = np.where(np.all(np.abs(exog_demeaned) < 1e-6, axis=0))[0]
+
+    return redundant_indices
+
+def _delete_redundant(exog_demeaned, redundant_indices: npt.NDArray[np.integer]) -> npt.NDArray[np.floating]:
+    """
+    Remove redundant columns from demeaned exogenous variables.
+
+    Identifies and removes columns that are constant (zero variance)
+    after demeaning, which can occur when fixed effects perfectly
+    predict certain variables.
+
+    Parameters
+    ----------
+    exog_demeaned : ndarray
+        Demeaned independent variables of shape (nobs, k_vars).
+
+    Returns
+    -------
+    exog_cleaned : ndarray
+        Exogenous variables with redundant columns removed,
+        shape (nobs, k_cleaned), where k_cleaned ≤ k_vars.
+
+    Examples
+    --------
+    >>> exog_dm = np.array([[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]])
+    >>> exog_clean = _delete_redundant(exog_dm)
+    >>> exog_clean
+    array([[1.],
+           [2.],
+           [3.]])
+    """
+    exog_demeaned_clean = np.delete(exog_demeaned, redundant_indices, axis=1)
+    return exog_demeaned_clean
+
+def _adjust_indices_after_deletion(interest:list[int], redundant_indices: npt.NDArray[np.integer]) -> list[int]:
+    """
+    Adjust interest variable indices after removing redundant columns.
+
+    Parameters
+    ----------
+    interest : list of int
+        Original indices of interest variables.
+    redundant_indices : ndarray
+        Indices of columns removed from exogenous variables.
+
+    Returns
+    -------
+    adjusted_interest : list of int
+        Updated indices of interest variables after column removal.
+
+    Examples
+    --------
+    >>> interest = [0, 2, 3]
+    >>> redundant_indices = np.array([1])
+    >>> adjusted = _adjust_indices_after_deletion(interest, redundant_indices)
+    >>> adjusted
+    [0, 1, 2]
+    """
+    redundant_set = set(redundant_indices.tolist())
+    adjusted = []
+    for idx in interest:
+        if idx in redundant_set:
+            raise ValueError(f"Interest variable at index {idx} was removed as redundant.")
+        shift = np.sum(redundant_indices < idx)
+        adjusted.append(idx - shift)
+    return adjusted
+
+def _adjust_names_after_deletion(names: list[str], redundant_indices: npt.NDArray[np.integer]) -> list[str]:
+    """
+    Adjust variable names list after removing redundant columns.
+
+    Parameters
+    ----------
+    names : list of str
+        Original variable names corresponding to exogenous variables.
+    redundant_indices : ndarray
+        Indices of columns removed from exogenous variables.
+
+    Returns
+    -------
+    adjusted_names : list of str
+        Updated variable names after column removal.
+
+    Examples
+    --------
+    >>> names = ['x1', 'x2', 'x3']
+    >>> redundant_indices = np.array([1])
+    >>> adjusted_names = _adjust_names_after_deletion(names, redundant_indices)
+    >>> adjusted_names
+    ['x1', 'x3']
+    """
+    adjusted_names = [name for i, name in enumerate(names) if i not in redundant_indices]
+    return adjusted_names
 
 def _detect_variable_types(
     exog: npt.NDArray[np.floating],
@@ -174,7 +280,7 @@ def _detect_variable_types(
     variable_types = {}
 
     for i, col_idx in enumerate(indices):
-        n_unique = len(np.unique(exog[:, i]))
+        n_unique = len(np.unique(exog[:, col_idx]))
 
         if n_unique == 2:
             variable_types[col_idx] = "binary"
