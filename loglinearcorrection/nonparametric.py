@@ -548,10 +548,10 @@ class NNModelDensity(NNModel):
             raise ValueError("self.params must be a dict")
 
         shared_defaults = {
-            "hidden_layers": [1028, 1028, 1028, 1028, 1028],
+            "hidden_layers": [1024, 1024, 1024, 1024, 1024],
             "activation": "leaky_relu",
             "output_activation": "identity",
-            "dropout": 0.2,
+            "dropout": 0.3,
             "bias": True,
             "weight_init": "default",
         }
@@ -592,7 +592,7 @@ class NNModelDensity(NNModel):
             epochs: int = 100,
             batch_size: int = 256,
             learning_rate: float = 1e-3,
-            weight_decay: float = 1e-3,
+            weight_decay: float = 1e-2,
             val_frac: float = 0.2,
             patience: int = 20,
             min_delta: float = 0.0,
@@ -1154,6 +1154,7 @@ class NNModelDensityResults(NPModelResultsDensity):
         return np.column_stack(cols).astype(np.float64)
 
     def get_prob_discrete(self, probs: np.ndarray, discrete_x, original_encoding, var_index: int) -> np.ndarray:
+        # This returns P(ObservedData|Other DataPoints), So P(1) for data points which take value 1, P(0) for data which takes 0.
         cond_meta = self.model["cond"][1]
         n = probs.shape[0]
         disc_int = cond_meta.get("interest_disc_indices", [])
