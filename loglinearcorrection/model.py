@@ -239,7 +239,7 @@ class DoublyRobustElasticityEstimatorModel:
         weights_train = weight_fold[train_idx] if self.weights is not None else None
         
         # Step 1: Estimate OLS coefficients
-        ols_model = sm.WLS(log_endog_ols_train, exog_train, weights=weights_train) if weights_train is not None else sm.OLS(log_endog_ols_train, exog_train)
+        ols_model = sm.WLS(log_endog_ols_train, exog_ols_train, weights=weights_train) if weights_train is not None else sm.OLS(log_endog_ols_train, exog_ols_train)
         ols_results = ols_model.fit()
         beta = ols_results.params
         
@@ -255,6 +255,7 @@ class DoublyRobustElasticityEstimatorModel:
         
         m_test, m_prime_test = m_results.derivative(exog_test, interest_indices)
         if any(m_test <= 0):
+            print(m_test[m_test <= 0])
             raise ValueError("Predicted m(x) has non-positive values")
         p_test = exp_residuals_test - m_test
         
@@ -408,7 +409,7 @@ class DoublyRobustElasticityEstimatorModel:
             m_params['arch_params'] = {'hidden_layers': [512, 512, 512],
                                        'input_size': 0,
                                        'output_size': 0,
-                                       'output_activation': 'relu'}
+                                       'output_activation': 'identity'}
 
         m_params['arch_params']['input_size'] = self.exog.shape[1]
         m_params['arch_params']['output_size'] = 1
