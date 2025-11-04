@@ -592,7 +592,7 @@ class NNModelDensity(NNModel):
             epochs: int = 100,
             batch_size: int = 256,
             learning_rate: float = 1e-3,
-            weight_decay: float = 1e-2,
+            weight_decay: float = 1e-3,
             val_frac: float = 0.2,
             patience: int = 20,
             min_delta: float = 0.0,
@@ -696,7 +696,11 @@ class NNModelDensity(NNModel):
         n = X.shape[0]
 
         # model
+        # DROPOUT HAS TO BE 0 FOR SCORE.
         cfg = {**arch_cfg, **dims}
+        if cfg['dropout'] > 0.0 and cfg['output_size'] > 1:
+            cfg['dropout'] = 0.0
+            print('Warning: Dropout in score model biases results with multiple continuous interest, setting to 0.0.')
         model = FeedForwardNNModel(cfg).to(device)
 
         # loss
