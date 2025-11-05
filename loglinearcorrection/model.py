@@ -118,7 +118,7 @@ class DoublyRobustElasticityEstimatorModel:
 
         # Extract names from pandas objects or generate defaults
         self.endog_names = (
-            endog.name if isinstance(endog, pd.Series)
+            endog.name if isinstance(endog, pd.Series) and endog.name is not None
             else endog.columns[0] if isinstance(endog, pd.DataFrame)
             else "y"
         )
@@ -139,12 +139,6 @@ class DoublyRobustElasticityEstimatorModel:
         endog_arr = np.asarray(endog)
         weights_arr = np.asarray(weights) if weights is not None else None
 
-        if not np.issubdtype(endog_arr.dtype, np.number):
-            raise ValueError("endog must contain only numeric data")
-        if not np.issubdtype(exog_arr.dtype, np.number):
-            raise ValueError("exog must contain only numeric data")
-        if weights_arr is not None and not np.issubdtype(weights_arr.dtype, np.number):
-            raise ValueError("weights must contain only numeric data")
 
         # Store original data
         self.endog = endog_arr.ravel()
@@ -170,14 +164,21 @@ class DoublyRobustElasticityEstimatorModel:
             non_fe_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
 
         # Adjust interest based on fe_indices
-        self.exog = self.exog[:, non_fe_indices]
+        self.exog = self.exog[:, non_fe_indices].astype(np.float64)
         adjusted_exog_names: list[str] = [self.exog_names[i] for i in non_fe_indices]
         self.exog_names: list[str] = adjusted_exog_names
         self.interest = self._parse_interest(interest, non_fe_indices)
 
+        if not np.issubdtype(self.endog.dtype, np.number):
+            raise ValueError("endog must contain only numeric data")
+        if not np.issubdtype(self.exog.dtype, np.number):
+            raise ValueError("exog must contain only numeric data")
+        if weights_arr is not None and not np.issubdtype(self.weights.dtype, np.number):
+            raise ValueError("weights must contain only numeric data")
+
         # FIGURE OUT REDUNDANT INDICES, PASS PARAMS TO FIT METHODS
         if self.fixed_effects is not None:
-            endog_demeaned, exog_demeaned = _apply_fixed_effects(self.endog, self.exog, self.fixed_effects)
+            endog_demeaned, exog_demeaned = _apply_fixed_effects(np.log(self.endog), self.exog, self.fixed_effects)
             redundant_idx = _redundant_columns(exog_demeaned)
             print("Redundant columns after applying fixed effects:", [self.exog_names[i] for i in redundant_idx])
             self.exog = _delete_redundant(exog_demeaned, redundant_idx)
@@ -350,10 +351,10 @@ class DoublyRobustElasticityEstimatorModel:
         fold_results = []
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(self.exog)):
             weight_fold = np.ones(self.nobs)
-            weight_fold[test_idx] = 0
+            weight_fold[test_idx] = 1e-10 # temporary hack to prevent fe from dying on zero weights
             if self.weights is not None:
                 weight_fold = weight_fold * self.weights
-            
+
             print(f'Processing fold {fold_idx+1}/{n_folds}')
             fold_result = self._process_fold(
                 train_idx, test_idx, weight_fold, 
@@ -504,10 +505,10 @@ class DoublyRobustElasticityEstimatorModel:
         import pyfixest
         df = pd.DataFrame(self.exog, columns=self.exog_names)
         df[self.endog_names] = self.endog
-        fe_names = list(self.fe_cols) if getattr(self, "fe_cols", None) is not None else []
+        fe_names = [f'F{i}' for i in range(self.fe_cols.shape[1])] if getattr(self, "fe_cols", None) is not None else []
 
         if fe_names:
-            fe_df = pd.DataFrame(self.fixed_effects, columns=fe_names)
+            fe_df = pd.DataFrame(self.fe_cols, columns=fe_names)
             df = pd.concat([df, fe_df], axis=1)
 
 
