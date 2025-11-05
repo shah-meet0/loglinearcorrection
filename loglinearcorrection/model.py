@@ -157,6 +157,7 @@ class DoublyRobustElasticityEstimatorModel:
             non_fe_indices = list(range(self.exog.shape[1]))
             self.fe_indices = []
             self.fixed_effects = None
+            self.fe_cols = None
         else:
             if self.exog_names and isinstance(fixed_effects[0], str):
                 fe_indices = [self.exog_names.index(name) for name in fixed_effects]
@@ -164,6 +165,7 @@ class DoublyRobustElasticityEstimatorModel:
                 fe_indices = list(set(fixed_effects))
 
             self.fe_indices = fe_indices
+            self.fe_cols = self.exog[:, fe_indices]
             self.fixed_effects = _initialize_fixed_effects(self.exog[:, fe_indices])
             non_fe_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
 
@@ -181,6 +183,11 @@ class DoublyRobustElasticityEstimatorModel:
             self.exog = _delete_redundant(exog_demeaned, redundant_idx)
             self.exog_names = _adjust_names_after_deletion(self.exog_names, redundant_idx)
             self.interest = _adjust_indices_after_deletion(self.interest, redundant_idx)
+            self.ols_res = sm.WLS(endog_demeaned, exog_demeaned, weights=self.weights if self.weights else 1).fit()
+            self.beta = self.ols_res.params
+        else:
+            self.ols_res = sm.WLS(np.log(self.endog), self.exog, weights=self.weights if self.weights else 1).fit()
+            self.beta = self.ols_res.params
 
         # Detect variable types for interest variables
         self.variable_types = _detect_variable_types(
@@ -255,9 +262,9 @@ class DoublyRobustElasticityEstimatorModel:
         
         m_test, m_prime_test = m_results.derivative(exog_test, interest_indices)
         if any(m_test <= 0):
-            print(m_test[m_test <= 0])
             raise ValueError("Predicted m(x) has non-positive values")
         p_test = exp_residuals_test - m_test
+        real_resid_fold = np.exp(self.ols_res.resid[test_idx])
         
         # Estimate density
         density_model = NNModelDensity(variable_types=self.variable_types, **density_params['arch_params'])
@@ -265,7 +272,11 @@ class DoublyRobustElasticityEstimatorModel:
         alpha_weights = f_results.alpha_weight(exog_test, interest_indices)
         
         # Step 3: Construct moments
-        fold_moments = np.zeros((len(test_idx), len(interest_indices)))
+        n_interest = len(interest_indices)
+        fold_moments = np.zeros((len(test_idx), n_interest))
+        fold_derivative = np.zeros((len(test_idx), n_interest, 2 * n_interest)) # First len(interest) for elasticities, second elasiticities w.r.t beta
+        identity = np.eye(n_interest)
+        fold_derivative[:, :n_interest, :n_interest] = -1 * identity # fill in ones on interest diagonal
         fold_alpha_x = []
         fold_theta_x = []
         
@@ -276,7 +287,10 @@ class DoublyRobustElasticityEstimatorModel:
                 alpha_weight = alpha_weights[:, moment_idx]
                 alpha_test = -alpha_weight / m_test
                 m_semi_elast_test = m_prime_test[:, moment_idx] / m_test
-                theta_test = beta[var_idx] + m_semi_elast_test
+                theta_test = self.beta[var_idx] + m_semi_elast_test
+
+                fold_derivative[:, moment_idx, n_interest:] = identity[moment_idx, :]  - (alpha_test  * real_resid_fold)[:, None] * exog_test[:, interest_indices]
+
             elif var_type == 'binary':
                 # Binary variable logic (keeping existing implementation)
                 exog_test_flip = exog_test.copy()
@@ -289,8 +303,13 @@ class DoublyRobustElasticityEstimatorModel:
                 correction_0 = (1- exog_test[:, var_idx].astype(np.int64)) * m_shifted_test/m_test
                 correction_1 = (exog_test[:, var_idx].astype(np.int64)) * m_test/m_shifted_test
                 
-                theta_test = np.exp(beta[var_idx]) * (correction_1 + correction_0) - 1
-                alpha_test = np.exp(beta[var_idx]) * (alpha_1 - alpha_0)
+                theta_test = np.exp(self.beta[var_idx]) * (correction_1 + correction_0) - 1
+                alpha_test = np.exp(self.beta[var_idx]) * (alpha_1 - alpha_0)
+
+                derivative_leading_term = np.zeros(shape=(len(test_idx), n_interest))
+                derivative_leading_term[:, moment_idx] = theta_test + 1 + alpha_test * (real_resid_fold - m_test)
+                derivative_second_term = (-1 * alpha_test * real_resid_fold)[:, None] * exog_test[:, interest_indices]
+                fold_derivative[:, moment_idx, n_interest:] = derivative_leading_term + derivative_second_term
             else:  # ordinal
                 theta_test = 0
                 alpha_test = 0
@@ -304,6 +323,7 @@ class DoublyRobustElasticityEstimatorModel:
             'm_results': m_results,
             'f_results': f_results,
             'moments': fold_moments,
+            'derivative': fold_derivative,
             'alpha_x': np.column_stack(fold_alpha_x) if fold_alpha_x else np.array([]),
             'theta_x': np.column_stack(fold_theta_x) if fold_theta_x else np.array([]),
             'test_idx': test_idx
@@ -311,7 +331,7 @@ class DoublyRobustElasticityEstimatorModel:
 
 
     def fit(self, n_folds: int = 5, random_state: Optional[int] = None,
-            m_params: Dict = None, density_params: Dict = None) -> 'DREEMR':
+            m_params: Dict = None, density_params: Dict = None, fit_ppml = False) -> 'DREEMR':
         """Fit the Doubly Robust Nonparametric Orthogonal elasticity estimator."""
         
         m_params = self._parse_m_params(m_params)
@@ -342,18 +362,29 @@ class DoublyRobustElasticityEstimatorModel:
             fold_results.append(fold_result)
         
         # Aggregate moments across folds
-        n_params = len(interest_indices) + self.exog.shape[1]
+        n_interest = len(interest_indices)
+        n_params = (2 + fit_ppml) * n_interest # Elasticities for interest  + OLS params for interest + PPML params if applicable
         moments = np.zeros((self.nobs, n_params))
+        derivative = np.zeros(shape=(self.nobs, n_params, n_params))
         fold_weights = np.zeros(self.nobs)
         
         for fold in fold_results:
-            moments[fold['test_idx'], :len(interest_indices)] = fold['moments']
+            moments[fold['test_idx'], :n_interest] = fold['moments']
             fold_weights[fold['test_idx']] = self.weights[fold['test_idx']] if self.weights is not None else 1.0
-        
+            derivative[fold['test_idx'], :n_interest, :2*n_interest] = fold['derivative']
+
+        ols_moments, ols_derivative = self._process_ols(interest_indices)
+        moments[:,n_interest: 2 * n_interest] = ols_moments
+        derivative[:, n_interest: 2 * n_interest, n_interest:2*n_interest] = ols_derivative
+
+        if fit_ppml:
+            ppml_moments, ppml_derivative, ppml_params = self._process_ppml(interest_indices)
+            moments[:, 2 * n_interest:] = ppml_moments
+            derivative[:, 2 * n_interest:, 2 * n_interest:] = ppml_derivative
+
         # Extract point estimates
         moment_means = np.average(moments, axis=0, weights=fold_weights)
         elasticity_estimates = moment_means[:len(interest_indices)]
-        avg_beta = np.mean([f['beta'] for f in fold_results], axis=0)
         
         # Prepare data based on input type
         is_pandas = hasattr(self, '_original_is_pandas') and self._original_is_pandas
@@ -372,7 +403,8 @@ class DoublyRobustElasticityEstimatorModel:
         # Create results object
         results = DREEMR(
             elasticities=elasticities_df,
-            beta=avg_beta,
+            beta=self.beta[interest_indices],
+            ols_results=self.ols_res,
             exog_names=self.exog_names,
             endog_name=self.endog_names,
             n_folds=n_folds,
@@ -381,7 +413,9 @@ class DoublyRobustElasticityEstimatorModel:
             interest_indices=interest_indices,
             fold_results=fold_results,
             moments=moments,
-            fold_weights=fold_weights
+            derivative = derivative,
+            fold_weights=fold_weights,
+            gamma = ppml_params if fit_ppml else None
         )
         
         # Compute variances
@@ -394,7 +428,7 @@ class DoublyRobustElasticityEstimatorModel:
             m_params = {'arch_params': {'hidden_layers': [512, 512, 512],
                                         'input_size': 0,
                                         'output_size': 0,
-                                        'output_activation': 'relu'
+                                        'output_activation': 'identity'
                                         },
                         'fit_params': {}}
 
@@ -458,6 +492,37 @@ class DoublyRobustElasticityEstimatorModel:
             interest = [non_fe_indices.index(i) for i in interest if i in non_fe_indices]
 
         return interest
+
+    def _process_ols(self, interest_indices: list[int]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        resid = self.ols_res.resid
+        relevant_exog = self.exog[:, interest_indices]
+        moments_ols = resid[:, None] * relevant_exog
+        derivatives_ols = relevant_exog[:, :, None] * relevant_exog[:, None, :]
+        return moments_ols, derivatives_ols
+
+    def _process_ppml(self, interest_indices: list[int]) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        import pyfixest
+        df = pd.DataFrame(self.exog, columns=self.exog_names)
+        df[self.endog_names] = self.endog
+        fe_names = list(self.fe_cols) if getattr(self, "fe_cols", None) is not None else []
+
+        if fe_names:
+            fe_df = pd.DataFrame(self.fixed_effects, columns=fe_names)
+            df = pd.concat([df, fe_df], axis=1)
+
+
+        exog_part = " + ".join(self.exog_names) if self.exog_names else "1"
+        fe_part = " + ".join(fe_names)
+        # PPML with FEs typically drops the intercept to avoid collinearity with FEs
+        formula = f"{self.endog_names} ~ {exog_part}" + (f" | {fe_part}" if fe_part else "")
+
+        ppml_model = pyfixest.fepois(formula, data=df, drop_intercept=True) # Weights not supported
+        resid = ppml_model.resid()
+        negative_fitted_values = resid + self.endog
+        ppml_moments = resid[:, None] * self.exog[:, interest_indices]
+        ppml_derivatives = negative_fitted_values[:, None, None] * (self.exog[:, interest_indices, None] * self.exog[:, None, interest_indices])
+        ppml_params = ppml_model.coef().loc[[self.exog_names[i] for i in interest_indices]].values
+        return ppml_moments, ppml_derivatives, ppml_params
 
 
 

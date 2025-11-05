@@ -15,7 +15,7 @@ class DoublyRobustElasticityEstimatorModelResults:
     
     Parameters
     ----------
-    elasticities : dict
+    elasticities : Union[pd.DataFrame, npt.ndarray]
         Dictionary mapping variable names to elasticity information:
         - 'estimate': float - Point estimate of elasticity
         - 'type': str - Variable type ('continuous', 'binary', 'ordinal')
@@ -70,6 +70,7 @@ class DoublyRobustElasticityEstimatorModelResults:
         self,
         elasticities: Union[pd.DataFrame, npt.NDArray[np.float64]],
         beta: npt.NDArray[np.float64],
+        ols_results: Any,
         exog_names: List[str],
         endog_name: str,
         n_folds: int,
@@ -78,10 +79,13 @@ class DoublyRobustElasticityEstimatorModelResults:
         interest_indices: List[int],
         fold_results: List[Dict],
         moments: npt.NDArray[np.float64],
-        fold_weights: npt.NDArray[np.float64]
+        derivative: npt.NDArray[np.float64],
+        fold_weights: npt.NDArray[np.float64],
+        gamma: Optional[npt.NDArray[np.float64]] = None
     ):
         self.elasticities = elasticities
         self.beta = beta
+        self.ols_results = ols_results
         self.exog_names = exog_names
         self.endog_name = endog_name
         self.n_folds = n_folds
@@ -90,7 +94,10 @@ class DoublyRobustElasticityEstimatorModelResults:
         self.interest_indices = interest_indices
         self.fold_results = fold_results
         self.moments = moments
+        self.derivative = derivative
         self.fold_weights = fold_weights
+        self._ppml_fit = gamma is not None
+        self.gamma = gamma
         self._is_pandas = isinstance(elasticities, pd.DataFrame)
         
         # Will be populated by compute_variances()
@@ -119,11 +126,15 @@ class DoublyRobustElasticityEstimatorModelResults:
             
         w = self.fold_weights.reshape(-1, 1)
         W = w / w.sum()
-        V = self.moments.T @ (W * self.moments)
+        S = self.moments.T @ (W * self.moments)
+
+        D = np.average(self.derivative, axis=0, weights=self.fold_weights)
+        D_inv = np.linalg.pinv(D)
+        V = D_inv @ S @ D_inv.T
         
         self._variance_matrix = V
-        elasticity_variances = np.diag(V)[:len(self.interest_indices)]
-        self._standard_errors = np.sqrt(elasticity_variances / self.nobs)
+        elasticity_variances = np.diag(V)
+        self._standard_errors = np.sqrt(elasticity_variances / self.nobs) # we might not want to use nobs, but sum of weights
         
         # Compute confidence intervals
         from scipy import stats
@@ -131,7 +142,7 @@ class DoublyRobustElasticityEstimatorModelResults:
         
         self._confidence_intervals = {}
         if self._is_pandas:
-            self.elasticities['std_err'] = self._standard_errors
+            self.elasticities['std_err'] = self._standard_errors[[i for i in range(len(self.interest_indices))]]
             for i, var_name in enumerate(self.elasticities.index):
                 estimate = self.elasticities.loc[var_name, 'estimate']
                 se = self._standard_errors[i]
@@ -373,11 +384,19 @@ class DoublyRobustElasticityEstimatorModelResults:
         
         print("-" * 70)
         print()
-        print("OLS Coefficients (averaged across folds):")
+        print("OLS Coefficients:")
         print("-" * 70)
-        for i, name in enumerate(self.exog_names):
-            print(f"{name:<20} {self.beta[i]:>11.4f}")
-        print("=" * 70)
+        for i, index in enumerate(self.interest_indices):
+            print(f"{self.exog_names[index]:<20} Coef: {self.beta[i]:>11.4f}")
+        print("-" * 70)
+        if self._ppml_fit:
+            print("-" * 70)
+            print()
+            print("PPML Coefficients:")
+            print("-" * 70)
+            for i, index in enumerate(self.interest_indices):
+                print(f"{self.exog_names[index]:<20} Coef: {self.gamma[i]:>11.4f}")
+            print("=" * 70)
 
     def __repr__(self) -> str:
         """String representation of results."""
