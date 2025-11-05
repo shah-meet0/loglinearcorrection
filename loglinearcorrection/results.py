@@ -5,6 +5,7 @@ from typing import Dict, Any, List, Optional, Union, TYPE_CHECKING
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from loglinearcorrection.hypothesis import CoefDiffTest
 
 class DoublyRobustElasticityEstimatorModelResults:
     """
@@ -341,7 +342,73 @@ class DoublyRobustElasticityEstimatorModelResults:
         m_x = np.mean(m_predictions, axis=0)
         
         return np.exp(log_pred) * m_x
-    
+
+    def difference_test(self, verbose: bool = True) -> CoefDiffTest:
+        """
+        Compare elasticities against OLS, and against PPML if available.
+        Assumes self._variance_matrix orders blocks as [Elasticities | OLS | PPML]
+        with block length k = len(self.interest_indices). Uses vcov = V / n.
+        """
+        if self._variance_matrix is None:
+            self.compute_variances()
+
+        k = len(self.interest_indices)
+
+        # Names in interest order
+        names = [self.exog_names[i] for i in self.interest_indices]
+
+        # Elasticity vector in interest order
+        if self._is_pandas:
+            elast = np.asarray([self.elasticities.loc[n, "estimate"] for n in names], dtype=float)
+        else:
+            elast = np.asarray(self.elasticities[:k], dtype=float)
+
+        # OLS vector in interest order
+        beta_vec = (np.asarray(self.beta[:k], float)
+                    if self.beta.shape[0] == k
+                    else np.asarray([self.beta[idx] for idx in self.interest_indices], float))
+
+        # PPML vector if present
+        if self._ppml_fit:
+            gamma_vec = (np.asarray(self.gamma[:k], float)
+                         if self.gamma.shape[0] == k
+                         else np.asarray([self.gamma[idx] for idx in self.interest_indices], float))
+
+        # Concatenate in required order: [Elasticities | OLS | (PPML)]
+        coefs = np.concatenate([elast, beta_vec] + ([gamma_vec] if self._ppml_fit else []), axis=0)
+
+        # Scale V by effective n
+        V = np.asarray(self._variance_matrix, dtype=float)
+        n_eff = float(self.nobs)
+        Vn = V / n_eff
+
+        if Vn.shape != (coefs.size, coefs.size):
+            raise ValueError(f"vcov shape {Vn.shape} does not match concatenated coef length {coefs.size}")
+
+        # Run tests: (Elasticities − OLS) and optionally (Elasticities − PPML)
+        test = CoefDiffTest(n=self.nobs, k=k, coefs=coefs, vcov=Vn)
+
+        if verbose:
+            # Results are ordered first for Elasticities−OLS, then Elasticities−PPML
+            for j in range(k):
+                print(f"{names[j]}:")
+                if self._ppml_fit:
+                    print(
+                        f"  Elasticity estimate: {elast[j]:.3f}  OLS estimate: {beta_vec[j]:.3f}  PPML estimate: {gamma_vec[j]:.3f}")
+                else:
+                    print(f"  Elasticity estimate: {elast[j]:.6g}  OLS estimate: {beta_vec[j]:.6g}")
+
+                r_ols = test.results[j]
+                print(
+                    f"  Hypothesis test: DREEM = OLS    Statistic: {r_ols.statistic:.2f}  p-value: {r_ols.p_value:.4f}")
+
+                if self._ppml_fit:
+                    r_ppml = test.results[k + j]
+                    print(
+                        f"  Hypothesis test: DREEM = PPML   Statistic: {r_ppml.statistic:.2f}  p-value: {r_ppml.p_value:.4f}")
+                print()
+
+        return test
 
     def summary(self) -> None:
         """Print summary of estimation results."""
