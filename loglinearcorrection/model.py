@@ -119,7 +119,7 @@ class DoublyRobustElasticityEstimatorModel:
         # Extract names from pandas objects or generate defaults
         self.endog_names = (
             endog.name if isinstance(endog, pd.Series) and endog.name is not None
-            else endog.columns[0] if isinstance(endog, pd.DataFrame)
+            else endog.columns[0] if isinstance(endog, pd.DataFrame) and endog.columns[0] != 0
             else "y"
         )
 
@@ -516,6 +516,7 @@ class DoublyRobustElasticityEstimatorModel:
         fe_part = " + ".join(fe_names)
         # PPML with FEs typically drops the intercept to avoid collinearity with FEs
         formula = f"{self.endog_names} ~ {exog_part}" + (f" | {fe_part}" if fe_part else "")
+
 
         ppml_model = pyfixest.fepois(formula, data=df, drop_intercept=True) # Weights not supported
         resid = ppml_model.resid()
