@@ -95,37 +95,6 @@ class FeedForwardNNModel(nn.Module):
         return self.model(x)
 
 
-class SlicedScoreMatchingLoss(nn.Module):
-    def __init__(self, M:int=1):
-        """
-        Initialize the Sliced Score Matching loss.
-
-        Parameters
-        ----------
-        n_projections : int
-            Number of random projections to use.
-        """
-        super().__init__()
-        self.M = M
-
-    @torch.enable_grad()
-    def forward(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        x = x.detach().requires_grad_(True) # First make sure computation graph starts at x
-        loss = torch.zeros((), device=x.device)
-        feat_dims = tuple(range(1, x.ndim))
-
-        for _ in range(self.M):
-            v = torch.randn_like(x)  # pv with E[v v^T] = I
-            h = model(x)  # h_theta(x), same shape as x # This is an estimate of the score
-            hv = (h * v).sum(dim=feat_dims)  # v^T h(x), per-sample
-            # ∇_x (v^T h(x))
-            grad_hv = torch.autograd.grad(hv.sum(), x, create_graph=True)[0]
-            # v^T [∇_x h(x)] v  =  (∇_x (v^T h(x))) · v
-            jvp = (grad_hv * v).sum(dim=feat_dims)  # per-sample
-            loss = loss + 0.5 * (hv ** 2) + jvp
-        return loss.mean() / self.M
-
-
 class NullNN(nn.Module):
     def __init__(self, input_size=0, output_size=0):
         super().__init__()
@@ -205,3 +174,33 @@ class ScoreMatchingLossRestricted(nn.Module):
 
         loss = (sq + div).mean()
         return loss
+
+# class SlicedScoreMatchingLoss(nn.Module):
+#     def __init__(self, M:int=1):
+#         """
+#         Initialize the Sliced Score Matching loss.
+#
+#         Parameters
+#         ----------
+#         n_projections : int
+#             Number of random projections to use.
+#         """
+#         super().__init__()
+#         self.M = M
+#
+#     @torch.enable_grad()
+#     def forward(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+#         x = x.detach().requires_grad_(True) # First make sure computation graph starts at x
+#         loss = torch.zeros((), device=x.device)
+#         feat_dims = tuple(range(1, x.ndim))
+#
+#         for _ in range(self.M):
+#             v = torch.randn_like(x)  # pv with E[v v^T] = I
+#             h = model(x)  # h_theta(x), same shape as x # This is an estimate of the score
+#             hv = (h * v).sum(dim=feat_dims)  # v^T h(x), per-sample
+#             # ∇_x (v^T h(x))
+#             grad_hv = torch.autograd.grad(hv.sum(), x, create_graph=True)[0]
+#             # v^T [∇_x h(x)] v  =  (∇_x (v^T h(x))) · v
+#             jvp = (grad_hv * v).sum(dim=feat_dims)  # per-sample
+#             loss = loss + 0.5 * (hv ** 2) + jvp
+#         return loss.mean() / self.M

@@ -3,6 +3,8 @@ from loglinearcorrection.model import DoublyRobustElasticityEstimatorModel as DR
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
 
+# This module tests estimation using DREEM
+
 # Data
 np.random.seed(42)  # For reproducibility
 n = 15000
