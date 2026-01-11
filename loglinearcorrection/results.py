@@ -406,6 +406,13 @@ class DoublyRobustElasticityEstimatorModelResults:
                     r_ppml = test.results[k + j]
                     print(
                         f"  Hypothesis test: DREEM = PPML   Statistic: {r_ppml.statistic:.2f}  p-value: {r_ppml.p_value:.4f}")
+
+                    # OLS vs PPML (new block comparison)
+                    r_ols_ppml = test.results[2 * k + j]
+                    print(
+                        f"  Hypothesis test: OLS = PPML     "
+                        f"Statistic: {r_ols_ppml.statistic:.2f}  p-value: {r_ols_ppml.p_value:.4f}"
+                    )
                 print()
 
         return test
