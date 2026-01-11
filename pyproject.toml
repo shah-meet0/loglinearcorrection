@@ -1,6 +1,6 @@
 [project]
 name = "loglinearcorrection"
-version = "0.2.0"
+version = "0.3.0"
 description = ""
 authors = [
     {name = "Ellen Munroe"},
@@ -8,7 +8,7 @@ authors = [
     {name = "Meet Shah"},
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 dependencies = [
     "numpy (>=2.0.0,<3.0.0)",
     "scipy (>=1.15.2,<2.0.0)",
@@ -21,6 +21,7 @@ dependencies = [
     "openpyxl (>=3.1.5,<4.0.0)",
     "numdifftools (>=0.9.41,<0.10.0)",
     "pyhdfe (>=0.2.0,<0.3.0)",
+    "torch (>=2.9.0,<3.0.0)",
 
 ]
 
