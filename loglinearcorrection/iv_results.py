@@ -17,22 +17,22 @@ import pandas as pd
 class IVDoublyRobustElasticityEstimatorModelResults:
     """
     Results container for the IV-DRNO estimator.
-    
+
     Stores estimation results and provides methods for inference
     based on the fitted IV-DRNO model.
-    
+
     Parameters
     ----------
     elasticities : Union[pd.DataFrame, ndarray]
         Elasticity estimates for interest variables.
     beta : ndarray
-        Control function OLS coefficients on X.
-    gamma : ndarray or None
+        Control function OLS coefficients on X (interest variables).
+    delta : ndarray or None
         Control function OLS coefficients on exogenous controls W.
     rho : ndarray
         Control function OLS coefficients on V.
-    ols_results : statsmodels results
-        Full OLS results from control function estimation.
+    ols_results : statsmodels results or None
+        Full OLS results (None with cross-fitting).
     exog_names : list of str
         Names of endogenous variables X.
     endog_name : str
@@ -53,11 +53,13 @@ class IVDoublyRobustElasticityEstimatorModelResults:
         Detailed results from each fold.
     moments : ndarray
         Moment conditions for all observations.
+    derivative : ndarray
+        Derivative matrix for sandwich variance.
     fold_weights : ndarray
         Weights for each observation.
     V_hat : ndarray
         Estimated control function residuals.
-        
+
     Attributes
     ----------
     standard_errors : ndarray
@@ -65,12 +67,12 @@ class IVDoublyRobustElasticityEstimatorModelResults:
     confidence_intervals : dict
         95% confidence intervals.
     """
-    
+
     def __init__(
         self,
         elasticities: Union[pd.DataFrame, npt.NDArray[np.float64]],
         beta: npt.NDArray[np.float64],
-        gamma: Optional[npt.NDArray[np.float64]],
+        delta: Optional[npt.NDArray[np.float64]],
         rho: npt.NDArray[np.float64],
         ols_results: Any,
         exog_names: List[str],
@@ -83,12 +85,13 @@ class IVDoublyRobustElasticityEstimatorModelResults:
         interest_indices: List[int],
         fold_results: List[Dict],
         moments: npt.NDArray[np.float64],
+        derivative: npt.NDArray[np.float64],
         fold_weights: npt.NDArray[np.float64],
         V_hat: npt.NDArray[np.float64]
     ):
         self.elasticities = elasticities
         self.beta = beta
-        self.gamma = gamma
+        self.delta = delta
         self.rho = rho
         self.ols_results = ols_results
         self.exog_names = exog_names
@@ -101,11 +104,12 @@ class IVDoublyRobustElasticityEstimatorModelResults:
         self.interest_indices = interest_indices
         self.fold_results = fold_results
         self.moments = moments
+        self.derivative = derivative
         self.fold_weights = fold_weights
         self.V_hat = V_hat
-        
+
         self._is_pandas = isinstance(elasticities, pd.DataFrame)
-        
+
         # Will be populated by compute_variances()
         self._standard_errors = None
         self._variance_matrix = None
@@ -125,93 +129,55 @@ class IVDoublyRobustElasticityEstimatorModelResults:
             self.compute_variances()
         return self._confidence_intervals
     
-    def compute_variances(self, include_ols_moments: bool = True) -> None:
+    def compute_variances(self) -> None:
         """
         Compute variance-covariance matrix and standard errors.
-        
-        Uses the influence function representation:
-            sqrt(n)(θ̂ - θ_0) →_d N(0, Var(ψ))
-        
-        where ψ is the stacked moment/influence function:
-            ψ = [ψ_θ, ψ_OLS] for joint inference on (elasticities, β, γ, ρ)
-        
-        Parameters
-        ----------
-        include_ols_moments : bool, default=True
-            If True, include OLS influence function for joint inference
-            on all parameters. If False, only compute variance for elasticities.
+
+        Uses sandwich formula:
+            V = D^{-1} S D^{-1}'
+
+        where:
+            D = E[∂ψ/∂θ] (Jacobian)
+            S = E[ψ ψ'] (moment variance)
+
+        The asymptotic variance of sqrt(n)(θ̂ - θ_0) is V.
         """
         if self._standard_errors is not None:
             return  # Already computed
-        
+
         n = self.nobs
         n_interest = len(self.interest_indices)
-        
-        # Get elasticity moments
-        moments_theta = self.moments  # shape (n, n_interest)
-        
-        # Compute OLS influence function for joint inference
-        if include_ols_moments and self.ols_results is not None:
-            # Get dimensions
-            k_x = len(self.exog_names)
-            k_w = len(self.control_names) if self.control_names else 0
-            k_v = self.V_hat.shape[1] if self.V_hat.ndim > 1 else 1
-            k_total = k_x + k_w + k_v
-            
-            # OLS influence function: ψ_i = (X'X)^{-1} X_i ε_i
-            # We need to reconstruct the design matrix
-            resid = self.ols_results.resid
-            
-            # Build design matrix [X_endog, W, V]
-            # This requires access to original data - for now use approximation
-            # based on normalized covariance and residuals
-            try:
-                # (X'X)^{-1} from statsmodels
-                bread = self.ols_results.normalized_cov_params
-                
-                # Approximate influence using residual heterogeneity
-                # Full version would need stored design matrix
-                ols_influence = np.zeros((n, k_total))
-                
-                # Scale residuals by diagonal of bread matrix
-                for j in range(k_total):
-                    ols_influence[:, j] = resid * np.sqrt(bread[j, j])
-                    
-            except Exception:
-                # Fallback: just use residuals
-                ols_influence = np.zeros((n, k_total))
-                ols_influence[:, 0] = resid
-            
-            # Stack moments
-            stacked_moments = np.column_stack([moments_theta, ols_influence])
-            n_params_total = n_interest + k_total
-        else:
-            stacked_moments = moments_theta
-            n_params_total = n_interest
-        
-        # Compute variance matrix
+
+        # Compute weighted averages
         w = self.fold_weights.reshape(-1, 1)
         W = w / w.sum()
-        
+
         # Moment variance: S = E[ψ ψ']
-        S = stacked_moments.T @ (W * stacked_moments)
-        
-        self._variance_matrix = S
-        self._full_variance_matrix = S
-        
+        S = self.moments.T @ (W * self.moments)
+
+        # Jacobian: D = E[∂ψ/∂θ]
+        D = np.average(self.derivative, axis=0, weights=self.fold_weights)
+
+        # Sandwich variance: V = D^{-1} S D^{-1}'
+        D_inv = np.linalg.pinv(D)
+        V = D_inv @ S @ D_inv.T
+
+        self._variance_matrix = V
+        self._full_variance_matrix = V
+
         # Standard errors for elasticities (first n_interest components)
-        variances_theta = np.diag(S)[:n_interest]
-        self._standard_errors = np.sqrt(variances_theta / n)
-        
+        elasticity_variances = np.diag(V)[:n_interest]
+        self._standard_errors = np.sqrt(elasticity_variances / n)
+
         # Full standard errors (all parameters)
-        self._full_standard_errors = np.sqrt(np.diag(S) / n)
-        
+        self._full_standard_errors = np.sqrt(np.diag(V) / n)
+
         # Confidence intervals for elasticities
         from scipy import stats
         z_score = stats.norm.ppf(0.975)
-        
+
         self._confidence_intervals = {}
-        
+
         if self._is_pandas:
             self.elasticities['std_err'] = self._standard_errors
             for i, var_name in enumerate(self.elasticities.index):
@@ -362,17 +328,21 @@ class IVDoublyRobustElasticityEstimatorModelResults:
             return {'statistic': np.nan, 'p_value': np.nan, 'rho': np.nan}
             
         rho = np.atleast_1d(self.rho)
-        
-        # Get standard error from OLS
-        if self.ols_results is not None and hasattr(self.ols_results, 'bse'):
-            n_exog = len(self.beta) if self.beta is not None else 0
-            rho_se = self.ols_results.bse[n_exog:n_exog + len(rho)]
+
+        # Estimate SE from fold variation or use approximation
+        if self.fold_results:
+            rho_folds = np.array([fold['rho'] for fold in self.fold_results])
+            rho_se = np.std(rho_folds, axis=0) / np.sqrt(len(self.fold_results))
+            rho_se = np.atleast_1d(rho_se)
+            # If SE is too small, use proportion of estimate
+            rho_se = np.maximum(rho_se, np.abs(rho) * 0.05 + 1e-6)
         else:
-            rho_se = np.abs(rho) * 0.1 + 1e-6  # Rough approximation
-            
+            rho_se = np.abs(rho) * 0.1 + 1e-6
+
         # t-test for each rho
         t_stats = rho / (rho_se + 1e-10)
-        p_values = 2 * (1 - stats.t.cdf(np.abs(t_stats), df=self.nobs - len(self.beta) - len(rho)))
+        df = self.nobs - len(self.beta) - len(rho) if self.beta is not None else self.nobs - len(rho)
+        p_values = 2 * (1 - stats.t.cdf(np.abs(t_stats), df=df))
         
         if len(rho) == 1:
             return {
@@ -475,17 +445,135 @@ class IVDoublyRobustElasticityEstimatorModelResults:
             for i, idx in enumerate(self.interest_indices):
                 # self.beta is already sliced to interest_indices
                 print(f"    {self.exog_names[idx]:<20}: {self.beta[i]:>11.4f}")
-        if self.gamma is not None:
-            print("  Exogenous controls (γ):")
+        if self.delta is not None:
+            print("  Exogenous controls (δ):")
             for i, name in enumerate(self.control_names):
-                print(f"    {name:<20}: {self.gamma[i]:>11.4f}")
+                print(f"    {name:<20}: {self.delta[i]:>11.4f}")
         if self.rho is not None:
             rho = np.atleast_1d(self.rho)
             print("  Control function (ρ):")
             for i, r in enumerate(rho):
                 print(f"    V_{i+1:<19}: {r:>11.4f}")
         print("=" * 75)
-        
+
+    def predict_semi_elasticity(
+        self,
+        x: npt.ArrayLike,
+        var_index: int
+    ) -> npt.NDArray[np.float64]:
+        """
+        Compute semi-elasticity at new points for a specific variable.
+
+        Parameters
+        ----------
+        x : array_like
+            Points at which to evaluate semi-elasticity, shape (n_samples, k_vars)
+        var_index : int
+            Index of variable for which to compute semi-elasticity
+
+        Returns
+        -------
+        ndarray
+            Semi-elasticity values θ(x) at each point, shape (n_samples,)
+        """
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+
+        if var_index not in self.interest_indices:
+            raise ValueError(f"Variable at index {var_index} not in interest variables")
+        interest_position = self.interest_indices.index(var_index)
+        var_type = self.variable_types.get(var_index, 'continuous')
+
+        # Average predictions across folds
+        theta_predictions = []
+
+        for fold in self.fold_results:
+            m_results = fold['m_results']
+            beta = fold['beta']
+
+            # Need V values for prediction - use zeros as default (marginal over V)
+            V_dummy = np.zeros((x.shape[0], self.V_hat.shape[1] if self.V_hat.ndim > 1 else 1))
+            m_input = np.column_stack([x, V_dummy])
+
+            if var_type == 'continuous':
+                m_x, m_deriv = m_results.derivative(m_input, [var_index])
+                m_x = np.maximum(m_x, 1e-10)
+                theta = beta[var_index] + m_deriv[:, 0] / m_x
+
+            elif var_type == 'binary':
+                m_x = m_results.predict(m_input)
+                m_x = np.maximum(m_x, 1e-10)
+
+                x_flip = x.copy()
+                x_flip[:, var_index] = 1 - x_flip[:, var_index]
+                m_input_flip = np.column_stack([x_flip, V_dummy])
+                m_flip = m_results.predict(m_input_flip)
+                m_flip = np.maximum(m_flip, 1e-10)
+
+                theta = np.exp(beta[var_index]) * (m_flip / m_x) - 1
+            else:
+                theta = np.zeros(x.shape[0])
+
+            theta_predictions.append(theta)
+
+        return np.mean(theta_predictions, axis=0)
+
+    def predict_log_y(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        """
+        Predict log(y) at new points.
+
+        Uses the control function model: log(y) = β·x (assuming V=0)
+
+        Parameters
+        ----------
+        x : array_like
+            Predictor values, shape (n_samples, k_vars) or (k_vars,)
+
+        Returns
+        -------
+        ndarray
+            Predicted log(y) values
+        """
+        x = np.asarray(x)
+        if x.ndim == 1:
+            return np.dot(x[self.interest_indices], self.beta)
+        return x[:, self.interest_indices] @ self.beta
+
+    def predict_y(self, x: npt.ArrayLike) -> npt.NDArray[np.float64]:
+        """
+        Predict y at new points.
+
+        Uses: y = exp(β·x) * m(x) where m(x) = E[exp(residual)|x]
+
+        Parameters
+        ----------
+        x : array_like
+            Predictor values, shape (n_samples, k_vars) or (k_vars,)
+
+        Returns
+        -------
+        ndarray
+            Predicted y values
+        """
+        x = np.asarray(x)
+        if x.ndim == 1:
+            x = x.reshape(1, -1)
+
+        log_pred = self.predict_log_y(x)
+
+        # Average m(x) predictions across folds
+        m_predictions = []
+        V_dummy = np.zeros((x.shape[0], self.V_hat.shape[1] if self.V_hat.ndim > 1 else 1))
+
+        for fold in self.fold_results:
+            m_input = np.column_stack([x, V_dummy])
+            m_predictions.append(fold['m_results'].predict(m_input))
+
+        m_x = np.mean(m_predictions, axis=0)
+
+        return np.exp(log_pred) * m_x
+
     def __repr__(self) -> str:
         """String representation."""
         n_vars = len(self.interest_indices)

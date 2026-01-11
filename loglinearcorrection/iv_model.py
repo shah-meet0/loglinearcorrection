@@ -23,6 +23,8 @@ import numpy.typing as npt
 import pandas as pd
 from sklearn.model_selection import KFold
 import statsmodels.api as sm
+import torch
+
 
 from .utils import (
     _apply_fixed_effects, _detect_variable_types, _delete_redundant,
@@ -308,26 +310,31 @@ class IVDoublyRobustElasticityEstimatorModel:
             
         return g_pred
     
-    def _estimate_control_function_ols(
+    def _estimate_control_function_ols_fold(
         self,
-        V_hat: np.ndarray,
+        train_idx: np.ndarray,
+        V_hat_full: np.ndarray,
         weight_fold: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, object]:
         """
-        Estimate control function OLS: log Y = β'X + γ'W + ρ'V + ε.
-        
+        Estimate control function OLS on training data only.
+
+        log Y = β'X + δ'W + ρ'V + ε
+
         Parameters
         ----------
-        V_hat : ndarray, shape (n, k_x)
-            Estimated control function residuals.
+        train_idx : ndarray
+            Indices of training observations.
+        V_hat_full : ndarray, shape (n, k_x)
+            Estimated control function residuals for all observations.
         weight_fold : ndarray, optional
-            Observation weights.
-            
+            Observation weights for all observations.
+
         Returns
         -------
         beta : ndarray, shape (k_x,)
             Coefficients on endogenous variables X.
-        gamma : ndarray, shape (k_w,) or None
+        delta : ndarray, shape (k_w,) or None
             Coefficients on exogenous controls W.
         rho : ndarray, shape (k_x,)
             Coefficients on control function V.
@@ -335,59 +342,49 @@ class IVDoublyRobustElasticityEstimatorModel:
             Full OLS results object.
         """
         k_x = self.exog.shape[1]
-        k_v = V_hat.shape[1] if V_hat.ndim > 1 else 1
-        
+        k_v = V_hat_full.shape[1] if V_hat_full.ndim > 1 else 1
+
         # Ensure V_hat is 2D
-        if V_hat.ndim == 1:
-            V_hat = V_hat.reshape(-1, 1)
-        
-        # Build design matrix: [X, W, V]
-        design_parts = [self.exog, V_hat]
-        
+        if V_hat_full.ndim == 1:
+            V_hat_full = V_hat_full.reshape(-1, 1)
+
+        # Extract training data
+        X_train = self.exog[train_idx]
+        V_train = V_hat_full[train_idx]
+        log_y_train = np.log(self.endog[train_idx])
+
+        # Build design matrix: [X, W, V] on training data
         if self.exog_control is not None:
             k_w = self.exog_control.shape[1]
-            design_parts = [self.exog, self.exog_control, V_hat]
+            W_train = self.exog_control[train_idx]
+            design_train = np.column_stack([X_train, W_train, V_train])
         else:
             k_w = 0
-            
-        design = np.column_stack(design_parts)
-        
-        # Apply fixed effects if specified
-        log_y = np.log(self.endog)
-        
-        if self._fe_spec is not None:
-            # Initialize and apply FE demeaning
-            if self.fixed_effects is None and hasattr(self, '_fe_data'):
-                self.fixed_effects = _initialize_fixed_effects(self._fe_data)
-            if self.fixed_effects is not None:
-                from .utils import _apply_fixed_effects
-                log_y_dm, design_dm = _apply_fixed_effects(
-                    log_y, design, self.fixed_effects, 
-                    weights=weight_fold.reshape(-1, 1) if weight_fold is not None else None
-                )
-                log_y = log_y_dm
-                design = design_dm
-        
-        # Fit OLS
-        if weight_fold is not None:
-            ols = sm.WLS(log_y, design, weights=weight_fold)
+            design_train = np.column_stack([X_train, V_train])
+
+        # Get training weights
+        weights_train = weight_fold[train_idx] if weight_fold is not None else None
+
+        # Fit OLS on training data
+        if weights_train is not None:
+            ols = sm.WLS(log_y_train, design_train, weights=weights_train)
         else:
-            ols = sm.OLS(log_y, design)
-            
+            ols = sm.OLS(log_y_train, design_train)
+
         ols_res = ols.fit()
-        
+
         # Extract coefficients
         # Order: [X (k_x), W (k_w), V (k_v)]
         beta = ols_res.params[:k_x]
-        
+
         if k_w > 0:
-            gamma = ols_res.params[k_x:k_x + k_w]
+            delta = ols_res.params[k_x:k_x + k_w]
             rho = ols_res.params[k_x + k_w:k_x + k_w + k_v]
         else:
-            gamma = None
+            delta = None
             rho = ols_res.params[k_x:k_x + k_v]
-        
-        return beta, gamma, rho, ols_res
+
+        return beta, delta, rho, ols_res
     
     def _compute_mu_and_derivative(
         self,
@@ -493,107 +490,79 @@ class IVDoublyRobustElasticityEstimatorModel:
             
         return mu, mu_prime
     
-    def _compute_pathwise_derivative_autodiff(
+    def _compute_uncorrected_score_with_grad(
         self,
         X: np.ndarray,
         V: np.ndarray,
-        Z: np.ndarray,
         Y_transformed: np.ndarray,
-        m_model,
-        omega_model,
-        density_model,
-        interest_indices: List[int],
-        beta: np.ndarray
-    ) -> np.ndarray:
+        m_results,  # NNModelNuisanceResults
+        omega_results,  # NNModelDensityRatioResults  
+        density_results,  # NNModelDensityResults
+        mu: np.ndarray,
+        mu_prime: np.ndarray,
+        beta: np.ndarray,
+        interest_indices: list
+    ) -> tuple:
         """
-        Compute pathwise derivative D_g ψ using PyTorch automatic differentiation.
+        Compute uncorrected score and its gradient w.r.t. V via autodiff.
         
-        Computes separately for each (interest variable, V dimension) pair.
-        
-        The pathwise derivative measures how the score changes when we perturb
-        g(Z) → g(Z) + δ_j in direction j, equivalently V_j → V_j - δ.
-        
-        Returns
-        -------
-        D_g : ndarray, shape (n, n_interest, k_v)
-            Pathwise derivative for each observation, interest variable, and V dimension.
-            This captures Λ^dir + Λ^ω (the direct effects).
+        Fixed version that properly handles results objects.
         """
         import torch
         
-        device = m_model.device
+        # Get device from m_results
+        device = m_results.device
         n = X.shape[0]
         k_v = V.shape[1] if V.ndim > 1 else 1
         n_interest = len(interest_indices)
         
-        # Convert to tensors with gradient tracking on V
+        if V.ndim == 1:
+            V = V.reshape(-1, 1)
+        
+        # Convert to tensors
         X_t = torch.tensor(X, dtype=torch.float32, device=device)
-        V_t = torch.tensor(V.reshape(-1, k_v), dtype=torch.float32, device=device, requires_grad=True)
+        V_t = torch.tensor(V, dtype=torch.float32, device=device, requires_grad=True)
         Y_trans_t = torch.tensor(Y_transformed, dtype=torch.float32, device=device)
+        mu_t = torch.tensor(mu, dtype=torch.float32, device=device)
+        mu_prime_t = torch.tensor(mu_prime, dtype=torch.float32, device=device)
         
-        # Forward pass through m
+        mu_t = torch.clamp(mu_t, min=1e-8)
+        
+        # Forward pass through m(X, V) - use the underlying model from results
         m_input = torch.cat([X_t, V_t], dim=1)
-        m_model.model.eval()
-        m_pred = m_model.model(m_input).squeeze(-1)
+        m_results.model.eval()
+        m_pred = m_results.model(m_input).squeeze(-1)
+        m_pred = torch.clamp(m_pred, min=1e-8)
         
-        # R = Y_trans - m
         R = Y_trans_t - m_pred
         
-        # ω(X, V)
+        # Forward pass through ω(X, V) - use underlying model from results
         omega_input = torch.cat([X_t, V_t], dim=1)
-        omega_model.model.eval()
-        omega_logits = omega_model.model(omega_input).squeeze(-1)
+        omega_results.model.eval()
+        omega_logits = omega_results.model(omega_input).squeeze(-1)
         p = torch.sigmoid(omega_logits)
         p = torch.clamp(p, min=1e-6, max=1 - 1e-6)
-        r = p / (1 - p)
-        omega = 1.0 / r
+        omega = (1 - p) / p
         omega = torch.clamp(omega, min=0.01, max=100.0)
         
-        # S_X(X) - doesn't depend on V
+        # Get S_X(X) - no grad needed
         with torch.no_grad():
-            S_X = density_model.alpha_weight(X, interest_indices)
+            S_X = density_results.alpha_weight(X, interest_indices)
             S_X_t = torch.tensor(S_X, dtype=torch.float32, device=device)
         
-        # μ proxy (use m since we don't have μ with gradient tracking)
-        mu_proxy = m_pred.detach()
-        mu_proxy = torch.clamp(mu_proxy, min=1e-6)
-        
-        # Compute D_g for each interest variable separately
-        D_g = np.zeros((n, n_interest, k_v))
+        psi_uncorr = np.zeros((n, n_interest))
+        D_g_psi = np.zeros((n, n_interest, k_v))
         
         for k_idx, var_idx in enumerate(interest_indices):
-            # Score component for interest variable k:
-            # ψ_k,correction = -ω(X,V) S_{X,k}(X) R(X,V) / μ(X)
-            alpha_k = -omega * S_X_t[:, k_idx] / mu_proxy
-            score_k = alpha_k * R
+            theta_k = beta[var_idx] + mu_prime_t[:, k_idx] / mu_t
+            alpha_k = -omega * S_X_t[:, k_idx] / mu_t
+            psi_k = theta_k + alpha_k * R
             
-            # Compute gradient w.r.t. V
-            # Need to recompute graph for each k since we need separate gradients
-            if k_idx > 0:
-                # Recompute with fresh graph
-                V_t = torch.tensor(V.reshape(-1, k_v), dtype=torch.float32, device=device, requires_grad=True)
-                m_input = torch.cat([X_t, V_t], dim=1)
-                m_pred = m_model.model(m_input).squeeze(-1)
-                R = Y_trans_t - m_pred
-                
-                omega_input = torch.cat([X_t, V_t], dim=1)
-                omega_logits = omega_model.model(omega_input).squeeze(-1)
-                p = torch.sigmoid(omega_logits)
-                p = torch.clamp(p, min=1e-6, max=1 - 1e-6)
-                r = p / (1 - p)
-                omega = 1.0 / r
-                omega = torch.clamp(omega, min=0.01, max=100.0)
-                
-                mu_proxy = m_pred.detach()
-                mu_proxy = torch.clamp(mu_proxy, min=1e-6)
-                
-                alpha_k = -omega * S_X_t[:, k_idx] / mu_proxy
-                score_k = alpha_k * R
+            psi_uncorr[:, k_idx] = psi_k.detach().cpu().numpy()
             
-            grad_outputs = torch.ones_like(score_k)
-            
+            grad_outputs = torch.ones_like(psi_k)
             grads = torch.autograd.grad(
-                outputs=score_k,
+                outputs=psi_k,
                 inputs=V_t,
                 grad_outputs=grad_outputs,
                 create_graph=False,
@@ -601,139 +570,68 @@ class IVDoublyRobustElasticityEstimatorModel:
                 allow_unused=False
             )[0]
             
-            # D_g = -∂ψ/∂V (negative because g perturbation = -V perturbation)
-            D_g[:, k_idx, :] = -grads.detach().cpu().numpy()
+            D_g_psi[:, k_idx, :] = grads.detach().cpu().numpy()
         
-        return D_g
-    
-    def _compute_lambda_indirect(
+        return psi_uncorr, D_g_psi
+
+
+    def _estimate_lambda_autodml(
         self,
-        X: np.ndarray,
-        V_samples: np.ndarray,
-        m_model,
-        mu: np.ndarray,
-        mu_prime: np.ndarray,
-        interest_indices: List[int],
-        n_mc_samples: int = 200
+        Z_train: np.ndarray,
+        D_g_train: np.ndarray,
+        Z_test: np.ndarray,
+        lambda_params: Dict
     ) -> np.ndarray:
         """
-        Compute Λ^ind_{k,j}(X) for each (interest variable k, V dimension j).
+        Estimate λ(Z) = E[D_g ψ | Z] via regression.
         
-        Formula:
-            Λ^ind_{k,j} = μ'_k(X) m̄_{v_j}(X) / μ(X)² - m̄_{x_k v_j}(X) / μ(X)
+        This is the automatic DML approach: regress the pathwise derivative
+        on the instruments to get the Riesz representer.
         
-        where:
-            m̄_{v_j}(x) = E_V[∂m/∂v_j(x, V)]
-            m̄_{x_k v_j}(x) = E_V[∂²m/∂x_k∂v_j(x, V)]
-        
-        This captures the indirect effect of g-perturbation through the
-        distribution shift in μ(x) = E_V[m(x,V)].
-        
+        Parameters
+        ----------
+        Z_train : ndarray, shape (n_train, k_z)
+            Training instruments.
+        D_g_train : ndarray, shape (n_train, n_interest, k_v)
+            Pathwise derivatives on training set.
+        Z_test : ndarray, shape (n_test, k_z)
+            Test instruments.
+        lambda_params : dict
+            Parameters for lambda model architecture and fitting.
+            
         Returns
         -------
-        Lambda_ind : ndarray, shape (n, n_interest, k_v)
-            Indirect pathwise derivative for each (observation, interest var, V dim).
+        lambda_test : ndarray, shape (n_test, n_interest, k_v)
+            Predicted λ(Z) on test set.
         """
-        import torch
+        from .iv_nonparametric import NNModelRieszLambda
         
-        device = m_model.device
-        n = X.shape[0]
-        k_x = X.shape[1]
-        n_interest = len(interest_indices)
+        n_test = Z_test.shape[0]
+        n_interest = D_g_train.shape[1]
+        k_v = D_g_train.shape[2]
         
-        # Ensure V_samples is 2D
-        if V_samples.ndim == 1:
-            V_samples = V_samples.reshape(-1, 1)
-        k_v = V_samples.shape[1]
+        lambda_test = np.zeros((n_test, n_interest, k_v))
         
-        # Sample V for MC
-        n_v = V_samples.shape[0]
-        if n_mc_samples < n_v:
-            sample_idx = np.random.choice(n_v, size=n_mc_samples, replace=False)
-            V_mc = V_samples[sample_idx]
-        else:
-            V_mc = V_samples
-        n_samples = V_mc.shape[0]
-        
-        # We need to compute for each x_i:
-        # m̄_{v_j}(x) = E_V[∂m/∂v_j] for each V dimension j
-        # m̄_{x_k v_j}(x) = E_V[∂²m/∂x_k∂v_j] for each (interest var k, V dim j)
-        
-        m_bar_v = np.zeros((n, k_v))  # E[∂m/∂v_j] for each j
-        m_bar_xv = np.zeros((n, n_interest, k_v))  # E[∂²m/∂x_k∂v_j]
-        
-        # Process in batches for memory efficiency
-        batch_size = min(50, n)
-        
-        for batch_start in range(0, n, batch_size):
-            batch_end = min(batch_start + batch_size, n)
-            X_batch = X[batch_start:batch_end]
-            batch_n = batch_end - batch_start
-            
-            # Expand for MC: (batch_n * n_samples, k_x + k_v)
-            X_expanded = np.repeat(X_batch, n_samples, axis=0)
-            V_expanded = np.tile(V_mc, (batch_n, 1))
-            
-            # Convert to tensors with gradients
-            X_t = torch.tensor(X_expanded, dtype=torch.float32, device=device, requires_grad=True)
-            V_t = torch.tensor(V_expanded, dtype=torch.float32, device=device, requires_grad=True)
-            
-            m_input = torch.cat([X_t, V_t], dim=1)
-            
-            # Forward pass
-            m_model.model.eval()
-            m_pred = m_model.model(m_input).squeeze(-1)
-            
-            # Compute ∂m/∂v (gradient w.r.t. V, shape: batch*n_samples x k_v)
-            grad_v = torch.autograd.grad(
-                outputs=m_pred.sum(),
-                inputs=V_t,
-                create_graph=True,  # Need for second derivatives
-                retain_graph=True
-            )[0]  # shape: (batch_n * n_samples, k_v)
-            
-            # Compute ∂²m/∂x_k∂v_j for each (interest variable k, V dimension j)
-            # This is the mixed Hessian
-            for k_idx, var_idx in enumerate(interest_indices):
-                for v_dim in range(k_v):
-                    # ∂/∂x_k of (∂m/∂v_j)
-                    grad_v_j = grad_v[:, v_dim]
-                    
-                    hess = torch.autograd.grad(
-                        outputs=grad_v_j.sum(),
-                        inputs=X_t,
-                        retain_graph=True,
-                        allow_unused=True
-                    )[0]
-                    
-                    if hess is not None:
-                        hess_kj = hess[:, var_idx].detach().cpu().numpy()
-                    else:
-                        hess_kj = np.zeros(X_t.shape[0])
-                    
-                    # Reshape and average over MC samples
-                    hess_reshaped = hess_kj.reshape(batch_n, n_samples)
-                    m_bar_xv[batch_start:batch_end, k_idx, v_dim] = hess_reshaped.mean(axis=1)
-            
-            # Average ∂m/∂v over MC samples
-            grad_v_np = grad_v.detach().cpu().numpy()
-            grad_v_reshaped = grad_v_np.reshape(batch_n, n_samples, k_v)
-            m_bar_v[batch_start:batch_end] = grad_v_reshaped.mean(axis=1)
-        
-        # Compute Λ^ind_{k,j} for each (interest variable k, V dimension j)
-        # Λ^ind_{k,j} = μ'_k(X) * m̄_{v_j}(X) / μ(X)² - m̄_{x_k v_j}(X) / μ(X)
-        Lambda_ind = np.zeros((n, n_interest, k_v))
-        
-        mu_safe = np.maximum(mu, 1e-10)
-        
+        # Fit separate λ model for each (interest variable, V dimension) pair
+        # Alternatively, could fit a single model with multi-output
         for k_idx in range(n_interest):
-            for v_dim in range(k_v):
-                term1 = mu_prime[:, k_idx] * m_bar_v[:, v_dim] / (mu_safe ** 2)
-                term2 = m_bar_xv[:, k_idx, v_dim] / mu_safe
-                Lambda_ind[:, k_idx, v_dim] = term1 - term2
+            for v_idx in range(k_v):
+                # Target: D_g ψ for this (k, v) pair
+                target = D_g_train[:, k_idx, v_idx]
+                
+                # Fit λ(Z) = E[D_g ψ | Z]
+                lambda_model = NNModelRieszLambda(**lambda_params.get('arch_params', {}))
+                lambda_results = lambda_model.fit(
+                    Z_train, target,
+                    **lambda_params.get('fit_params', {})
+                )
+                
+                # Predict on test set
+                lambda_test[:, k_idx, v_idx] = lambda_results.predict(Z_test)
         
-        return Lambda_ind
-    
+        return lambda_test
+
+
     def _process_fold(
         self,
         train_idx: np.ndarray,
@@ -747,218 +645,201 @@ class IVDoublyRobustElasticityEstimatorModel:
         lambda_params: Dict
     ) -> Dict:
         """
-        Process a single cross-fitting fold.
-        
+        Fold processing using automatic DML for λ estimation.
+
         Steps:
-        1. Estimate first stage g(Z, W) on train
-        2. Compute V_hat = X - g(Z, W) on full sample (for OLS)
-        3. Estimate beta, gamma, rho via control function OLS
+        1. Estimate first stage g(Z) on train
+        2. Compute V_hat = X - g(Z) on full data (using train-fitted model)
+        3. Estimate β, ρ via control function OLS on TRAIN only
         4. Estimate m(X, V) on train
-        5. Compute mu(x), mu'(x) on test via MC integration
-        6. Estimate omega(X, V) via classification on train
-        7. Estimate S_X(X) via score matching on train
-        8. Estimate lambda(Z) via automatic DML with autodiff
-        9. Construct moments
+        5. Compute μ(x), μ'(x) on test via MC integration
+        6. Estimate ω(X, V) on train
+        7. Estimate S_X(X) on train
+        8. Compute uncorrected score AND its gradient ∂ψ/∂V on train
+        9. Estimate λ(Z) = E[∂ψ/∂V | Z] via regression
+        10. Construct final corrected moments and derivatives on test
         """
-        
         k_x = self.exog.shape[1]
         k_v = k_x  # V has same dimension as X
-        
-        # Step 1: First stage
-        print("  Estimating first stage g(Z, W)...")
+        n_interest = len(interest_indices)
+
+        # ===== Steps 1-2: First stage =====
+        print("  Estimating first stage g(Z)...")
         g_results = self._estimate_first_stage(train_idx, first_stage_params)
-        
-        # Predict g(Z, W) on full sample for OLS
+
         W_full = self.exog_control if self.exog_control is not None else None
         g_pred_full = self._predict_first_stage(g_results, self.instruments, W_full)
-        
-        V_hat_full = self.exog - g_pred_full  # Shape: (n, k_x)
-        
-        # Step 2-3: Control function OLS on full sample
+        V_hat_full = self.exog - g_pred_full
+
+        # ===== Step 3: Control function OLS on TRAINING data only =====
         print("  Estimating control function OLS...")
-        beta, gamma, rho, ols_res = self._estimate_control_function_ols(V_hat_full, weight_fold)
-        
-        # Store for later use
-        self.V_hat = V_hat_full
-        self.beta = beta
-        self.gamma = gamma
-        self.rho = rho
-        self.ols_res = ols_res
-        
-        # Compute residuals for m estimation
-        # m(x,v) = E[Y e^{-β'X} | X=x, V=v]
+        beta, delta, rho, ols_res = self._estimate_control_function_ols_fold(
+            train_idx, V_hat_full, weight_fold
+        )
+
         Y_transformed = self.endog * np.exp(-self.exog @ beta)
         
-        # Step 4: Estimate m(X, V) on train
+        # ===== Step 4: Estimate m(X, V) =====
         print("  Estimating nuisance m(X, V)...")
         X_train = self.exog[train_idx]
         V_train = V_hat_full[train_idx]
         Y_trans_train = Y_transformed[train_idx]
         
-        # Input to m is [X, V], shape: (n, k_x + k_v)
         m_input_train = np.column_stack([X_train, V_train])
         
-        # Update m_params for joint (X, V) input
         m_arch = m_params.get('arch_params', {}).copy()
         m_arch['input_size'] = m_input_train.shape[1]
         m_arch['output_size'] = 1
         if 'hidden_layers' not in m_arch:
-            base_width = max(256, min(512, 8 * (k_x + k_v)))
-            m_arch['hidden_layers'] = [base_width, base_width, base_width]
+            m_arch['hidden_layers'] = [256, 256, 256]
         if 'output_activation' not in m_arch:
-            m_arch['output_activation'] = 'softplus'  # Ensure positivity
-            
+            m_arch['output_activation'] = 'softplus'
+        
+        from .nonparametric import NNModelNuisance
         m_model = NNModelNuisance(variable_types={}, **m_arch)
         m_results = m_model.fit(m_input_train, Y_trans_train, **m_params.get('fit_params', {}))
         
-        # Step 5: Compute mu(x) and mu'(x) on test
+        # ===== Step 5: Compute μ(x), μ'(x) on test =====
         print("  Computing marginal integration μ(x)...")
         X_test = self.exog[test_idx]
         V_test = V_hat_full[test_idx]
         
-        # For MC integration, use V from training set (independent of test X)
         mu_test, mu_prime_test = self._compute_mu_and_derivative(
             m_results, X_test, V_train, interest_indices
         )
-        
-        # Ensure positivity
         mu_test = np.maximum(mu_test, 1e-10)
         
-        # Get m(X_test, V_test) for residual
-        m_input_test = np.column_stack([X_test, V_test])
-        m_test = m_results.predict(m_input_test)
-        m_test = np.maximum(m_test, 1e-10)
-        
-        # R = Y e^{-β'X} - m(X, V)
-        Y_trans_test = Y_transformed[test_idx]
-        R_test = Y_trans_test - m_test
-        
-        # Step 6: Estimate omega(X, V) via classification
+        # ===== Step 6: Estimate ω(X, V) =====
         print("  Estimating density ratio ω(X, V)...")
+        from .iv_nonparametric import NNModelDensityRatio
         omega_model = NNModelDensityRatio(**omega_params.get('arch_params', {}))
-        omega_results = omega_model.fit(
-            X_train, V_train,
-            **omega_params.get('fit_params', {})
-        )
-        omega_test = omega_results.predict(X_test, V_test)
+        omega_results = omega_model.fit(X_train, V_train, **omega_params.get('fit_params', {}))
         
-        # Step 7: Estimate S_X(X) via score matching
+        # ===== Step 7: Estimate S_X(X) =====
         print("  Estimating score S_X(X)...")
+        from .nonparametric import NNModelDensity
         density_model = NNModelDensity(variable_types=self.variable_types, **density_params.get('arch_params', {}))
         density_results = density_model.fit(X_train, interest=interest_indices, **density_params.get('fit_params', {}))
         
-        # Get score for continuous interest variables
-        S_X_test = density_results.alpha_weight(X_test, interest_indices)
+        # ===== Step 8: Compute uncorrected score and gradient on TRAIN =====
+        print("  Computing pathwise derivatives via autodiff...")
         
-        # Step 8: Estimate lambda(Z) via automatic DML with autodiff
-        print("  Estimating λ(Z) correction via autodiff...")
-        Z_train = self.instruments[train_idx]
-        Z_test = self.instruments[test_idx]
-        n_interest = len(interest_indices)
-        
-        # Compute pathwise derivative on training set using autodiff
-        # This captures Λ^dir + Λ^ω, shape: (n_train, n_interest, k_v)
-        D_g_direct = self._compute_pathwise_derivative_autodiff(
-            X_train, V_train, Z_train, Y_trans_train,
-            m_model, omega_model, density_results,
-            interest_indices, beta
-        )
-        
-        # Compute Λ^ind separately (distribution shift effect)
-        # Need mu and mu_prime on training set for this
-        # Shape: (n_train, n_interest, k_v)
+        # Need μ and μ' on training set for computing D_g
         mu_train, mu_prime_train = self._compute_mu_and_derivative(
             m_results, X_train, V_train, interest_indices
         )
         mu_train = np.maximum(mu_train, 1e-10)
         
-        Lambda_ind = self._compute_lambda_indirect(
-            X_train, V_train, m_model,
-            mu_train, mu_prime_train, interest_indices
+        # Compute uncorrected score and its gradient w.r.t. V
+        _, D_g_train = self._compute_uncorrected_score_with_grad(
+            X_train, V_train, Y_trans_train,
+            m_results, omega_results, density_results,
+            mu_train, mu_prime_train,
+            beta, interest_indices
         )
         
-        # Full pathwise derivative: D_g = (Λ^dir + Λ^ω) + Λ^ind
-        # Both have shape (n_train, n_interest, k_v)
-        D_g_full = D_g_direct + Lambda_ind
+        # ===== Step 9: Estimate λ(Z) = E[D_g ψ | Z] =====
+        print("  Estimating λ(Z) via automatic DML...")
+        Z_train = self.instruments[train_idx]
+        Z_test = self.instruments[test_idx]
         
-        # Regress D_g on Z for each (interest variable, V dimension) pair
-        # lambda_test will have shape (n_test, n_interest, k_v)
-        lambda_test = np.zeros((len(test_idx), n_interest, k_v))
-        lambda_results_dict = {}
+        lambda_test = self._estimate_lambda_autodml(
+            Z_train, D_g_train, Z_test, lambda_params
+        )
         
-        for k_idx in range(n_interest):
-            lambda_results_dict[k_idx] = []
-            for v_idx in range(k_v):
-                D_g_kv = D_g_full[:, k_idx, v_idx]
-                
-                lambda_model_kv = NNModelRieszLambda(**lambda_params.get('arch_params', {}))
-                lambda_res = lambda_model_kv.fit(Z_train, D_g_kv, **lambda_params.get('fit_params', {}))
-                lambda_results_dict[k_idx].append(lambda_res)
-                
-                lambda_test[:, k_idx, v_idx] = lambda_res.predict(Z_test)
-        
-        # Step 9: Construct moments
+        # ===== Step 10: Construct final moments on test =====
         print("  Constructing moments...")
+        
+        # Get test-set quantities
+        Y_trans_test = Y_transformed[test_idx]
+        omega_test = omega_results.predict(X_test, V_test)
+        S_X_test = density_results.alpha_weight(X_test, interest_indices)
+        
+        m_input_test = np.column_stack([X_test, V_test])
+        m_test = m_results.predict(m_input_test)
+        m_test = np.maximum(m_test, 1e-10)
+        R_test = Y_trans_test - m_test
+        
         n_test = len(test_idx)
-        
         fold_moments = np.zeros((n_test, n_interest))
-        
-        for moment_idx, var_idx in enumerate(interest_indices):
+
+        # Derivative matrix for sandwich variance: shape (n_test, n_interest, 2*n_interest)
+        # First n_interest columns: ∂ψ/∂θ = -I
+        # Second n_interest columns: ∂ψ/∂β (for joint inference)
+        fold_derivative = np.zeros((n_test, n_interest, 2 * n_interest))
+        identity = np.eye(n_interest)
+        fold_derivative[:, :, :n_interest] = -identity  # ∂ψ/∂θ = -I
+
+        fold_alpha_x = []
+        fold_theta_x = []
+
+        for k_idx, var_idx in enumerate(interest_indices):
             var_type = self.variable_types.get(var_idx, 'continuous')
-            
+
             if var_type == 'continuous':
                 # θ(x) = β_k + μ'_k(x)/μ(x)
-                theta_x = beta[var_idx] + mu_prime_test[:, moment_idx] / mu_test
-                
-                # α(x,v) = -ω(x,v) S_X,k(x) / μ(x)
-                alpha_x = -omega_test * S_X_test[:, moment_idx] / mu_test
-                
-                # Correction term: λ̃_k(Z) · V = Σ_j λ̃_{k,j}(Z) V_j
-                # lambda_test has shape (n_test, n_interest, k_v)
-                # V_test has shape (n_test, k_v)
-                lambda_k = lambda_test[:, moment_idx, :]  # shape (n_test, k_v)
+                theta_x = beta[var_idx] + mu_prime_test[:, k_idx] / mu_test
+
+                # α(x,v) = -ω(x,v) S_{X,k}(x) / μ(x)
+                alpha_x = -omega_test * S_X_test[:, k_idx] / mu_test
+
+                # λ correction: λ̃_k(Z) · V = Σ_j λ_{k,j}(Z) V_j
+                lambda_k = lambda_test[:, k_idx, :]  # shape (n_test, k_v)
                 lambda_correction = np.sum(lambda_k * V_test, axis=1)
-                
-                fold_moments[:, moment_idx] = theta_x + alpha_x * R_test - lambda_correction
-                
+
+                # Final moment: θ + α·R - λ̃·V
+                fold_moments[:, k_idx] = theta_x + alpha_x * R_test - lambda_correction
+
+                # Derivative w.r.t. β: ∂ψ/∂β_j = δ_{kj} - α·R·X_j (from Y_transformed dependence)
+                # For the k-th moment, ∂ψ_k/∂β_j = I_{k=j} + α_k * Y_trans * X_j
+                Y_trans_test = Y_transformed[test_idx]
+                fold_derivative[:, k_idx, n_interest + k_idx] = 1.0  # ∂θ/∂β_k = 1
+                for j_idx, j_var in enumerate(interest_indices):
+                    fold_derivative[:, k_idx, n_interest + j_idx] -= alpha_x * Y_trans_test * X_test[:, j_var]
+
             elif var_type == 'binary':
-                # Binary treatment: compute discrete change
                 X_test_flip = X_test.copy()
                 X_test_flip[:, var_idx] = 1 - X_test_flip[:, var_idx]
-                
+
                 m_input_flip = np.column_stack([X_test_flip, V_test])
                 m_flip = m_results.predict(m_input_flip)
                 m_flip = np.maximum(m_flip, 1e-10)
-                
-                # Compute μ(x_flip) via MC
+
                 mu_flip, _ = self._compute_mu_and_derivative(
                     m_results, X_test_flip, V_train, interest_indices
                 )
                 mu_flip = np.maximum(mu_flip, 1e-10)
-                
-                # Probability weights from density model for binary
-                p_var = density_results.alpha_weight(X_test, [var_idx])[:, 0]
-                
-                # Elasticity for binary: exp(β_k) * μ(x^{+k})/μ(x) - 1
+
+                p_var = S_X_test[:, k_idx]
+
                 theta_x = np.exp(beta[var_idx]) * (mu_flip / mu_test) - 1
-                
-                # Influence function for binary (simplified)
+
                 alpha_0 = (1 - X_test[:, var_idx]) * m_flip / (m_test**2 * (np.abs(p_var) + 1e-10))
                 alpha_1 = X_test[:, var_idx] / ((np.abs(p_var) + 1e-10) * m_flip)
                 alpha_x = np.exp(beta[var_idx]) * (alpha_1 - alpha_0)
-                
-                # Lambda correction for this interest variable
-                lambda_k = lambda_test[:, moment_idx, :]  # shape (n_test, k_v)
+
+                lambda_k = lambda_test[:, k_idx, :]
                 lambda_correction = np.sum(lambda_k * V_test, axis=1)
-                
-                fold_moments[:, moment_idx] = theta_x + alpha_x * R_test - lambda_correction
-                
+
+                fold_moments[:, k_idx] = theta_x + alpha_x * R_test - lambda_correction
+
+                # Binary derivative w.r.t. β
+                Y_trans_test = Y_transformed[test_idx]
+                fold_derivative[:, k_idx, n_interest + k_idx] = theta_x + 1 + alpha_x * (Y_trans_test - m_test)
+                for j_idx, j_var in enumerate(interest_indices):
+                    fold_derivative[:, k_idx, n_interest + j_idx] -= alpha_x * Y_trans_test * X_test[:, j_var]
+
             else:  # ordinal
-                fold_moments[:, moment_idx] = 0  # Placeholder
-                
+                theta_x = np.zeros(n_test)
+                alpha_x = np.zeros(n_test)
+                fold_moments[:, k_idx] = 0
+
+            fold_alpha_x.append(alpha_x)
+            fold_theta_x.append(theta_x)
+
         return {
             'beta': beta,
-            'gamma': gamma,
+            'delta': delta,
             'rho': rho,
             'g_results': g_results,
             'm_results': m_results,
@@ -967,13 +848,17 @@ class IVDoublyRobustElasticityEstimatorModel:
             'omega_model': omega_model,
             'density_results': density_results,
             'density_model': density_model,
-            'lambda_results': lambda_results_dict,
-            'D_g_full': D_g_full,  # Full pathwise derivative (Λ^dir + Λ^ω + Λ^ind)
+            'D_g_train': D_g_train,
             'moments': fold_moments,
+            'derivative': fold_derivative,
+            'alpha_x': np.column_stack(fold_alpha_x) if fold_alpha_x else np.array([]),
+            'theta_x': np.column_stack(fold_theta_x) if fold_theta_x else np.array([]),
             'mu_test': mu_test,
             'mu_prime_test': mu_prime_test,
-            'test_idx': test_idx
+            'test_idx': test_idx,
+            'V_hat_full': V_hat_full
         }
+
     
     def fit(
         self,
@@ -1042,21 +927,46 @@ class IVDoublyRobustElasticityEstimatorModel:
             )
             fold_results.append(fold_result)
             
-        # Aggregate moments
+        # Aggregate moments and derivatives
         n_interest = len(interest_indices)
-        moments = np.zeros((self.nobs, n_interest))
+        n_params = 2 * n_interest  # Elasticities + OLS beta for interest vars
+        moments = np.zeros((self.nobs, n_params))
+        derivative = np.zeros((self.nobs, n_params, n_params))
         fold_weights = np.zeros(self.nobs)
-        
+
+        # Aggregate V_hat from last fold (they should all be similar)
+        V_hat_final = fold_results[-1]['V_hat_full']
+
+        # Average beta across folds for final estimate
+        beta_avg = np.mean([fold['beta'] for fold in fold_results], axis=0)
+        rho_avg = np.mean([fold['rho'] for fold in fold_results], axis=0)
+        delta_list = [fold['delta'] for fold in fold_results if fold['delta'] is not None]
+        delta_avg = np.mean(delta_list, axis=0) if delta_list else None
+
         for fold in fold_results:
-            moments[fold['test_idx']] = fold['moments']
-            fold_weights[fold['test_idx']] = (
-                self.weights[fold['test_idx']] if self.weights is not None else 1.0
+            test_idx = fold['test_idx']
+            moments[test_idx, :n_interest] = fold['moments']
+            derivative[test_idx, :n_interest, :n_params] = fold['derivative']
+            fold_weights[test_idx] = (
+                self.weights[test_idx] if self.weights is not None else 1.0
             )
-            
+
+        # Add OLS moment conditions for joint inference
+        # OLS moments: ε_i * X_i where ε = log Y - β'X - ρ'V
+        log_Y = np.log(self.endog)
+        eps_ols = log_Y - self.exog @ beta_avg - V_hat_final @ rho_avg
+        X_interest = self.exog[:, interest_indices]
+        ols_moments = eps_ols[:, None] * X_interest
+        moments[:, n_interest:] = ols_moments
+
+        # OLS derivative: E[X_i X_i'] for the interest variables
+        ols_derivative = X_interest[:, :, None] * X_interest[:, None, :]
+        derivative[:, n_interest:, n_interest:] = ols_derivative
+
         # Compute estimates
-        moment_means = np.average(moments, axis=0, weights=fold_weights)
+        moment_means = np.average(moments[:, :n_interest], axis=0, weights=fold_weights)
         elasticity_estimates = moment_means
-        
+
         # Build results DataFrame
         if self._original_is_pandas:
             elasticities_df = pd.DataFrame({
@@ -1067,14 +977,14 @@ class IVDoublyRobustElasticityEstimatorModel:
             }).set_index('variable')
         else:
             elasticities_df = elasticity_estimates
-            
+
         # Create results object
         results = IVDREEMR(
             elasticities=elasticities_df,
-            beta=self.beta[interest_indices] if self.beta is not None else None,
-            gamma=self.gamma,
-            rho=self.rho,
-            ols_results=self.ols_res,
+            beta=beta_avg[interest_indices],
+            delta=delta_avg,
+            rho=rho_avg,
+            ols_results=None,  # No single OLS result with cross-fitting
             exog_names=self.exog_names,
             endog_name=self.endog_names,
             instrument_names=self.instrument_names,
@@ -1085,8 +995,9 @@ class IVDoublyRobustElasticityEstimatorModel:
             interest_indices=interest_indices,
             fold_results=fold_results,
             moments=moments,
+            derivative=derivative,
             fold_weights=fold_weights,
-            V_hat=self.V_hat
+            V_hat=V_hat_final
         )
         
         # Compute variances
