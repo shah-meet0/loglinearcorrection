@@ -12,6 +12,7 @@ from typing import Dict, Any, List, Optional, Union
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
+from loglinearcorrection.hypothesis import CoefDiffTest
 
 
 class IVDoublyRobustElasticityEstimatorModelResults:
@@ -358,6 +359,65 @@ class IVDoublyRobustElasticityEstimatorModelResults:
                 'rho': rho.tolist(),
                 'rho_se': rho_se.tolist()
             }
+
+    def difference_test(self, verbose: bool = True) -> CoefDiffTest:
+        """
+        Compare IV-DRNO elasticities against control function β coefficients.
+        
+        Tests H0: elasticity_j = β_j for each interest variable j.
+        
+        Under homoskedasticity, elasticity = β. Under heteroskedasticity,
+        they differ by the retransformation correction E[μ'(X)/μ(X)].
+        
+        Parameters
+        ----------
+        verbose : bool, default=True
+            If True, print test results.
+            
+        Returns
+        -------
+        CoefDiffTest
+            Test results object with .results list of HypothesisTestResult.
+        """
+        if self._variance_matrix is None:
+            self.compute_variances()
+
+        k = len(self.interest_indices)
+        names = [self.exog_names[i] for i in self.interest_indices]
+
+        # Elasticity vector
+        if self._is_pandas:
+            elast = np.asarray([self.elasticities.loc[n, "estimate"] for n in names], dtype=float)
+        else:
+            elast = np.asarray(self.elasticities[:k], dtype=float)
+
+        # Beta vector (control function coefficients for interest variables)
+        beta_vec = np.asarray(self.beta[:k], dtype=float)
+
+        # Concatenate: [Elasticities | Beta]
+        coefs = np.concatenate([elast, beta_vec], axis=0)
+
+        # Scale variance matrix by n
+        V = np.asarray(self._variance_matrix, dtype=float)
+        Vn = V / float(self.nobs)
+
+        if Vn.shape != (2 * k, 2 * k):
+            raise ValueError(f"vcov shape {Vn.shape} does not match expected ({2*k}, {2*k})")
+
+        # Run tests
+        test = CoefDiffTest(n=self.nobs, k=k, coefs=coefs, vcov=Vn)
+
+        if verbose:
+            print("IV-DRNO Elasticity vs Control Function β:")
+            print("-" * 70)
+            for j in range(k):
+                r = test.results[j]
+                print(f"{names[j]}:")
+                print(f"  Elasticity: {elast[j]:.6g}  β: {beta_vec[j]:.6g}  Diff: {elast[j] - beta_vec[j]:.6g}")
+                print(f"  Wald χ²(1): {r.statistic:.2f}  p-value: {r.p_value:.4f}")
+                print()
+
+        return test
     
     def summary(self) -> None:
         """Print summary of estimation results."""
