@@ -414,7 +414,7 @@ class TestNeymanOrthogonality:
     """Test Neyman orthogonality properties."""
 
     def test_moments_mean_equals_estimate(self, medium_heteroskedastic_data, fast_fit_params):
-        """Mean of moments should equal the estimate."""
+        """Mean of elasticity moments should equal the estimate."""
         from loglinearcorrection.iv_model import IVDoublyRobustElasticityEstimatorModel as IVDREEM
 
         data = medium_heteroskedastic_data
@@ -422,7 +422,10 @@ class TestNeymanOrthogonality:
 
         results = model.fit(n_folds=3, random_state=42, **fast_fit_params)
 
-        moments_mean = np.mean(results.moments)
+        # Only use elasticity moments (first n_interest columns), not OLS moments
+        n_interest = len(results.interest_indices)
+        elasticity_moments = results.moments[:, :n_interest]
+        moments_mean = np.mean(elasticity_moments)
 
         if isinstance(results.elasticities, pd.DataFrame):
             estimate = float(results.elasticities['estimate'].iloc[0])
@@ -585,8 +588,8 @@ class TestExogenousControls:
 
         results = model.fit(n_folds=2, random_state=42, **fast_fit_params)
 
-        assert results.gamma is not None, "Expected gamma estimates for controls"
-        assert len(results.gamma) == 2, f"Expected 2 gamma estimates, got {len(results.gamma)}"
+        assert results.delta is not None, "Expected delta estimates for controls"
+        assert len(results.delta) == 2, f"Expected 2 delta estimates, got {len(results.delta)}"
 
 
 # =============================================================================
