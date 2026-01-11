@@ -20,7 +20,8 @@ class CoefDiffTest:
     Compare blocks of coefficients of length k.
 
     If coefs has length 2k: run k tests for block0 - block1.
-    If coefs has length 3k: run 2k tests for block0 - block1 and block0 - block2.
+    If coefs has length 3k: run 3k tests for:
+        block0 - block1, block0 - block2, and block1 - block2.
 
     Wald tests with χ²(1) reference.
     """
@@ -39,8 +40,15 @@ class CoefDiffTest:
             raise ValueError(f"vcov must be {p}x{p}. Got {self.vcov.shape}.")
 
         self.num_blocks = p // self.k
-        # Required pairs: (0,1) and optionally (0,2)
-        self.pairs = [(0, 1)] + ([(0, 2)] if self.num_blocks == 3 else [])
+        if self.num_blocks == 2:
+            self.pairs = [(0, 1)]
+        elif self.num_blocks == 3:
+            # Now also include block1 - block2
+            self.pairs = [(0, 1), (0, 2), (1, 2)]
+        else:
+            # Should not happen because of validation above
+            raise ValueError("Unsupported number of blocks.")
+
         self.results = self._compute_tests()
 
     def _block_slice(self, b: int):
@@ -81,6 +89,3 @@ class CoefDiffTest:
                     )
                 )
         return results
-
-
-
