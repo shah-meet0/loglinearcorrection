@@ -161,6 +161,7 @@ class DoublyRobustElasticityEstimatorModel:
             self.fe_cols = self.exog[:, fe_indices]
             self.fixed_effects = _initialize_fixed_effects(self.exog[:, fe_indices])
             non_fe_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
+            print(non_fe_indices)
 
         # Adjust interest based on fe_indices
         self.exog = self.exog[:, non_fe_indices].astype(np.float64)
@@ -497,7 +498,8 @@ class DoublyRobustElasticityEstimatorModel:
 
             if self.exog_names and isinstance(interest[0], str):
                 interest = [self.exog_names.index(name) for name in interest if name in self.exog_names]
-            interest = [non_fe_indices.index(i) for i in interest if i in non_fe_indices]
+            else:
+                interest = [non_fe_indices.index(i) for i in interest if i in non_fe_indices]
 
         return interest
 
