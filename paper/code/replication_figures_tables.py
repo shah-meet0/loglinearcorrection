@@ -3,9 +3,26 @@ import seaborn as sns
 import numpy as np
 import matplotlib.pyplot as plt
 
+# Style preamble
+plt.style.use('seaborn-v0_8-white')
+plt.rcParams.update({
+    'font.family': 'serif',
+    'font.serif': ['Computer Modern Roman'],
+    'text.usetex': True,
+    'axes.labelsize': 11,
+    'axes.titlesize': 12,
+    'xtick.labelsize': 10,
+    'ytick.labelsize': 10,
+    'legend.fontsize': 10,
+})
+
+# Softer colors
+COLOR_SIG = '#c44e52'      # muted red
+COLOR_NONSIG = '#4c4c4c'   # dark gray
+
 
 # Load file
-filepath = "./paper/data/replication_output"
+filepath = r"./paper/data/replication_input.csv"
 df = pd.read_csv(filepath)
 df.columns
 
@@ -94,6 +111,13 @@ def counts_to_markdown_table(counts_ols: dict, counts_ppml: dict) -> str:
 
 # Generate and print the markdown table
 markdown_table = counts_to_markdown_table(counts, counts_ppml)
+from pathlib import Path
+
+path = Path("./paper/outputs/table_differences.md")
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(markdown_table, encoding="utf-8")
+
+
 print(markdown_table)
 
 # Convert to series for plotting
@@ -301,126 +325,233 @@ counts_ppml = pd.Series(counts_ppml)
 
 # NEW THE GRAPH
 
-df_new = df.query('abs(elasticity) < 1.5 and abs(ols_coef) < 1.5')
-df_new.sort_values(by='diff_elast_minus_ols', inplace=True, ascending=True)
-df_new.reset_index(drop=True, inplace=True)
+df_fig1 = df.query('abs(elasticity) < 10 and abs(ols_coef) < 10 and nobs> 100')
+df_fig1.sort_values(by='diff_elast_minus_ols', inplace=True, ascending=True)
+df_fig1.reset_index(drop=True, inplace=True)
 rows = []
 models = ['elast_minus_ols', 'elast_minus_ppml', 'ols_minus_ppml']
 p_rows = ['test_elast_vs_ols_p', 'test_elast_vs_ppml_p', 'test_ols_vs_ppml_p']
 
 
 
-# for index, result in df_new.iterrows():
-#     for i, model in enumerate(models):
-#         row = {}
-#         row['model'] = model
-#         row['diff'] = result[f'diff_{model}']
-#         row['se_diff'] = result[f'se_diff_{model}']
-#         row['sig'] = result[p_rows[i]] < 0.05
-#         row['index'] = index
-#         row['elasticity'] = result['elasticity']
-#         row['ols_coef'] = result['ols_coef']
-#         row['ppml_coef'] = result['ppml_coef']
-#         rows.append(row)
-#
-# df_plot = pd.DataFrame(rows)
-#
-# color_map = {
-#     ("elast_minus_ols", False): "black",
-#     ("elast_minus_ols", True):  "red",
-#     ("elast_minus_ppml", False): "black",
-#     ("elast_minus_ppml", True):  "red",
-#     ("ols_minus_ppml", False): "pink",
-#     ("ols_minus_ppml", True):  "red",
-# }
-#
-# symbol_map = {
-#     ("elast_minus_ols", False): "s",
-#     ("elast_minus_ols", True):  "o",
-#     ("elast_minus_ppml", False): "s",
-#     ("elast_minus_ppml", True):  "o",
-#     ("ols_minus_ppml", False): "o",
-#     ("ols_minus_ppml", True):  "o",
-# }
-#
-# width = 0.5
-#
-# offsets = {
-#     "elast_minus_ols": -width,
-#     "elast_minus_ppml": 0,
-#     "ols_minus_ppml": width
-# }
-#
-# y_base = np.arange(len(df_plot['index'].unique()))
-#
-#
-# fig, ax = plt.subplots(figsize=(12, 8), ncols=2, sharex=True, sharey=True)
-#
-# for i, index in enumerate(df_plot['index'].unique()):
-#     subset = df_plot[df_plot['index'] == index]
-#     for j, tup in enumerate(subset.iterrows()):
-#         if j == 2:
-#             continue
-#         row = tup[1]
-#         ax[j].errorbar(
-#               x=row['diff'],
-#               y=y_base[i],
-#               xerr=1.96 * row['se_diff'],
-#               yerr=0,
-#               color=color_map[(row['model'], row['sig'])],
-#               capsize=3,
-#               label=f"{row['model']} {'(sig)' if row['sig'] else '(not sig)'}",
-#               marker=symbol_map[(row['model'], row['sig'])],
-#                 markersize=3.5,
-#         )
-#
-#
-# ax[0].set_title('Elasticity - OLS')
-# ax[1].set_title('Elasticity - PPML')
-#
-# for a in ax:
-#     a.axvline(x=0, color='black', linestyle='--')
-#     a.set_ylabel('')
-#     a.set_xlabel('Difference')
-# fig.suptitle('Differences with 95% CI', weight='bold', fontsize=16)
-# ax[0].set_xlim(-0.75, 0.75)
-# ax[0].yaxis.set_visible(False)
-#
-# from matplotlib.lines import Line2D
-# legend_elements = [
-#     Line2D([0], [0], marker="o", linestyle="none", color="red", label="Significant Difference"),
-#     Line2D([0], [0], marker="s", linestyle="none", color="black", label="Insignificant Difference")
-# ]
-# ax[0].legend(handles=legend_elements, loc="upper left")
-#
-#
-# plt.tight_layout()
-# plt.savefig(r"C:\Users\Meet Shah\Desktop\retransformationbias\projects\applied-micro-pres\Figures\ellen-pres-combined-graph.pdf", dpi=1000, transparent=True)
+for index, result in df_fig1.iterrows():
+    for i, model in enumerate(models):
+        row = {}
+        row['model'] = model
+        row['diff'] = result[f'diff_{model}']
+        row['se_diff'] = result[f'se_diff_{model}']
+        row['sig'] = result[p_rows[i]] < 0.05
+        row['index'] = index
+        row['elasticity'] = result['elasticity']
+        row['ols_coef'] = result['ols_coef']
+        row['ppml_coef'] = result['ppml_coef']
+        rows.append(row)
+
+df_plot = pd.DataFrame(rows)
+
+color_map = {
+    ("elast_minus_ols", False): COLOR_NONSIG,
+    ("elast_minus_ols", True):  COLOR_SIG,
+    ("elast_minus_ppml", False): COLOR_NONSIG,
+    ("elast_minus_ppml", True):  COLOR_SIG,
+}
+
+symbol_map = {
+    ("elast_minus_ols", False): "s",
+    ("elast_minus_ols", True):  "^",
+    ("elast_minus_ppml", False): "s",
+    ("elast_minus_ppml", True):  "^",
+}
+
+width = 0.5
+
+offsets = {
+    "elast_minus_ols": -width,
+    "elast_minus_ppml": 0,
+    "ols_minus_ppml": width
+}
+
+y_base = np.arange(len(df_plot['index'].unique()))
 
 
-# NEW THE GRAPH VERSION 2
+fig, ax = plt.subplots(figsize=(12, 8), ncols=2, sharex=True, sharey=True)
+for i, index in enumerate(df_plot['index'].unique()):
+    subset = df_plot[df_plot['index'] == index]
+    for j, tup in enumerate(subset.iterrows()):
+        if j == 2:
+            continue
+        row = tup[1]
+        ax[j].errorbar(
+              x=row['diff'],
+              y=y_base[i],
+              xerr=1.96 * row['se_diff'],
+              yerr=0,
+              color=color_map[(row['model'], row['sig'])],
+              capsize=3,
+              label=f"{row['model']} {'(sig)' if row['sig'] else '(not sig)'}",
+              marker=symbol_map[(row['model'], row['sig'])],
+                markersize=5,
+        )
+
+ax[0].set_title('Elasticity - OLS')
+ax[1].set_title('Elasticity - PPML')
+
+for a in ax:
+    a.axvline(x=0, color='#888888', linestyle='--', linewidth=0.8)
+    a.set_ylabel('')
+    a.set_xlabel('Difference')
+    a.spines['top'].set_visible(False)
+    a.spines['right'].set_visible(False)
+    a.spines['left'].set_visible(False)
+
+fig.suptitle(r'Differences with 95\% CI', weight='bold', fontsize=16)
+ax[0].set_xlim(-1.5, 1.5)
+ax[0].yaxis.set_visible(False)
+
+from matplotlib.lines import Line2D
+legend_elements = [
+    Line2D([0], [0], marker="^", linestyle="none", color=COLOR_SIG, label="Significant Difference"),
+    Line2D([0], [0], marker="s", linestyle="none", color=COLOR_NONSIG, label="Insignificant Difference")
+]
+ax[0].legend(handles=legend_elements, loc="upper left", frameon=False)
+
+
+plt.tight_layout()
+plt.savefig('./paper/outputs/figure_elasticity_vs_both_ci.pdf', transparent=True, dpi=500)
+
+
+
+# OLS vs PPML Difference with 95% CI
+
+# Prepare data for OLS-PPML comparison
+df_ols_ppml = df_fig1.copy()
+df_ols_ppml.sort_values(by='diff_ols_minus_ppml', inplace=True, ascending=True)
+df_ols_ppml.reset_index(drop=True, inplace=True)
+
+y_base_ols_ppml = np.arange(len(df_ols_ppml))
+
+fig, ax = plt.subplots(figsize=(8, 8))
+
+
+# Plot error bars
+for i, (_, row) in enumerate(df_ols_ppml.iterrows()):
+    sig = row['ols_ppml_diff_sig_5']
+    color = COLOR_SIG if sig else COLOR_NONSIG
+    marker = '^' if sig else 's'
+    
+    ax.errorbar(
+        x=row['diff_ols_minus_ppml'],
+        y=y_base_ols_ppml[i],
+        xerr=1.96 * row['se_diff_ols_minus_ppml'],
+        yerr=0,
+        color=color,
+        capsize=4,
+        capthick=1.5,
+        linewidth=0.8,
+        marker=marker,
+        markersize=5,
+        zorder=2,
+    )
+
+ax.axvline(x=0, color='#888888', linestyle='--', linewidth=0.8)
+ax.set_xlabel('Difference (OLS - PPML)')
+ax.set_ylabel('')
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.spines['left'].set_visible(False)
+ax.yaxis.set_visible(False)
+ax.set_xlim(-1.5, 1.5)
+
+fig.suptitle(r'OLS vs PPML Difference with 95\% CI', weight='bold', fontsize=16)
+
+from matplotlib.lines import Line2D
+legend_elements = [
+    Line2D([0], [0], marker="^", linestyle="none", color=COLOR_SIG, label="Significant Difference"),
+    Line2D([0], [0], marker="s", linestyle="none", color=COLOR_NONSIG, label="Insignificant Difference")
+]
+ax.legend(handles=legend_elements, loc="upper left", frameon=False)
+
+plt.tight_layout()
+plt.savefig('./paper/outputs/figure_ols_vs_ppml_ci.pdf', transparent=True, dpi=500)
+
+
+# 2D Comparison PPML vs OLS
 
 fig, ax = plt.subplots(figsize=(12, 8))
-sns.scatterplot(data=df_new,y='elasticity', x='ols_coef', hue='ols_diff_sig_5', style='ols_diff_sig_5', palette=['black', 'red'], markers=['s', 'o'], ax=ax, legend=False)
+sns.scatterplot(data=df_fig1, y='ppml_coef', x='ols_coef', hue='ols_ppml_diff_sig_5', style='ols_ppml_diff_sig_5', palette=[COLOR_NONSIG, COLOR_SIG], markers=['s', '^'], ax=ax, legend=False)
 ax.axline((0, 0), slope=1, color='blue', linestyle='-', label='45° line', alpha=0.5)
-ax.axvline(x=0, color='black', linestyle='--', alpha = 0.5)
-ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
+ax.axvline(x=0, color='#888888', linestyle='--', linewidth=0.8, alpha=0.8)
+ax.axhline(y=0, color='#888888', linestyle='--', linewidth=0.8, alpha=0.8)
+ax.set_xlabel('OLS Coefficient')
+ax.set_ylabel('PPML Coefficient')
+ax.set_xlim(-1, 1)
+ax.set_ylim(-1, 1)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
+fig.suptitle('PPML vs OLS Coefficient', weight='bold', fontsize=16)
+
+from matplotlib.lines import Line2D
+legend_elements = [
+    Line2D([0], [0], marker="^", linestyle="none", color=COLOR_SIG, label="Significant Difference"),
+    Line2D([0], [0], marker="s", linestyle="none", color=COLOR_NONSIG, label="Insignificant Difference"),
+    Line2D([0], [0], linestyle="-", color="blue", alpha=0.5, label=r"45$^\circ$ Line"),
+]
+ax.legend(handles=legend_elements, loc="upper left", frameon=False)
+plt.tight_layout()
+plt.savefig('./paper/outputs/figure_ols_vs_ppml_2d.pdf', transparent=True, dpi=500)
+
+
+# 2D Comparison Elasticity vs OLS
+
+fig, ax = plt.subplots(figsize=(12, 8))
+sns.scatterplot(data=df_fig1, y='elasticity', x='ols_coef', hue='ols_diff_sig_5', style='ols_diff_sig_5', palette=[COLOR_NONSIG, COLOR_SIG], markers=['s', '^'], ax=ax, legend=False)
+ax.axline((0, 0), slope=1, color='blue', linestyle='-', label='45° line', alpha=0.5)
+ax.axvline(x=0, color='#888888', linestyle='--', linewidth=0.8, alpha=0.8)
+ax.axhline(y=0, color='#888888', linestyle='--', linewidth=0.8, alpha=0.8)
 ax.set_xlabel('OLS Coefficient')
 ax.set_ylabel('Elasticity')
 ax.set_xlim(-1, 1)
 ax.set_ylim(-1, 1)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
+ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
 fig.suptitle('DR Elasticity vs OLS Coefficient', weight='bold', fontsize=16)
 
 from matplotlib.lines import Line2D
 legend_elements = [
-    Line2D([0], [0], marker="o", linestyle="none", color="red", label="Significant Difference"),
-    Line2D([0], [0], marker="s", linestyle="none", color="black", label="Insignificant Difference"),
-    Line2D([0], [0], linestyle="--", color="blue", label="45° Line"),
+    Line2D([0], [0], marker="^", linestyle="none", color=COLOR_SIG, label="Significant Difference"),
+    Line2D([0], [0], marker="s", linestyle="none", color=COLOR_NONSIG, label="Insignificant Difference"),
+    Line2D([0], [0], linestyle="-", color="blue", alpha=0.5, label=r"45$^\circ$ Line"),
 ]
-ax.legend(handles=legend_elements, loc="upper left")
-# ax.set_yticks(np.arange(-0.3, 0.35, 0.05))
-# ax.set_xticks(np.arange(-0.3, 0.35, 0.05))
+ax.legend(handles=legend_elements, loc="upper left", frameon=False)
 plt.tight_layout()
+plt.savefig('./paper/outputs/figure_elasticity_vs_ols_2d.pdf', transparent=True, dpi=500)
+
+
+# 2D Comparison Elasticity vs PPML
+
+fig, ax = plt.subplots(figsize=(12, 8))
+sns.scatterplot(data=df_fig1, y='elasticity', x='ppml_coef', hue='ppml_diff_sig_5', style='ppml_diff_sig_5', palette=[COLOR_NONSIG, COLOR_SIG], markers=['s', '^'], ax=ax, legend=False)
+ax.axline((0, 0), slope=1, color='blue', linestyle='-', label='45° line', alpha=0.5)
+ax.axvline(x=0, color='#888888', linestyle='--', linewidth=0.8, alpha=0.8)
+ax.axhline(y=0, color='#888888', linestyle='--', linewidth=0.8, alpha=0.8)
+ax.set_xlabel('PPML Coefficient')
+ax.set_ylabel('Elasticity')
+ax.set_xlim(-1, 1)
+ax.set_ylim(-1, 1)
+ax.spines['top'].set_visible(False)
+ax.spines['right'].set_visible(False)
 ax.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.7)
-plt.savefig(r"C:\Users\Meet Shah\Desktop\retransformationbias\projects\applied-micro-pres\Figures\ellen-pres-scatter-ols-no-zoom.pdf", dpi=1000, transparent=True)
+fig.suptitle('DR Elasticity vs PPML Coefficient', weight='bold', fontsize=16)
+
+from matplotlib.lines import Line2D
+legend_elements = [
+    Line2D([0], [0], marker="^", linestyle="none", color=COLOR_SIG, label="Significant Difference"),
+    Line2D([0], [0], marker="s", linestyle="none", color=COLOR_NONSIG, label="Insignificant Difference"),
+    Line2D([0], [0], linestyle="-", color="blue", alpha=0.5, label=r"45$^\circ$ Line"),
+]
+ax.legend(handles=legend_elements, loc="upper left", frameon=False)
+plt.tight_layout()
+plt.savefig('./paper/outputs/figure_elasticity_vs_ppml_2d.pdf', transparent=True, dpi=500)
 
