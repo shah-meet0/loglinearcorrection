@@ -18,6 +18,7 @@ Score:
 """
 
 from typing import Optional, Dict, List, Tuple, Union
+import warnings
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -32,8 +33,52 @@ from .utils import (
     _adjust_indices_after_deletion, _redundant_columns
 )
 from .nonparametric import NNModelNuisance, NNModelDensity
-from .iv_nonparametric import NNModelDensityRatio, NNModelRieszLambda
+from .iv_nonparametric import NNModelDensityRatio, NNModelRieszLambda, NNModelPropensity
 from .iv_results import IVDREEMR
+
+
+def _construct_S_for_binary(
+    X: np.ndarray,
+    V: np.ndarray,
+    binary_var_idx: int,
+    W: np.ndarray = None
+) -> np.ndarray:
+    """
+    Construct S = (X_{-1}, W, V) by removing the binary treatment variable.
+
+    For the binary IV-DRNO, S is the conditioning set that excludes the
+    binary treatment X_1 but includes all other variables.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n, k_x)
+        Full endogenous variable matrix including binary treatment.
+    V : ndarray, shape (n, k_v)
+        Control function residuals.
+    binary_var_idx : int
+        Index of binary treatment variable to exclude from X.
+    W : ndarray, shape (n, k_w), optional
+        Exogenous control variables.
+
+    Returns
+    -------
+    S : ndarray, shape (n, k_x - 1 + k_w + k_v)
+        Conditioning set S = (X_{-1}, W, V).
+    """
+    # Remove the binary variable from X
+    X_minus_1 = np.delete(X, binary_var_idx, axis=1)
+
+    # Ensure V is 2D
+    if V.ndim == 1:
+        V = V.reshape(-1, 1)
+
+    # Concatenate components
+    if W is not None:
+        if W.ndim == 1:
+            W = W.reshape(-1, 1)
+        return np.column_stack([X_minus_1, W, V])
+
+    return np.column_stack([X_minus_1, V])
 
 
 class IVDoublyRobustElasticityEstimatorModel:
@@ -307,9 +352,186 @@ class IVDoublyRobustElasticityEstimatorModel:
         # Ensure 2D output
         if g_pred.ndim == 1:
             g_pred = g_pred.reshape(-1, 1)
-            
+
         return g_pred
-    
+
+    def _estimate_first_stage_binary(
+        self,
+        train_idx: np.ndarray,
+        var_idx: int,
+        V_continuous: Optional[np.ndarray] = None,
+        first_stage_binary_params: Optional[Dict] = None
+    ) -> Tuple[object, np.ndarray]:
+        """
+        Estimate binary first stage via probit and compute generalized residuals.
+
+        For binary endogenous variable X_1:
+            X_1 = 1{h(Z, W, V) >= U}, where U | Z, W, V ~ N(0, 1)
+
+        This implies:
+            P(X_1 = 1 | Z, W, V) = Φ(h(Z, W, V))
+
+        The generalized residual (inverse Mills ratio) is:
+            v = φ(h) / Φ(h)           if X_1 = 1
+            v = -φ(h) / (1 - Φ(h))    if X_1 = 0
+
+        Parameters
+        ----------
+        train_idx : ndarray
+            Indices of training observations.
+        var_idx : int
+            Index of the binary variable in self.exog.
+        V_continuous : ndarray, optional
+            Control function residuals from continuous endogenous variables.
+            If None, first stage uses only (Z, W).
+        first_stage_binary_params : dict, optional
+            Parameters for binary first stage with keys:
+            - 'method': 'probit' (default) or 'logit'
+            - 'arch_params': Neural network architecture (if using NN)
+            - 'fit_params': Training parameters
+
+        Returns
+        -------
+        probit_results : fitted model
+            Fitted probit/logit model for prediction.
+        gen_resid_full : ndarray, shape (n,)
+            Generalized residuals for all observations.
+        """
+        from scipy.stats import norm
+
+        if first_stage_binary_params is None:
+            first_stage_binary_params = {}
+
+        method = first_stage_binary_params.get('method', 'probit')
+        use_nn = first_stage_binary_params.get('use_nn', False)
+
+        # Build first stage design matrix
+        Z_train = self.instruments[train_idx]
+        X1_train = self.exog[train_idx, var_idx]
+
+        if self.exog_control is not None:
+            W_train = self.exog_control[train_idx]
+            design_train = np.column_stack([Z_train, W_train])
+        else:
+            design_train = Z_train
+
+        # Include continuous control function residuals if available
+        if V_continuous is not None:
+            V_cont_train = V_continuous[train_idx]
+            design_train = np.column_stack([design_train, V_cont_train])
+
+        # Add constant for probit/logit
+        design_train_const = sm.add_constant(design_train)
+
+        # Fit probit or logit
+        if method == 'probit':
+            model = sm.Probit(X1_train, design_train_const)
+        elif method == 'logit':
+            model = sm.Logit(X1_train, design_train_const)
+        else:
+            raise ValueError(f"Unknown method: {method}. Use 'probit' or 'logit'.")
+
+        try:
+            probit_results = model.fit(disp=0, maxiter=100)
+        except Exception as e:
+            print(f"    Warning: {method} failed to converge, using regularized fit")
+            probit_results = model.fit_regularized(disp=0, maxiter=100)
+
+        # Build full design matrix for prediction
+        Z_full = self.instruments
+        if self.exog_control is not None:
+            design_full = np.column_stack([Z_full, self.exog_control])
+        else:
+            design_full = Z_full
+
+        if V_continuous is not None:
+            design_full = np.column_stack([design_full, V_continuous])
+
+        design_full_const = sm.add_constant(design_full)
+
+        # Compute linear index h = design @ params
+        h_full = design_full_const @ probit_results.params
+
+        # Compute generalized residuals
+        X1_full = self.exog[:, var_idx]
+        gen_resid_full = self._compute_generalized_residuals(
+            X1_full, h_full, method=method
+        )
+
+        return probit_results, gen_resid_full
+
+    def _compute_generalized_residuals(
+        self,
+        X1: np.ndarray,
+        h: np.ndarray,
+        method: str = 'probit'
+    ) -> np.ndarray:
+        """
+        Compute generalized residuals for binary choice model.
+
+        For probit (U ~ N(0,1)):
+            v = φ(h) / Φ(h)           if X_1 = 1  (inverse Mills ratio)
+            v = -φ(h) / (1 - Φ(h))    if X_1 = 0
+
+        For logit (U ~ Logistic):
+            v = 1 - Λ(h)              if X_1 = 1
+            v = -Λ(h)                 if X_1 = 0
+        where Λ is the logistic CDF.
+
+        The generalized residual has the property:
+            E[v | Z, W] = 0
+
+        Parameters
+        ----------
+        X1 : ndarray, shape (n,)
+            Binary outcome (0 or 1).
+        h : ndarray, shape (n,)
+            Linear index from probit/logit.
+        method : str
+            'probit' or 'logit'.
+
+        Returns
+        -------
+        gen_resid : ndarray, shape (n,)
+            Generalized residuals.
+        """
+        from scipy.stats import norm, logistic
+
+        # Clip h to avoid numerical issues
+        h = np.clip(h, -10, 10)
+
+        if method == 'probit':
+            # Probit: F = Φ (standard normal CDF)
+            phi_h = norm.pdf(h)  # φ(h)
+            Phi_h = norm.cdf(h)  # Φ(h)
+
+            # Clip probabilities away from 0 and 1
+            Phi_h = np.clip(Phi_h, 1e-10, 1 - 1e-10)
+
+            # Generalized residual (inverse Mills ratio style)
+            # v = φ(h)/Φ(h) if X1=1, v = -φ(h)/(1-Φ(h)) if X1=0
+            gen_resid = np.where(
+                X1 == 1,
+                phi_h / Phi_h,
+                -phi_h / (1 - Phi_h)
+            )
+
+        elif method == 'logit':
+            # Logit: F = Λ (logistic CDF)
+            Lambda_h = logistic.cdf(h)  # Λ(h) = 1/(1+exp(-h))
+
+            # Clip probabilities
+            Lambda_h = np.clip(Lambda_h, 1e-10, 1 - 1e-10)
+
+            # Generalized residual for logit
+            # v = X1 - Λ(h) (score with respect to h)
+            gen_resid = X1 - Lambda_h
+
+        else:
+            raise ValueError(f"Unknown method: {method}")
+
+        return gen_resid
+
     def _estimate_control_function_ols_fold(
         self,
         train_idx: np.ndarray,
@@ -385,7 +607,144 @@ class IVDoublyRobustElasticityEstimatorModel:
             rho = ols_res.params[k_x:k_x + k_v]
 
         return beta, delta, rho, ols_res
-    
+
+    def _estimate_control_function_plm_fold(
+        self,
+        train_idx: np.ndarray,
+        V_hat_full: np.ndarray,
+        weight_fold: Optional[np.ndarray] = None,
+        plm_params: Optional[Dict] = None
+    ) -> Tuple[np.ndarray, np.ndarray, object, object, object]:
+        """
+        Estimate partially linear control function model via DML.
+
+        Model: log Y = β'X + δ'W + ρ(V) + ε
+
+        Uses Robinson's (1988) double-residual approach with neural networks:
+        1. Fit μ_Y(V) = E[log Y | V]
+        2. Fit μ_X(V) = E[X | V]
+        3. Fit μ_W(V) = E[W | V] (if W exists)
+        4. OLS on residuals: (log Y - μ_Y) = β'(X - μ_X) + δ'(W - μ_W) + ε
+
+        The nonlinear control function ρ(V) is implicitly:
+            ρ(V) = μ_Y(V) - β'μ_X(V) - δ'μ_W(V)
+
+        Parameters
+        ----------
+        train_idx : ndarray
+            Indices of training observations.
+        V_hat_full : ndarray, shape (n, k_v)
+            Estimated control function residuals for all observations.
+        weight_fold : ndarray, optional
+            Observation weights for all observations.
+        plm_params : dict, optional
+            Parameters for PLM neural networks.
+
+        Returns
+        -------
+        beta : ndarray, shape (k_x,)
+            Coefficients on endogenous variables X.
+        delta : ndarray, shape (k_w,) or None
+            Coefficients on exogenous controls W.
+        mu_Y_results : NNModelNuisanceResults
+            Fitted model for E[log Y | V].
+        mu_X_results : NNModelNuisanceResults
+            Fitted model for E[X | V].
+        mu_W_results : NNModelNuisanceResults or None
+            Fitted model for E[W | V] (if W exists).
+        """
+        from .nonparametric import NNModelNuisance
+
+        if plm_params is None:
+            plm_params = {}
+
+        k_x = self.exog.shape[1]
+        k_v = V_hat_full.shape[1] if V_hat_full.ndim > 1 else 1
+
+        # Ensure V_hat is 2D
+        if V_hat_full.ndim == 1:
+            V_hat_full = V_hat_full.reshape(-1, 1)
+
+        # Extract training data
+        X_train = self.exog[train_idx]
+        V_train = V_hat_full[train_idx]
+        log_y_train = np.log(self.endog[train_idx])
+
+        # Get training weights
+        weights_train = weight_fold[train_idx] if weight_fold is not None else None
+
+        # Architecture parameters for conditional expectation networks
+        arch_params = plm_params.get('arch_params', {}).copy()
+        arch_params.setdefault('hidden_layers', [128, 128])
+        arch_params.setdefault('output_activation', 'identity')
+
+        fit_params = plm_params.get('fit_params', {}).copy()
+        fit_params.setdefault('epochs', 100)
+        fit_params.setdefault('patience', 15)
+        fit_params.setdefault('verbose', False)
+
+        # ===== Step 1: Fit μ_Y(V) = E[log Y | V] =====
+        mu_Y_arch = arch_params.copy()
+        mu_Y_arch['input_size'] = k_v
+        mu_Y_arch['output_size'] = 1
+
+        mu_Y_model = NNModelNuisance(variable_types={}, **mu_Y_arch)
+        mu_Y_results = mu_Y_model.fit(V_train, log_y_train, **fit_params)
+        mu_Y_pred_train = mu_Y_results.predict(V_train)
+
+        # ===== Step 2: Fit μ_X(V) = E[X | V] =====
+        mu_X_arch = arch_params.copy()
+        mu_X_arch['input_size'] = k_v
+        mu_X_arch['output_size'] = k_x
+
+        mu_X_model = NNModelNuisance(variable_types={}, **mu_X_arch)
+        mu_X_results = mu_X_model.fit(V_train, X_train, **fit_params)
+        mu_X_pred_train = mu_X_results.predict(V_train)
+        if mu_X_pred_train.ndim == 1:
+            mu_X_pred_train = mu_X_pred_train.reshape(-1, 1)
+
+        # ===== Step 3: Fit μ_W(V) = E[W | V] if W exists =====
+        mu_W_results = None
+        if self.exog_control is not None:
+            k_w = self.exog_control.shape[1]
+            W_train = self.exog_control[train_idx]
+
+            mu_W_arch = arch_params.copy()
+            mu_W_arch['input_size'] = k_v
+            mu_W_arch['output_size'] = k_w
+
+            mu_W_model = NNModelNuisance(variable_types={}, **mu_W_arch)
+            mu_W_results = mu_W_model.fit(V_train, W_train, **fit_params)
+            mu_W_pred_train = mu_W_results.predict(V_train)
+            if mu_W_pred_train.ndim == 1:
+                mu_W_pred_train = mu_W_pred_train.reshape(-1, 1)
+        else:
+            k_w = 0
+
+        # ===== Step 4: Compute residuals =====
+        Y_tilde = log_y_train - mu_Y_pred_train  # log Y - E[log Y | V]
+        X_tilde = X_train - mu_X_pred_train      # X - E[X | V]
+
+        if k_w > 0:
+            W_tilde = W_train - mu_W_pred_train  # W - E[W | V]
+            design_tilde = np.column_stack([X_tilde, W_tilde])
+        else:
+            design_tilde = X_tilde
+
+        # ===== Step 5: OLS on residuals =====
+        if weights_train is not None:
+            ols = sm.WLS(Y_tilde, design_tilde, weights=weights_train)
+        else:
+            ols = sm.OLS(Y_tilde, design_tilde)
+
+        ols_res = ols.fit()
+
+        # Extract coefficients
+        beta = ols_res.params[:k_x]
+        delta = ols_res.params[k_x:k_x + k_w] if k_w > 0 else None
+
+        return beta, delta, mu_Y_results, mu_X_results, mu_W_results
+
     def _compute_mu_and_derivative(
         self,
         m_results,
@@ -574,6 +933,137 @@ class IVDoublyRobustElasticityEstimatorModel:
         
         return psi_uncorr, D_g_psi
 
+    def _compute_binary_score_with_grad(
+        self,
+        X: np.ndarray,
+        V: np.ndarray,
+        Y_transformed: np.ndarray,
+        m_results,  # NNModelNuisanceResults
+        pi_results,  # NNModelPropensityResults
+        beta: float,
+        var_idx: int,
+        W: np.ndarray = None
+    ) -> tuple:
+        """
+        Compute binary score and its gradient w.r.t. V via autodiff.
+
+        Binary score: ψ = θ(S) + α_1(S)Δ_1 + α_0(S)Δ_0
+
+        where:
+            θ(S) = exp(β) * m_1(S)/m_0(S) - 1
+            Δ_1 = 1{X_1=1}/π(S) * (R - m_1(S))
+            Δ_0 = 1{X_1=0}/(1-π(S)) * (R - m_0(S))
+            α_1(S) = exp(β)/m_0(S)
+            α_0(S) = -exp(β) * m_1(S)/m_0(S)²
+
+        Parameters
+        ----------
+        X : ndarray, shape (n, k_x)
+            Endogenous variables.
+        V : ndarray, shape (n, k_v)
+            Control function residuals.
+        Y_transformed : ndarray, shape (n,)
+            R = Y * exp(-β * X_1).
+        m_results : NNModelNuisanceResults
+            Fitted m(X, V) model.
+        pi_results : NNModelPropensityResults
+            Fitted π(S) propensity model.
+        beta : float
+            Coefficient on binary treatment.
+        var_idx : int
+            Index of binary variable.
+        W : ndarray, shape (n, k_w), optional
+            Exogenous controls.
+
+        Returns
+        -------
+        psi_uncorr : ndarray, shape (n,)
+            Uncorrected binary score.
+        D_g_psi : ndarray, shape (n, k_v)
+            Gradient of score w.r.t. V.
+        """
+        import torch
+
+        device = m_results.device
+        n = X.shape[0]
+        k_v = V.shape[1] if V.ndim > 1 else 1
+
+        if V.ndim == 1:
+            V = V.reshape(-1, 1)
+
+        exp_beta = np.exp(beta)
+
+        # Convert to tensors with grad tracking on V
+        X_t = torch.tensor(X, dtype=torch.float32, device=device)
+        V_t = torch.tensor(V, dtype=torch.float32, device=device, requires_grad=True)
+        R_t = torch.tensor(Y_transformed, dtype=torch.float32, device=device)
+        X1_obs = torch.tensor(X[:, var_idx], dtype=torch.float32, device=device)
+
+        # Create X with X_1=0 and X_1=1
+        X_t_0 = X_t.clone()
+        X_t_0[:, var_idx] = 0
+        X_t_1 = X_t.clone()
+        X_t_1[:, var_idx] = 1
+
+        # Forward pass through m(X, V) to get m_0 and m_1
+        m_results.model.eval()
+        m_input_0 = torch.cat([X_t_0, V_t], dim=1)
+        m_input_1 = torch.cat([X_t_1, V_t], dim=1)
+
+        m_0 = m_results.model(m_input_0).squeeze(-1)
+        m_1 = m_results.model(m_input_1).squeeze(-1)
+        m_0 = torch.clamp(m_0, min=1e-8)
+        m_1 = torch.clamp(m_1, min=1e-8)
+
+        # Construct S = (X_{-1}, W, V) for propensity
+        X_minus_1 = torch.cat([X_t[:, :var_idx], X_t[:, var_idx+1:]], dim=1)
+        if W is not None:
+            W_t = torch.tensor(W, dtype=torch.float32, device=device)
+            S_t = torch.cat([X_minus_1, W_t, V_t], dim=1)
+        else:
+            S_t = torch.cat([X_minus_1, V_t], dim=1)
+
+        # Forward pass through π(S)
+        pi_results.model.eval()
+        pi_logits = pi_results.model(S_t).squeeze(-1)
+        pi = torch.sigmoid(pi_logits)
+        pi = torch.clamp(pi, min=0.01, max=0.99)
+
+        # Compute score components
+        # θ(S) = exp(β) * m_1/m_0 - 1
+        theta = exp_beta * m_1 / m_0 - 1
+
+        # α_1(S) = exp(β)/m_0(S)
+        alpha_1 = exp_beta / m_0
+
+        # α_0(S) = -exp(β) * m_1(S)/m_0(S)²
+        alpha_0 = -exp_beta * m_1 / (m_0 ** 2)
+
+        # Δ_1 = 1{X_1=1}/π * (R - m_1)
+        Delta_1 = (X1_obs / pi) * (R_t - m_1)
+
+        # Δ_0 = 1{X_1=0}/(1-π) * (R - m_0)
+        Delta_0 = ((1 - X1_obs) / (1 - pi)) * (R_t - m_0)
+
+        # Uncorrected score (before λ correction)
+        psi = theta + alpha_1 * Delta_1 + alpha_0 * Delta_0
+
+        # Compute gradient w.r.t. V
+        grad_outputs = torch.ones_like(psi)
+        grads = torch.autograd.grad(
+            outputs=psi,
+            inputs=V_t,
+            grad_outputs=grad_outputs,
+            create_graph=False,
+            retain_graph=False,
+            allow_unused=False
+        )[0]
+
+        psi_uncorr = psi.detach().cpu().numpy()
+        D_g_psi = grads.detach().cpu().numpy()
+
+        return psi_uncorr, D_g_psi
+
 
     def _estimate_lambda_autodml(
         self,
@@ -639,43 +1129,114 @@ class IVDoublyRobustElasticityEstimatorModel:
         weight_fold: np.ndarray,
         interest_indices: List[int],
         first_stage_params: Dict,
+        first_stage_binary_params: Dict,
         m_params: Dict,
         density_params: Dict,
         omega_params: Dict,
-        lambda_params: Dict
+        lambda_params: Dict,
+        pi_params: Dict,
+        plm_params: Dict = None,
+        use_plm: bool = True
     ) -> Dict:
         """
         Fold processing using automatic DML for λ estimation.
 
         Steps:
-        1. Estimate first stage g(Z) on train
-        2. Compute V_hat = X - g(Z) on full data (using train-fitted model)
-        3. Estimate β, ρ via control function OLS on TRAIN only
+        1. Estimate first stage:
+           - For continuous X: g(Z) = E[X|Z,W], then V = X - g(Z)
+           - For binary X: probit/logit first stage, then generalized residuals
+        2. Compute V_hat on full data (using train-fitted models)
+        3. Estimate β via partially linear model (PLM) or OLS on TRAIN only
+           - PLM: log Y = β'X + δ'W + ρ(V) + ε with nonparametric ρ(V)
+           - OLS: log Y = β'X + δ'W + ρ'V + ε with linear ρ'V
         4. Estimate m(X, V) on train
         5. Compute μ(x), μ'(x) on test via MC integration
         6. Estimate ω(X, V) on train
         7. Estimate S_X(X) on train
+        7b. Estimate π(S) for binary variables
         8. Compute uncorrected score AND its gradient ∂ψ/∂V on train
         9. Estimate λ(Z) = E[∂ψ/∂V | Z] via regression
         10. Construct final corrected moments and derivatives on test
+
+        Parameters
+        ----------
+        ...
+        plm_params : dict, optional
+            Parameters for partially linear model neural networks.
+        use_plm : bool, default=True
+            If True, use nonparametric ρ(V). If False, use linear ρ'V.
         """
         k_x = self.exog.shape[1]
         k_v = k_x  # V has same dimension as X
         n_interest = len(interest_indices)
+        n = len(self.endog)
 
-        # ===== Steps 1-2: First stage =====
-        print("  Estimating first stage g(Z)...")
-        g_results = self._estimate_first_stage(train_idx, first_stage_params)
+        # ===== Steps 1-2: First stage with generalized residuals for binary =====
+        # Identify binary and continuous variables
+        binary_indices = [i for i in range(k_x) if self.variable_types.get(i) == 'binary']
+        continuous_indices = [i for i in range(k_x) if i not in binary_indices]
 
-        W_full = self.exog_control if self.exog_control is not None else None
-        g_pred_full = self._predict_first_stage(g_results, self.instruments, W_full)
-        V_hat_full = self.exog - g_pred_full
+        # Warn about binary variable bias
+        if binary_indices:
+            warnings.warn(
+                "IV-DRNO with binary endogenous variables may be severely biased. "
+                "The control function (generalized residuals) has disjoint support "
+                "for treated vs untreated observations, requiring extrapolation that "
+                "neural networks cannot reliably perform. The arithmetic elasticity "
+                "may not be point-identified with binary endogenous variables. "
+                "See docs/iv_drno_binary_bias.md for details.",
+                UserWarning
+            )
 
-        # ===== Step 3: Control function OLS on TRAINING data only =====
-        print("  Estimating control function OLS...")
-        beta, delta, rho, ols_res = self._estimate_control_function_ols_fold(
-            train_idx, V_hat_full, weight_fold
-        )
+        print("  Estimating first stage...")
+        V_hat_full = np.zeros((n, k_x))
+        g_results = None
+        binary_first_stage_results = {}
+
+        # Step 1a: Estimate first stage for continuous variables (if any)
+        if continuous_indices:
+            print(f"    Continuous variables {continuous_indices}: g(Z) = E[X|Z,W]")
+            # For continuous, use standard first stage
+            g_results = self._estimate_first_stage(train_idx, first_stage_params)
+            W_full = self.exog_control if self.exog_control is not None else None
+            g_pred_full = self._predict_first_stage(g_results, self.instruments, W_full)
+
+            # Compute additive residuals for continuous variables
+            for i in continuous_indices:
+                V_hat_full[:, i] = self.exog[:, i] - g_pred_full[:, i]
+        else:
+            print("    No continuous endogenous variables")
+
+        # Step 1b: Estimate binary first stage with generalized residuals
+        if binary_indices:
+            # Get continuous residuals for conditioning (if any)
+            V_continuous = V_hat_full[:, continuous_indices] if continuous_indices else None
+
+            for var_idx in binary_indices:
+                print(f"    Binary variable {var_idx}: probit first stage + generalized residuals")
+                probit_res, gen_resid = self._estimate_first_stage_binary(
+                    train_idx,
+                    var_idx,
+                    V_continuous=V_continuous,
+                    first_stage_binary_params=first_stage_binary_params
+                )
+                V_hat_full[:, var_idx] = gen_resid
+                binary_first_stage_results[var_idx] = probit_res
+
+        # ===== Step 3: Control function estimation on TRAINING data only =====
+        if use_plm:
+            print("  Estimating control function via PLM (nonlinear ρ(V))...")
+            beta, delta, mu_Y_results, mu_X_results, mu_W_results = \
+                self._estimate_control_function_plm_fold(
+                    train_idx, V_hat_full, weight_fold, plm_params
+                )
+            rho = None  # ρ(V) is nonparametric, stored implicitly in mu_Y, mu_X, mu_W
+        else:
+            print("  Estimating control function via OLS (linear ρ'V)...")
+            beta, delta, rho, ols_res = self._estimate_control_function_ols_fold(
+                train_idx, V_hat_full, weight_fold
+            )
+            mu_Y_results = mu_X_results = mu_W_results = None
 
         Y_transformed = self.endog * np.exp(-self.exog @ beta)
         
@@ -720,23 +1281,73 @@ class IVDoublyRobustElasticityEstimatorModel:
         from .nonparametric import NNModelDensity
         density_model = NNModelDensity(variable_types=self.variable_types, **density_params.get('arch_params', {}))
         density_results = density_model.fit(X_train, interest=interest_indices, **density_params.get('fit_params', {}))
-        
+
+        # ===== Step 7b: Estimate propensity π(S) for binary variables =====
+        binary_indices = [i for i in interest_indices
+                         if self.variable_types.get(i) == 'binary']
+        pi_results_dict = {}
+
+        if binary_indices:
+            print("  Estimating propensity π(S) for binary variables...")
+            W_train = self.exog_control[train_idx] if self.exog_control is not None else None
+
+            for var_idx in binary_indices:
+                # Construct S = (X_{-1}, W, V) excluding the binary variable
+                S_train = _construct_S_for_binary(X_train, V_train, var_idx, W_train)
+                X1_train = X_train[:, var_idx]
+
+                pi_arch = pi_params.get('arch_params', {}).copy()
+                pi_model = NNModelPropensity(**pi_arch)
+                pi_results_dict[var_idx] = pi_model.fit(
+                    S_train, X1_train,
+                    **pi_params.get('fit_params', {})
+                )
+
         # ===== Step 8: Compute uncorrected score and gradient on TRAIN =====
         print("  Computing pathwise derivatives via autodiff...")
-        
-        # Need μ and μ' on training set for computing D_g
+
+        # Need μ and μ' on training set for computing D_g (for continuous vars)
         mu_train, mu_prime_train = self._compute_mu_and_derivative(
             m_results, X_train, V_train, interest_indices
         )
         mu_train = np.maximum(mu_train, 1e-10)
-        
-        # Compute uncorrected score and its gradient w.r.t. V
-        _, D_g_train = self._compute_uncorrected_score_with_grad(
-            X_train, V_train, Y_trans_train,
-            m_results, omega_results, density_results,
-            mu_train, mu_prime_train,
-            beta, interest_indices
-        )
+
+        # Separate continuous and binary indices
+        continuous_indices = [i for i in interest_indices
+                              if self.variable_types.get(i) != 'binary']
+
+        n_train = len(train_idx)
+        D_g_train = np.zeros((n_train, n_interest, k_v))
+
+        # Compute gradients for continuous variables
+        if continuous_indices:
+            # Map continuous indices to their position in interest_indices
+            cont_positions = [interest_indices.index(i) for i in continuous_indices]
+
+            _, D_g_continuous = self._compute_uncorrected_score_with_grad(
+                X_train, V_train, Y_trans_train,
+                m_results, omega_results, density_results,
+                mu_train, mu_prime_train,
+                beta, continuous_indices
+            )
+            # Place continuous gradients in the right positions
+            for i, pos in enumerate(cont_positions):
+                D_g_train[:, pos, :] = D_g_continuous[:, i, :]
+
+        # Compute gradients for binary variables
+        if binary_indices:
+            W_train_for_grad = self.exog_control[train_idx] if self.exog_control is not None else None
+
+            for var_idx in binary_indices:
+                k_idx = interest_indices.index(var_idx)
+
+                _, D_g_binary = self._compute_binary_score_with_grad(
+                    X_train, V_train, Y_trans_train,
+                    m_results, pi_results_dict[var_idx],
+                    beta[var_idx], var_idx,
+                    W_train_for_grad
+                )
+                D_g_train[:, k_idx, :] = D_g_binary
         
         # ===== Step 9: Estimate λ(Z) = E[D_g ψ | Z] =====
         print("  Estimating λ(Z) via automatic DML...")
@@ -798,36 +1409,83 @@ class IVDoublyRobustElasticityEstimatorModel:
                     fold_derivative[:, k_idx, n_interest + j_idx] -= alpha_x * Y_trans_test * X_test[:, j_var]
 
             elif var_type == 'binary':
-                X_test_flip = X_test.copy()
-                X_test_flip[:, var_idx] = 1 - X_test_flip[:, var_idx]
+                # ===== Binary IV-DRNO following Neyman-orthogonal score =====
+                # Score: ψ = θ(S) + α_1(S)Δ_1 + α_0(S)Δ_0 - λ̃(Z)'V
+                #
+                # where:
+                #   θ(S) = exp(β) * m_1(S)/m_0(S) - 1  (SAME for all obs)
+                #   m_i(S) = m(X with X_1=i, V)
+                #   Δ_1 = 1{X_1=1}/π(S) * (R - m_1(S))
+                #   Δ_0 = 1{X_1=0}/(1-π(S)) * (R - m_0(S))
+                #   α_1(S) = exp(β)/m_0(S)
+                #   α_0(S) = -exp(β) * m_1(S)/m_0(S)²
 
-                m_input_flip = np.column_stack([X_test_flip, V_test])
-                m_flip = m_results.predict(m_input_flip)
-                m_flip = np.maximum(m_flip, 1e-10)
+                exp_beta = np.exp(beta[var_idx])
 
-                mu_flip, _ = self._compute_mu_and_derivative(
-                    m_results, X_test_flip, V_train, interest_indices
-                )
-                mu_flip = np.maximum(mu_flip, 1e-10)
+                # Step 1: Compute m at both treatment levels
+                X_test_0 = X_test.copy()
+                X_test_0[:, var_idx] = 0
+                X_test_1 = X_test.copy()
+                X_test_1[:, var_idx] = 1
 
-                p_var = S_X_test[:, k_idx]
+                m_input_0 = np.column_stack([X_test_0, V_test])
+                m_input_1 = np.column_stack([X_test_1, V_test])
 
-                theta_x = np.exp(beta[var_idx]) * (mu_flip / mu_test) - 1
+                m_0 = np.maximum(m_results.predict(m_input_0), 1e-10)
+                m_1 = np.maximum(m_results.predict(m_input_1), 1e-10)
 
-                alpha_0 = (1 - X_test[:, var_idx]) * m_flip / (m_test**2 * (np.abs(p_var) + 1e-10))
-                alpha_1 = X_test[:, var_idx] / ((np.abs(p_var) + 1e-10) * m_flip)
-                alpha_x = np.exp(beta[var_idx]) * (alpha_1 - alpha_0)
+                # Step 2: θ(S) = exp(β) * m_1/m_0 - 1 (SAME for all observations)
+                theta_x = exp_beta * m_1 / m_0 - 1
 
+                # Step 3: Get propensity π(S) = P(X_1=1 | S)
+                W_test = self.exog_control[test_idx] if self.exog_control is not None else None
+                S_test = _construct_S_for_binary(X_test, V_test, var_idx, W_test)
+                pi = pi_results_dict[var_idx].predict(S_test)
+
+                # Step 4: IPW residuals
+                X1_obs = X_test[:, var_idx]
+                R_binary = Y_trans_test  # R = Y * exp(-β * X_1), same as Y_trans_test
+
+                # Δ_1 = 1{X_1=1}/π * (R - m_1)
+                Delta_1 = (X1_obs / pi) * (R_binary - m_1)
+
+                # Δ_0 = 1{X_1=0}/(1-π) * (R - m_0)
+                Delta_0 = ((1 - X1_obs) / (1 - pi)) * (R_binary - m_0)
+
+                # Step 5: Riesz representers
+                alpha_1 = exp_beta / m_0
+                alpha_0 = -exp_beta * m_1 / (m_0 ** 2)
+
+                # Step 6: Lambda correction
                 lambda_k = lambda_test[:, k_idx, :]
                 lambda_correction = np.sum(lambda_k * V_test, axis=1)
 
-                fold_moments[:, k_idx] = theta_x + alpha_x * R_test - lambda_correction
+                # Step 7: Final moment: ψ = θ + α_1*Δ_1 + α_0*Δ_0 - λ'V
+                fold_moments[:, k_idx] = (
+                    theta_x
+                    + alpha_1 * Delta_1
+                    + alpha_0 * Delta_0
+                    - lambda_correction
+                )
 
-                # Binary derivative w.r.t. β
-                Y_trans_test = Y_transformed[test_idx]
-                fold_derivative[:, k_idx, n_interest + k_idx] = theta_x + 1 + alpha_x * (Y_trans_test - m_test)
+                # Store combined alpha for compatibility (though structure differs)
+                alpha_x = alpha_1 * (X1_obs / pi) + alpha_0 * ((1 - X1_obs) / (1 - pi))
+
+                # Binary derivative w.r.t. β for variance estimation
+                # ∂ψ/∂β = (θ + 1) + α_1 * Δ_1 + α_0 * Δ_0  (from exp(β) factor)
+                #        + terms from R = Y*exp(-βX_1) dependence
+                Y_trans_test_local = Y_transformed[test_idx]
+                fold_derivative[:, k_idx, n_interest + k_idx] = (
+                    theta_x + 1
+                    + alpha_1 * Delta_1
+                    + alpha_0 * Delta_0
+                )
                 for j_idx, j_var in enumerate(interest_indices):
-                    fold_derivative[:, k_idx, n_interest + j_idx] -= alpha_x * Y_trans_test * X_test[:, j_var]
+                    # Contribution from ∂R/∂β_j = -Y*exp(-βX_1)*X_j = -R*X_j
+                    fold_derivative[:, k_idx, n_interest + j_idx] -= (
+                        alpha_1 * (X1_obs / pi) * Y_trans_test_local * X_test[:, j_var]
+                        + alpha_0 * ((1 - X1_obs) / (1 - pi)) * Y_trans_test_local * X_test[:, j_var]
+                    )
 
             else:  # ordinal
                 theta_x = np.zeros(n_test)
@@ -856,7 +1514,11 @@ class IVDoublyRobustElasticityEstimatorModel:
             'mu_test': mu_test,
             'mu_prime_test': mu_prime_test,
             'test_idx': test_idx,
-            'V_hat_full': V_hat_full
+            'V_hat_full': V_hat_full,
+            # PLM components (if use_plm=True)
+            'mu_Y_results': mu_Y_results if use_plm else None,
+            'mu_X_results': mu_X_results if use_plm else None,
+            'mu_W_results': mu_W_results if use_plm else None,
         }
 
     
@@ -865,15 +1527,19 @@ class IVDoublyRobustElasticityEstimatorModel:
         n_folds: int = 5,
         random_state: Optional[int] = None,
         first_stage_params: Optional[Dict] = None,
+        first_stage_binary_params: Optional[Dict] = None,
         m_params: Optional[Dict] = None,
         density_params: Optional[Dict] = None,
         omega_params: Optional[Dict] = None,
         lambda_params: Optional[Dict] = None,
+        pi_params: Optional[Dict] = None,
+        plm_params: Optional[Dict] = None,
+        use_plm: bool = False,
         n_mc_samples: int = 500
     ) -> 'IVDREEMR':
         """
         Fit the IV-DRNO estimator via cross-fitting.
-        
+
         Parameters
         ----------
         n_folds : int, default=5
@@ -881,7 +1547,11 @@ class IVDoublyRobustElasticityEstimatorModel:
         random_state : int, optional
             Random seed for reproducibility.
         first_stage_params : dict, optional
-            Parameters for first stage g(Z) estimation.
+            Parameters for first stage g(Z) estimation (continuous variables).
+        first_stage_binary_params : dict, optional
+            Parameters for binary first stage with keys:
+            - 'method': 'probit' (default) or 'logit'
+            Binary variables use generalized residuals (inverse Mills ratio).
         m_params : dict, optional
             Parameters for m(X,V) nuisance estimation.
         density_params : dict, optional
@@ -890,40 +1560,52 @@ class IVDoublyRobustElasticityEstimatorModel:
             Parameters for density ratio ω estimation.
         lambda_params : dict, optional
             Parameters for λ(Z) estimation.
+        pi_params : dict, optional
+            Parameters for propensity π(S) estimation (binary variables only).
+        plm_params : dict, optional
+            Parameters for partially linear model estimation of ρ(V).
+            Used when use_plm=True.
+        use_plm : bool, default=False
+            If True, estimate nonparametric control function ρ(V) via PLM.
+            If False, estimate linear control function ρ'V via OLS.
         n_mc_samples : int, default=500
             Number of samples for Monte Carlo integration of μ(x).
-            
+
         Returns
         -------
         IVDREEMR
             Results object with estimates and inference.
         """
-        
+
         # Parse parameters with defaults
         first_stage_params = self._parse_first_stage_params(first_stage_params)
+        first_stage_binary_params = self._parse_first_stage_binary_params(first_stage_binary_params)
         m_params = self._parse_m_params(m_params)
         density_params = self._parse_density_params(density_params)
         omega_params = self._parse_omega_params(omega_params)
         lambda_params = self._parse_lambda_params(lambda_params)
-        
+        pi_params = self._parse_pi_params(pi_params)
+        plm_params = self._parse_plm_params(plm_params)
+
         # Set up cross-validation
         kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
-        
+
         # Process each fold
         fold_results = []
         interest_indices = self.interest
-        
+
         for fold_idx, (train_idx, test_idx) in enumerate(kf.split(self.exog)):
             print(f"Processing fold {fold_idx + 1}/{n_folds}")
-            
+
             weight_fold = np.ones(self.nobs)
             if self.weights is not None:
                 weight_fold = weight_fold * self.weights
-                
+
             fold_result = self._process_fold(
                 train_idx, test_idx, weight_fold,
-                interest_indices, first_stage_params, m_params,
-                density_params, omega_params, lambda_params
+                interest_indices, first_stage_params, first_stage_binary_params,
+                m_params, density_params, omega_params, lambda_params, pi_params,
+                plm_params=plm_params, use_plm=use_plm
             )
             fold_results.append(fold_result)
             
@@ -939,7 +1621,11 @@ class IVDoublyRobustElasticityEstimatorModel:
 
         # Average beta across folds for final estimate
         beta_avg = np.mean([fold['beta'] for fold in fold_results], axis=0)
-        rho_avg = np.mean([fold['rho'] for fold in fold_results], axis=0)
+
+        # Handle rho: None when using PLM (nonparametric), array when using OLS (linear)
+        rho_list = [fold['rho'] for fold in fold_results if fold['rho'] is not None]
+        rho_avg = np.mean(rho_list, axis=0) if rho_list else None
+
         delta_list = [fold['delta'] for fold in fold_results if fold['delta'] is not None]
         delta_avg = np.mean(delta_list, axis=0) if delta_list else None
 
@@ -952,9 +1638,28 @@ class IVDoublyRobustElasticityEstimatorModel:
             )
 
         # Add OLS moment conditions for joint inference
-        # OLS moments: ε_i * X_i where ε = log Y - β'X - ρ'V
+        # OLS moments: ε_i * X_i where ε = log Y - β'X - ρ(V)
         log_Y = np.log(self.endog)
-        eps_ols = log_Y - self.exog @ beta_avg - V_hat_final @ rho_avg
+
+        if rho_avg is not None:
+            # Linear control function: ε = log Y - β'X - ρ'V
+            eps_ols = log_Y - self.exog @ beta_avg - V_hat_final @ rho_avg
+        else:
+            # Nonparametric control function (PLM): ε = log Y - β'X - ρ̂(V)
+            # Use last fold's PLM models to compute ρ̂(V) = μ_Y(V) - β'μ_X(V)
+            mu_Y_results = fold_results[-1].get('mu_Y_results')
+            mu_X_results = fold_results[-1].get('mu_X_results')
+            if mu_Y_results is not None and mu_X_results is not None:
+                mu_Y_full = mu_Y_results.predict(V_hat_final)
+                mu_X_full = mu_X_results.predict(V_hat_final)
+                if mu_X_full.ndim == 1:
+                    mu_X_full = mu_X_full.reshape(-1, 1)
+                rho_hat_full = mu_Y_full - (mu_X_full @ beta_avg)
+                eps_ols = log_Y - self.exog @ beta_avg - rho_hat_full
+            else:
+                # Fallback: just use log Y - β'X (ignoring ρ)
+                eps_ols = log_Y - self.exog @ beta_avg
+
         X_interest = self.exog[:, interest_indices]
         ols_moments = eps_ols[:, None] * X_interest
         moments[:, n_interest:] = ols_moments
@@ -1026,7 +1731,34 @@ class IVDoublyRobustElasticityEstimatorModel:
             'fit_params': {**defaults['fit_params'], **params.get('fit_params', {})}
         }
         return result
-    
+
+    def _parse_first_stage_binary_params(self, params: Optional[Dict]) -> Dict:
+        """Parse binary first stage parameters with defaults.
+
+        For binary endogenous variables, we use probit/logit first stage
+        and compute generalized residuals (inverse Mills ratio).
+
+        Parameters
+        ----------
+        params : dict, optional
+            User-provided parameters with keys:
+            - 'method': 'probit' (default) or 'logit'
+
+        Returns
+        -------
+        dict
+            Merged parameters with defaults.
+        """
+        if params is None:
+            params = {}
+
+        defaults = {
+            'method': 'probit',  # 'probit' or 'logit'
+        }
+
+        result = {**defaults, **params}
+        return result
+
     def _parse_m_params(self, params: Optional[Dict]) -> Dict:
         """Parse m(X,V) model parameters with defaults."""
         if params is None:
@@ -1104,6 +1836,66 @@ class IVDoublyRobustElasticityEstimatorModel:
             }
         }
         
+        result = {
+            'arch_params': {**defaults['arch_params'], **params.get('arch_params', {})},
+            'fit_params': {**defaults['fit_params'], **params.get('fit_params', {})}
+        }
+        return result
+
+    def _parse_pi_params(self, params: Optional[Dict]) -> Dict:
+        """Parse propensity score parameters for binary treatment variables."""
+        if params is None:
+            params = {}
+
+        defaults = {
+            'arch_params': {
+                'hidden_layers': [128, 128],
+            },
+            'fit_params': {
+                'epochs': 100
+            }
+        }
+
+        result = {
+            'arch_params': {**defaults['arch_params'], **params.get('arch_params', {})},
+            'fit_params': {**defaults['fit_params'], **params.get('fit_params', {})}
+        }
+        return result
+
+    def _parse_plm_params(self, params: Optional[Dict]) -> Dict:
+        """Parse partially linear model (PLM) parameters for nonparametric ρ(V).
+
+        Used when use_plm=True to estimate:
+            log Y = β'X + δ'W + ρ(V) + ε
+        via Robinson's (1988) double-residual approach with neural networks.
+
+        Parameters
+        ----------
+        params : dict, optional
+            User-provided PLM parameters with keys:
+            - 'arch_params': Neural network architecture parameters
+            - 'fit_params': Training parameters for the neural networks
+
+        Returns
+        -------
+        dict
+            Merged parameters with defaults filled in.
+        """
+        if params is None:
+            params = {}
+
+        defaults = {
+            'arch_params': {
+                'hidden_layers': [128, 128],
+                'output_activation': 'identity',
+            },
+            'fit_params': {
+                'epochs': 100,
+                'patience': 15,
+                'verbose': False
+            }
+        }
+
         result = {
             'arch_params': {**defaults['arch_params'], **params.get('arch_params', {})},
             'fit_params': {**defaults['fit_params'], **params.get('fit_params', {})}

@@ -4,6 +4,7 @@ IV-specific nonparametric models for IVDRNO estimator.
 Contains:
 - NNModelDensityRatio: Classification-based density ratio ω(x,v) = f_V(v)/f_{V|X}(v|x)
 - NNModelRieszLambda: Automatic DML estimation of λ(Z) correction
+- NNModelPropensity: Propensity score π(s) = P(X_1=1|S) for binary treatment
 """
 
 import numpy as np
@@ -617,3 +618,290 @@ class NNModelRieszLambdaResults(NPModelResults):
             
         pred_np = pred.squeeze(-1).cpu().numpy()
         return pred_np.astype(np.float64)
+
+
+class NNModelPropensity(NNModel):
+    """
+    Propensity score estimation for binary treatment in IV setting.
+
+    Estimates π(s) = P(X_1 = 1 | S = s) where S = (X_{-1}, W, V) includes
+    the control function residual V. This conditioning on V is required
+    for Neyman orthogonality in the IV-DRNO binary treatment case.
+
+    Unlike standard propensity scores that only condition on observed
+    covariates, this conditions on the estimated first-stage residual,
+    which captures the endogeneity structure.
+
+    Parameters
+    ----------
+    hidden_layers : list of int, default=[128, 128]
+        Hidden layer sizes for the classifier.
+    activation : str, default='leaky_relu'
+        Activation function.
+    dropout : float, default=0.1
+        Dropout rate.
+    **params : dict
+        Additional parameters passed to base NNModel.
+    """
+
+    def __init__(
+        self,
+        hidden_layers: List[int] = None,
+        activation: str = 'leaky_relu',
+        dropout: float = 0.1,
+        **params
+    ):
+        self._arch_config = {
+            'hidden_layers': hidden_layers or [128, 128],
+            'activation': activation,
+            'dropout': dropout,
+            'output_activation': 'identity',  # Sigmoid applied in loss
+            'bias': True,
+            'weight_init': 'default'
+        }
+
+        for key, val in params.items():
+            if key in self._arch_config:
+                self._arch_config[key] = val
+
+        super().__init__(variable_types={}, build_now=False, **self._arch_config)
+
+    def fit(
+        self,
+        S: npt.ArrayLike,
+        X1: npt.ArrayLike,
+        *,
+        epochs: int = 100,
+        batch_size: int = 256,
+        learning_rate: float = 1e-3,
+        weight_decay: float = 1e-4,
+        val_frac: float = 0.2,
+        patience: int = 15,
+        verbose: bool = True,
+        **kwargs
+    ) -> 'NNModelPropensityResults':
+        """
+        Fit the propensity score model.
+
+        Parameters
+        ----------
+        S : array_like, shape (n, dim_S)
+            Conditioning variables S = (X_{-1}, W, V).
+        X1 : array_like, shape (n,)
+            Binary treatment indicator (0 or 1).
+        epochs : int, default=100
+            Training epochs.
+        batch_size : int, default=256
+            Batch size.
+        learning_rate : float, default=1e-3
+            Learning rate.
+        weight_decay : float, default=1e-4
+            L2 regularization.
+        val_frac : float, default=0.2
+            Validation fraction for early stopping.
+        patience : int, default=15
+            Early stopping patience.
+        verbose : bool, default=True
+            Print training progress.
+
+        Returns
+        -------
+        NNModelPropensityResults
+            Fitted model with prediction methods.
+        """
+        import torch
+        import torch.nn as nn
+        from torch.utils.data import DataLoader, TensorDataset
+
+        S = np.asarray(S, dtype=np.float32)
+        X1 = np.asarray(X1, dtype=np.float32).ravel()
+
+        if S.ndim == 1:
+            S = S.reshape(-1, 1)
+
+        n = S.shape[0]
+        input_size = S.shape[1]
+
+        # Validate binary treatment
+        unique_vals = np.unique(X1)
+        if not np.allclose(unique_vals, [0, 1]) and not np.allclose(unique_vals, [0]) and not np.allclose(unique_vals, [1]):
+            raise ValueError(f"X1 must be binary (0/1), got unique values: {unique_vals}")
+
+        # Build model
+        self._arch_config['input_size'] = input_size
+        self._arch_config['output_size'] = 1
+        self.model = self._create_model().to(self.device)
+
+        # Split train/val
+        n_val = int(n * val_frac)
+        perm = np.random.permutation(n)
+        val_idx = perm[:n_val]
+        train_idx = perm[n_val:]
+
+        # Create dataloaders
+        S_tr = torch.as_tensor(S[train_idx], dtype=torch.float32)
+        y_tr = torch.as_tensor(X1[train_idx], dtype=torch.float32).unsqueeze(-1)
+        S_va = torch.as_tensor(S[val_idx], dtype=torch.float32)
+        y_va = torch.as_tensor(X1[val_idx], dtype=torch.float32).unsqueeze(-1)
+
+        ds_tr = TensorDataset(S_tr, y_tr)
+        ds_va = TensorDataset(S_va, y_va)
+
+        pin = (self.device.type == "cuda")
+        dl_tr = DataLoader(ds_tr, batch_size=batch_size, shuffle=True, pin_memory=pin)
+        dl_va = DataLoader(ds_va, batch_size=batch_size, shuffle=False, pin_memory=pin)
+
+        # Loss and optimizer
+        # Use class-weighted BCE if imbalanced
+        n_pos = X1[train_idx].sum()
+        n_neg = len(train_idx) - n_pos
+        if n_pos > 0 and n_neg > 0:
+            pos_weight = torch.tensor([n_neg / n_pos], dtype=torch.float32, device=self.device)
+        else:
+            pos_weight = torch.tensor([1.0], dtype=torch.float32, device=self.device)
+
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+
+        # Training loop
+        best_loss = float('inf')
+        best_state = None
+        bad = 0
+        log_every = max(1, epochs // 10)
+
+        for ep in range(1, epochs + 1):
+            # Train
+            self.model.train()
+            tr_sum = tr_cnt = 0
+            for sb, yb in dl_tr:
+                sb = sb.to(self.device, non_blocking=pin)
+                yb = yb.to(self.device, non_blocking=pin)
+
+                optimizer.zero_grad(set_to_none=True)
+                logits = self.model(sb)
+                loss = criterion(logits, yb)
+                loss.backward()
+                optimizer.step()
+
+                bs = sb.size(0)
+                tr_sum += float(loss.detach()) * bs
+                tr_cnt += bs
+            tr_loss = tr_sum / max(tr_cnt, 1)
+
+            # Validate
+            self.model.eval()
+            va_sum = va_cnt = 0
+            with torch.no_grad():
+                for sb, yb in dl_va:
+                    sb = sb.to(self.device, non_blocking=pin)
+                    yb = yb.to(self.device, non_blocking=pin)
+                    logits = self.model(sb)
+                    loss = criterion(logits, yb)
+                    bs = sb.size(0)
+                    va_sum += float(loss) * bs
+                    va_cnt += bs
+            va_loss = va_sum / max(va_cnt, 1)
+
+            improved = va_loss < best_loss - 1e-6
+            if improved:
+                best_loss = va_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in self.model.state_dict().items()}
+                bad = 0
+            else:
+                bad += 1
+
+            if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
+                print(f"[Propensity ep {ep:>3}/{epochs}] train={tr_loss:.4f} val={va_loss:.4f}{' *' if improved else ''}")
+
+            if bad >= patience:
+                if verbose:
+                    print(f"Early stopping at epoch {ep}")
+                break
+
+        # Restore best
+        if best_state is not None:
+            self.model.load_state_dict(best_state)
+
+        return NNModelPropensityResults(self, val_loss=best_loss)
+
+    def _parse_params(self) -> dict:
+        return self._arch_config
+
+
+class NNModelPropensityResults(NPModelResults):
+    """
+    Results class for propensity score estimation.
+
+    Provides methods to compute π(s) = P(X_1 = 1 | S = s).
+    """
+
+    def __init__(self, model: NNModelPropensity, **metrics):
+        super().__init__(model, **metrics)
+        self.device = model.device
+
+    def predict(
+        self,
+        S: npt.ArrayLike,
+        clip: Tuple[float, float] = (0.01, 0.99)
+    ) -> npt.NDArray[np.float64]:
+        """
+        Compute propensity score π(s) = P(X_1 = 1 | S = s).
+
+        Parameters
+        ----------
+        S : array_like, shape (n, dim_S)
+            Conditioning variables S = (X_{-1}, W, V).
+        clip : tuple, default=(0.01, 0.99)
+            Range to clip probabilities for numerical stability.
+
+        Returns
+        -------
+        pi : ndarray, shape (n,)
+            Propensity scores.
+        """
+        import torch
+
+        S = np.asarray(S, dtype=np.float32)
+        if S.ndim == 1:
+            S = S.reshape(-1, 1)
+
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(S_t)
+            pi = torch.sigmoid(logits).squeeze(-1)
+
+        pi_np = pi.cpu().numpy()
+
+        # Clip for stability
+        pi_np = np.clip(pi_np, clip[0], clip[1])
+
+        return pi_np.astype(np.float64)
+
+    def predict_logit(
+        self,
+        S: npt.ArrayLike
+    ) -> npt.NDArray[np.float64]:
+        """
+        Compute log-odds logit(π(s)) = log(π/(1-π)).
+
+        More numerically stable for extreme probabilities.
+        """
+        import torch
+
+        S = np.asarray(S, dtype=np.float32)
+        if S.ndim == 1:
+            S = S.reshape(-1, 1)
+
+        S_t = torch.as_tensor(S, dtype=torch.float32, device=self.device)
+
+        self.model.eval()
+        with torch.no_grad():
+            logits = self.model(S_t).squeeze(-1)
+
+        return logits.cpu().numpy().astype(np.float64)
