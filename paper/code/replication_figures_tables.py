@@ -33,6 +33,8 @@ columns = ['variable_type', 'elasticity', 'elasticity_se', 'ols_coef', 'ppml_coe
        'test_elast_vs_ppml_stat', 'test_elast_vs_ppml_p', 'nobs', 'time',
        'paper', 'panel']
 
+df = df.query('paper <= 155 and paper != 117')
+
 df['ols_diff_sig'] = df['test_elast_vs_ols_p'] < 0.1
 df['ppml_diff_sig'] = df['test_elast_vs_ppml_p'] < 0.1
 

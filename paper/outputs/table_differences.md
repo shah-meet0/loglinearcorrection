@@ -1,4 +1,4 @@
 |  | No Change | Sig. Different | Effect Increase | Effect Decrease | Sign Change |
 | --- | --- | --- | --- | --- | --- |
-| OLS | 45 | 24 | 9 | 11 | 4 |
-| PPML | 41 | 28 | 18 | 7 | 3 |
+| OLS | 32 | 18 | 8 | 6 | 4 |
+| PPML | 31 | 19 | 13 | 4 | 2 |
