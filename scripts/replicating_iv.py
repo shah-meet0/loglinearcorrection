@@ -5,8 +5,8 @@ from loglinearcorrection.iv_model import IVDoublyRobustElasticityEstimatorModel 
 import json
 import pandas as pd
 
-INPUT_DIR = None # google drive outputdata
-output = None # wherever you want output to be, for e.g. ./output
+INPUT_DIR = os.path.expanduser("~/Downloads/retrep/outputdata")
+output = os.path.expanduser("~/Downloads/retrep/estimates")
 
 # Placeholder: list of IV paper IDs to replicate
 paper_list = np.array(['023', '050', '055', '079', '103', '125', '126', '127', '129','136', '143', '144', '164'])
@@ -27,16 +27,17 @@ def run_replications(DIR):
         results_paths = [os.path.join(folder_path, f) for f in os.listdir(folder_path) if not f.endswith('.ini')]
 
         for result_path in results_paths:
-            stripped_path = result_path.split('\\')
-            print(f"Processing paper {stripped_path[-2]}, {stripped_path[-1]}")
+            paper_id = os.path.basename(os.path.dirname(result_path))
+            panel_id = os.path.basename(result_path)
+            print(f"Processing paper {paper_id}, {panel_id}")
             
-            if stripped_path[-2] not in paper_list:
-                print(f"Skipping paper {stripped_path[-2]} - not in paper_list.")
+            if paper_id not in paper_list:
+                print(f"Skipping paper {paper_id} - not in paper_list.")
                 continue
             
-            # Skip if no Z.parquet (not an IV specification)
-            if not os.path.exists(os.path.join(result_path, 'Z.parquet')):
-                print(f"Skipping {stripped_path[-1]} - no Z.parquet found.")
+            # Skip if no z.parquet (not an IV specification)
+            if not os.path.exists(os.path.join(result_path, 'z.parquet')):
+                print(f"Skipping {panel_id} - no z.parquet found.")
                 continue
             
             try:
@@ -47,8 +48,8 @@ def run_replications(DIR):
 
             try:
                 results, mod = replicate(X, y, Z, metadata)
-                results['paper'] = stripped_path[-2]
-                results['panel'] = stripped_path[-1]
+                results['paper'] = paper_id
+                results['panel'] = panel_id
                 print(results)
                 
                 if os.path.exists(out):
@@ -61,7 +62,7 @@ def run_replications(DIR):
             except Exception as e:
                 print(e)
                 print(f"Error replicating for {result_path}")
-                unable.append(stripped_path[-2] + "_" + stripped_path[-1])
+                unable.append(paper_id + "_" + panel_id)
 
 
 def process_paper(result_path):
@@ -71,64 +72,87 @@ def process_paper(result_path):
         metadata = json.load(f)
     print(metadata)
     
-    X = pd.read_parquet(os.path.join(result_path, 'X.parquet'))
-    y = pd.read_parquet(os.path.join(result_path, 'y.parquet'))
-    Z = pd.read_parquet(os.path.join(result_path, 'Z.parquet'))
+    X = pd.read_parquet(os.path.join(result_path, 'X.parquet'), engine='pyarrow')
+    y = pd.read_parquet(os.path.join(result_path, 'y.parquet'), engine='pyarrow')
+    Z = pd.read_parquet(os.path.join(result_path, 'z.parquet'), engine='pyarrow')
     
     return metadata, X, y, Z
 
 
 def replicate(X, y, Z, metadata):
     """Run IV-DREEM replication."""
-    
+
     # Get endogenous regressor indices/names
     endogenous_regressors = metadata.get('endogenous_regressors', [])
-    
+
     # Identify endogenous vs exogenous columns
+    all_cols = list(X.columns)
     if isinstance(endogenous_regressors[0], str):
-        # Column names
         endog_cols = endogenous_regressors
-        exog_cols = [c for c in X.columns if c not in endog_cols]
     else:
-        # Column indices
-        all_cols = list(X.columns)
         endog_cols = [all_cols[i] for i in endogenous_regressors]
-        exog_cols = [c for c in all_cols if c not in endog_cols]
-    
-    # Split X
-    X_endog = X[endog_cols]
-    X_exog = X[exog_cols] if len(exog_cols) > 0 else None
-    
-    # Remap interest index from original X to X_endog
+
+    # Get interest variable name
     original_interest = metadata.get('interest')
     if isinstance(original_interest, list):
-        original_interest = original_interest[0]  # Take first if list
-    
-    # Get the column name - handle both string (column name) and int (index)
+        original_interest = original_interest[0]
     if isinstance(original_interest, str):
-        original_col_name = original_interest
+        interest_col_name = original_interest
     else:
-        original_col_name = X.columns[original_interest]
-    
-    # Find new index in X_endog
-    if original_col_name not in endog_cols:
-        raise ValueError(f"Interest variable '{original_col_name}' is not in endogenous regressors")
-    
-    new_interest = list(X_endog.columns).index(original_col_name)
-    
-    # Fixed effects
-    fe = metadata.get('fe', None)
-    fe = [int(fixed_effect) for fixed_effect in fe] if fe is not None else None
-    
+        interest_col_name = all_cols[original_interest]
+
+    # Check if interest is in endogenous - if not, add it
+    if interest_col_name not in endog_cols:
+        print(f"  Note: Interest '{interest_col_name}' not in endogenous, adding it")
+        endog_cols = [interest_col_name] + endog_cols
+
+    # Get FE column names (convert from indices if needed)
+    fe_spec = metadata.get('fe', None)
+    fe_col_names = None
+    if fe_spec is not None:
+        if isinstance(fe_spec[0], str):
+            # Already column names - could be string numbers like '1', '2'
+            # Check if they're numeric strings that should be indices
+            try:
+                fe_indices = [int(f) for f in fe_spec]
+                fe_col_names = [all_cols[i] for i in fe_indices]
+            except (ValueError, IndexError):
+                # They're actual column names
+                fe_col_names = fe_spec
+        else:
+            # Integer indices
+            fe_col_names = [all_cols[i] for i in fe_spec]
+
+    # Determine which columns go where:
+    # - exog: endogenous regressors + FE columns (for demeaning)
+    # - exog_control: other exogenous controls
+
+    if fe_col_names is not None:
+        # Include FE columns in exog so the model can demean them
+        exog_cols = list(dict.fromkeys(endog_cols + fe_col_names))  # preserve order, remove duplicates
+        control_cols = [c for c in all_cols if c not in exog_cols]
+    else:
+        exog_cols = endog_cols
+        control_cols = [c for c in all_cols if c not in exog_cols]
+
+    X_exog = X[exog_cols]
+    X_control = X[control_cols] if len(control_cols) > 0 else None
+
+    # Find interest index in new exog
+    new_interest = list(X_exog.columns).index(interest_col_name)
+
+    # Fixed effects as column names in X_exog
+    fe_for_model = fe_col_names if fe_col_names is not None else None
+
     n = X.shape[0]
-    
+
     # Initialize model
     model = IVDREEM(
         endog=y,
-        exog=X_endog,
+        exog=X_exog,
         instruments=Z,
-        exog_control=X_exog,
-        fixed_effects=fe,
+        exog_control=X_control,
+        fixed_effects=fe_for_model,
         interest=[new_interest]
     )
     
@@ -279,4 +303,4 @@ def main():
 
 
 if __name__ == "__main__":
-    df, res = main()
+    main()

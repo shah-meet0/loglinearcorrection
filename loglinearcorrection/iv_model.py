@@ -133,9 +133,19 @@ class IVDoublyRobustElasticityEstimatorModel:
         fixed_effects: Optional[List] = None,
         interest: Optional[List] = None,
         ordinal: Optional[List] = None,
+        endogenous_indices: Optional[List[int]] = None,
         **kwargs
     ) -> None:
-        """Initialize the IV-DRNO estimator."""
+        """Initialize the IV-DRNO estimator.
+
+        Parameters
+        ----------
+        endogenous_indices : list of int, optional
+            Indices of variables in exog that are actually endogenous
+            (i.e., need first-stage estimation). If None, all variables
+            in exog are assumed to be endogenous. Use this when the interest
+            variable is exogenous but other variables in exog are endogenous.
+        """
         
         # Extract names
         self.endog_names = self._extract_name(endog, default="y")
@@ -198,24 +208,61 @@ class IVDoublyRobustElasticityEstimatorModel:
         if not np.issubdtype(self.instruments.dtype, np.number):
             raise ValueError("instruments must be numeric")
             
-        # Fixed effects handling
+        # Fixed effects handling (following DRNO pattern from model.py)
         self.ordinal = ordinal
         if fixed_effects is not None:
-            # For IV, FE are handled differently - store for later
-            self._fe_spec = fixed_effects
-            self.fixed_effects = None  # Will be initialized in fit
-            self.fe_indices = []
+            # Parse fixed effects specification
+            if self._original_is_pandas and isinstance(fixed_effects[0], str):
+                fe_indices = [self.exog_names.index(name) for name in fixed_effects]
+            else:
+                fe_indices = list(set(fixed_effects))
+
+            self.fe_indices = fe_indices
+            self.fe_cols = self.exog[:, fe_indices]
+            self.fixed_effects = _initialize_fixed_effects(self.fe_cols)
+
+            # Remove FE columns from exog
+            non_fe_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
+            self.exog = self.exog[:, non_fe_indices].astype(np.float64)
+            self.exog_names = [self.exog_names[i] for i in non_fe_indices]
+
+            # Parse interest before checking redundancy (on reduced exog)
+            self.interest = self._parse_interest(interest, after_fe_removal=True,
+                                                  original_indices=non_fe_indices)
+
+            # Check for redundant columns after demeaning
+            _, exog_demeaned = _apply_fixed_effects(np.log(self.endog), self.exog, self.fixed_effects)
+            redundant_idx = _redundant_columns(exog_demeaned)
+            if len(redundant_idx) > 0:
+                print(f"Redundant columns after FE: {[self.exog_names[i] for i in redundant_idx]}")
+                self.exog = _delete_redundant(self.exog, redundant_idx)
+                self.exog_names = _adjust_names_after_deletion(self.exog_names, redundant_idx)
+                self.interest = _adjust_indices_after_deletion(self.interest, redundant_idx)
         else:
-            self._fe_spec = None
             self.fixed_effects = None
             self.fe_indices = []
-            
-        # Parse interest indices
-        self.interest = self._parse_interest(interest)
+            self.fe_cols = None
+            # Parse interest indices
+            self.interest = self._parse_interest(interest)
         
+        # Store endogenous indices - which variables need first stage
+        # If not specified, assume all exog variables are endogenous
+        n_exog = self.exog.shape[1]
+        if endogenous_indices is not None:
+            # Adjust indices if FE removed columns
+            if fixed_effects is not None and len(redundant_idx) > 0:
+                self.endogenous_indices = _adjust_indices_after_deletion(
+                    list(endogenous_indices), redundant_idx
+                )
+            else:
+                self.endogenous_indices = list(endogenous_indices)
+        else:
+            # Default: all exog variables are endogenous
+            self.endogenous_indices = list(range(n_exog))
+
         # Detect variable types for interest variables
         self.variable_types = _detect_variable_types(self.exog, self.interest)
-        
+
         # Override with ordinal specification
         if ordinal is not None:
             ordinal_indices = self._parse_indices(ordinal, self.exog_names)
@@ -245,15 +292,35 @@ class IVDoublyRobustElasticityEstimatorModel:
             return [names.index(name) for name in spec if name in names]
         return list(spec)
     
-    def _parse_interest(self, interest) -> List[int]:
-        """Parse interest specification."""
+    def _parse_interest(self, interest, after_fe_removal: bool = False,
+                        original_indices: List[int] = None) -> List[int]:
+        """Parse interest specification.
+
+        Parameters
+        ----------
+        interest : list or None
+            Interest specification (names or indices)
+        after_fe_removal : bool
+            If True, indices refer to original exog before FE removal
+        original_indices : list
+            Mapping from new indices to original indices (non-FE columns)
+        """
         if interest is None:
             return list(range(self.exog.shape[1]))
         if isinstance(interest, (int, str)):
             interest = [interest]
         if isinstance(interest[0], str):
-            return [self.exog_names.index(name) for name in interest 
+            return [self.exog_names.index(name) for name in interest
                     if name in self.exog_names]
+        # If after FE removal, need to map original indices to new indices
+        if after_fe_removal and original_indices is not None:
+            # interest contains original indices, map to new indices
+            new_interest = []
+            for idx in interest:
+                if idx in original_indices:
+                    new_idx = original_indices.index(idx)
+                    new_interest.append(new_idx)
+            return new_interest
         return list(interest)
     
     def _estimate_first_stage(
@@ -1171,10 +1238,59 @@ class IVDoublyRobustElasticityEstimatorModel:
         n_interest = len(interest_indices)
         n = len(self.endog)
 
+        # ===== Fixed Effects Demeaning =====
+        # Apply within-transformation if fixed effects are specified
+        # We temporarily replace self.* with demeaned versions so helper methods work
+        _original_endog = self.endog
+        _original_exog = self.exog
+        _original_instruments = self.instruments
+        _original_exog_control = self.exog_control
+
+        if self.fixed_effects is not None:
+            weights_for_fe = weight_fold.reshape(-1, 1) if self.weights is not None else None
+
+            # Demean log(Y) and X
+            log_endog_demeaned, exog_demeaned = _apply_fixed_effects(
+                np.log(self.endog), self.exog, self.fixed_effects,
+                weights=weights_for_fe
+            )
+
+            # Demean instruments Z
+            _, instruments_demeaned = _apply_fixed_effects(
+                np.zeros(self.nobs), self.instruments, self.fixed_effects,
+                weights=weights_for_fe
+            )
+
+            # Demean exogenous controls W (if present)
+            if self.exog_control is not None:
+                _, exog_control_demeaned = _apply_fixed_effects(
+                    np.zeros(self.nobs), self.exog_control, self.fixed_effects,
+                    weights=weights_for_fe
+                )
+            else:
+                exog_control_demeaned = None
+
+            # Temporarily replace self.* with demeaned versions
+            self.endog = np.exp(log_endog_demeaned)
+            self.exog = exog_demeaned
+            self.instruments = instruments_demeaned
+            self.exog_control = exog_control_demeaned
+
+            # Re-detect variable types after demeaning
+            # Binary variables may become continuous after within-transformation
+            self.variable_types = _detect_variable_types(self.exog, self.interest)
+
         # ===== Steps 1-2: First stage with generalized residuals for binary =====
-        # Identify binary and continuous variables
-        binary_indices = [i for i in range(k_x) if self.variable_types.get(i) == 'binary']
-        continuous_indices = [i for i in range(k_x) if i not in binary_indices]
+        # Identify binary and continuous variables AMONG ENDOGENOUS VARIABLES ONLY
+        # Variables not in endogenous_indices are exogenous and don't need first stage
+        binary_indices = [i for i in self.endogenous_indices
+                         if self.variable_types.get(i) == 'binary']
+        continuous_indices = [i for i in self.endogenous_indices
+                             if i not in binary_indices]
+        exogenous_indices = [i for i in range(k_x) if i not in self.endogenous_indices]
+
+        if exogenous_indices:
+            print(f"    Exogenous variables (no first stage): {exogenous_indices}")
 
         # Warn about binary variable bias
         if binary_indices:
@@ -1184,7 +1300,7 @@ class IVDoublyRobustElasticityEstimatorModel:
                 "for treated vs untreated observations, requiring extrapolation that "
                 "neural networks cannot reliably perform. The arithmetic elasticity "
                 "may not be point-identified with binary endogenous variables. "
-                "See docs/iv_drno_binary_bias.md for details.",
+                "See maths/iv_drno_binary_bias.md for details.",
                 UserWarning
             )
 
@@ -1238,8 +1354,33 @@ class IVDoublyRobustElasticityEstimatorModel:
             )
             mu_Y_results = mu_X_results = mu_W_results = None
 
+        # ===== Switch back to ORIGINAL data for nuisance estimation =====
+        # The demeaning was only for identifying β and ρ via control function OLS.
+        # For the DRNO correction (m, density, omega, score), we need the ORIGINAL Y
+        # because the Jensen's correction requires the full variance including FE.
+        # V_hat_full stays as computed (from demeaned first stage) since it captures
+        # the within-FE endogeneity.
+        #
+        # Save demeaned data for final OLS aggregation (needs demeaned data)
+        # Also save the variable_types from demeaned data - this is what was used for estimation
+        if self.fixed_effects is not None:
+            log_endog_demeaned = np.log(self.endog)  # Currently demeaned
+            exog_demeaned = self.exog.copy()
+            variable_types_for_estimation = self.variable_types.copy()
+            # Switch back to original data
+            self.endog = _original_endog
+            self.exog = _original_exog
+            self.instruments = _original_instruments
+            self.exog_control = _original_exog_control
+            # Keep the variable_types from demeaned data for consistency in moment construction
+            # (e.g., binary vars that became continuous after demeaning should stay continuous)
+            # We DON'T re-detect on original data because estimation was done on demeaned data
+        else:
+            log_endog_demeaned = None
+            exog_demeaned = None
+
         Y_transformed = self.endog * np.exp(-self.exog @ beta)
-        
+
         # ===== Step 4: Estimate m(X, V) =====
         print("  Estimating nuisance m(X, V)...")
         X_train = self.exog[train_idx]
@@ -1282,9 +1423,21 @@ class IVDoublyRobustElasticityEstimatorModel:
         density_model = NNModelDensity(variable_types=self.variable_types, **density_params.get('arch_params', {}))
         density_results = density_model.fit(X_train, interest=interest_indices, **density_params.get('fit_params', {}))
 
-        # ===== Step 7b: Estimate propensity π(S) for binary variables =====
-        binary_indices = [i for i in interest_indices
-                         if self.variable_types.get(i) == 'binary']
+        # ===== Step 7b: Estimate propensity π(S) for binary ENDOGENOUS interest variables =====
+        # Only estimate propensity for variables that are both binary AND endogenous
+        # (exogenous binary variables don't need propensity estimation for control function)
+        binary_endog_indices = [i for i in interest_indices
+                                if self.variable_types.get(i) == 'binary'
+                                and i in self.endogenous_indices]
+        # Also handle demeaned binary variables - after FE transformation they're no longer binary
+        # Check the actual data to see if it's still binary
+        binary_indices = []
+        for i in binary_endog_indices:
+            unique_vals = np.unique(self.exog[:, i])
+            if len(unique_vals) <= 2 and np.allclose(sorted(unique_vals), [0, 1], atol=0.01):
+                binary_indices.append(i)
+            else:
+                print(f"    Note: Variable {i} was binary but is continuous after FE demeaning")
         pi_results_dict = {}
 
         if binary_indices:
@@ -1313,8 +1466,9 @@ class IVDoublyRobustElasticityEstimatorModel:
         mu_train = np.maximum(mu_train, 1e-10)
 
         # Separate continuous and binary indices
-        continuous_indices = [i for i in interest_indices
-                              if self.variable_types.get(i) != 'binary']
+        # Note: binary_indices was computed above and only contains vars that are
+        # still binary after demeaning AND are endogenous. Everything else is continuous.
+        continuous_indices = [i for i in interest_indices if i not in binary_indices]
 
         n_train = len(train_idx)
         D_g_train = np.zeros((n_train, n_interest, k_v))
@@ -1495,6 +1649,9 @@ class IVDoublyRobustElasticityEstimatorModel:
             fold_alpha_x.append(alpha_x)
             fold_theta_x.append(theta_x)
 
+        # Note: We already switched back to original data earlier (after control function OLS)
+        # and saved demeaned data in log_endog_demeaned, exog_demeaned for final OLS
+
         return {
             'beta': beta,
             'delta': delta,
@@ -1519,6 +1676,9 @@ class IVDoublyRobustElasticityEstimatorModel:
             'mu_Y_results': mu_Y_results if use_plm else None,
             'mu_X_results': mu_X_results if use_plm else None,
             'mu_W_results': mu_W_results if use_plm else None,
+            # Demeaned data for FE OLS moments
+            'log_endog_demeaned': log_endog_demeaned,
+            'exog_demeaned': exog_demeaned,
         }
 
     
@@ -1639,11 +1799,18 @@ class IVDoublyRobustElasticityEstimatorModel:
 
         # Add OLS moment conditions for joint inference
         # OLS moments: ε_i * X_i where ε = log Y - β'X - ρ(V)
-        log_Y = np.log(self.endog)
+        # IMPORTANT: When FE are present, use demeaned data since beta/rho were estimated on demeaned
+        if self.fixed_effects is not None:
+            # Use demeaned data from fold_results (they should all be the same demeaning)
+            log_Y = fold_results[-1]['log_endog_demeaned']
+            exog_for_ols = fold_results[-1]['exog_demeaned']
+        else:
+            log_Y = np.log(self.endog)
+            exog_for_ols = self.exog
 
         if rho_avg is not None:
             # Linear control function: ε = log Y - β'X - ρ'V
-            eps_ols = log_Y - self.exog @ beta_avg - V_hat_final @ rho_avg
+            eps_ols = log_Y - exog_for_ols @ beta_avg - V_hat_final @ rho_avg
         else:
             # Nonparametric control function (PLM): ε = log Y - β'X - ρ̂(V)
             # Use last fold's PLM models to compute ρ̂(V) = μ_Y(V) - β'μ_X(V)
@@ -1655,12 +1822,12 @@ class IVDoublyRobustElasticityEstimatorModel:
                 if mu_X_full.ndim == 1:
                     mu_X_full = mu_X_full.reshape(-1, 1)
                 rho_hat_full = mu_Y_full - (mu_X_full @ beta_avg)
-                eps_ols = log_Y - self.exog @ beta_avg - rho_hat_full
+                eps_ols = log_Y - exog_for_ols @ beta_avg - rho_hat_full
             else:
                 # Fallback: just use log Y - β'X (ignoring ρ)
-                eps_ols = log_Y - self.exog @ beta_avg
+                eps_ols = log_Y - exog_for_ols @ beta_avg
 
-        X_interest = self.exog[:, interest_indices]
+        X_interest = exog_for_ols[:, interest_indices]
         ols_moments = eps_ols[:, None] * X_interest
         moments[:, n_interest:] = ols_moments
 
