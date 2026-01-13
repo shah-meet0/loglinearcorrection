@@ -1,4 +1,22 @@
+"""
+IV Replication Script for IV-DRNO
+
+Runs IV-DRNO replications on extracted paper data.
+
+Special Cases:
+- Paper 103: String categorical columns - auto-encoded via one-hot encoding
+- Paper 129: Probit failure with many instruments - sklearn LogisticRegressionCV fallback
+- Paper 144: Exogenous interest variable - uses endogenous_indices to specify
+             which variables are actually instrumented (interest is exogenous)
+
+Usage:
+    python replicating_iv.py                          # NN first stage (default)
+    python replicating_iv.py --method linear          # Linear first stage (2SLS-style)
+    python replicating_iv.py --method linear --output-suffix _linear
+"""
+
 import os
+import argparse
 from datetime import datetime
 import numpy as np
 from loglinearcorrection.iv_model import IVDoublyRobustElasticityEstimatorModel as IVDREEM
@@ -15,7 +33,51 @@ out = os.path.join(output, "iv_coef_diff_test.csv")
 unable = []
 
 
-def run_replications(DIR):
+def encode_categorical_columns(df):
+    """
+    Encode string/categorical columns as numeric via one-hot encoding.
+
+    Required for paper 103 which has string categorical variables like
+    'Executive, Administrative, and Managerial'.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame potentially containing string columns.
+
+    Returns
+    -------
+    df_encoded : pd.DataFrame
+        DataFrame with string columns replaced by one-hot encoded columns.
+    """
+    df_encoded = df.copy()
+    string_cols = [col for col in df.columns
+                   if df[col].dtype == object or df[col].dtype.name == 'category']
+
+    if string_cols:
+        print(f"  Encoding categorical columns: {string_cols}")
+        # One-hot encode, drop first to avoid collinearity
+        df_encoded = pd.get_dummies(df_encoded, columns=string_cols, drop_first=True, dtype=float)
+
+    return df_encoded
+
+
+def run_replications(DIR, first_stage_method='nn', output_file=None):
+    """
+    Run IV-DRNO replications on all papers in DIR.
+
+    Parameters
+    ----------
+    DIR : str
+        Directory containing paper output folders.
+    first_stage_method : str, default='nn'
+        Method for first stage: 'nn' (neural network) or 'linear' (2SLS-style OLS).
+    output_file : str, optional
+        Output CSV file path. If None, uses default.
+    """
+    # Use provided output file or default
+    out_path = output_file if output_file is not None else out
+
     files = os.listdir(DIR)
 
     for file in files:
@@ -30,16 +92,16 @@ def run_replications(DIR):
             paper_id = os.path.basename(os.path.dirname(result_path))
             panel_id = os.path.basename(result_path)
             print(f"Processing paper {paper_id}, {panel_id}")
-            
+
             if paper_id not in paper_list:
                 print(f"Skipping paper {paper_id} - not in paper_list.")
                 continue
-            
+
             # Skip if no z.parquet (not an IV specification)
             if not os.path.exists(os.path.join(result_path, 'z.parquet')):
                 print(f"Skipping {panel_id} - no z.parquet found.")
                 continue
-            
+
             try:
                 metadata, X, y, Z = process_paper(result_path)
             except Exception as e:
@@ -47,18 +109,19 @@ def run_replications(DIR):
                 continue
 
             try:
-                results, mod = replicate(X, y, Z, metadata)
+                results, mod = replicate(X, y, Z, metadata, first_stage_method=first_stage_method)
                 results['paper'] = paper_id
                 results['panel'] = panel_id
+                results['first_stage_method'] = first_stage_method
                 print(results)
-                
-                if os.path.exists(out):
-                    df = pd.read_csv(out)
+
+                if os.path.exists(out_path):
+                    df = pd.read_csv(out_path)
                     df = pd.concat([df, results.to_frame().T], ignore_index=True)
                 else:
                     df = results.to_frame().T
 
-                df.to_csv(out, index=False)
+                df.to_csv(out_path, index=False)
             except Exception as e:
                 print(e)
                 print(f"Error replicating for {result_path}")
@@ -66,22 +129,44 @@ def run_replications(DIR):
 
 
 def process_paper(result_path):
-    """Load metadata, X, y, and Z from result_path."""
+    """
+    Load metadata, X, y, and Z from result_path.
+
+    Applies categorical encoding if needed (paper 103).
+    """
     metadata_path = os.path.join(result_path, 'metadata.json')
     with open(metadata_path, 'r') as f:
         metadata = json.load(f)
     print(metadata)
-    
+
     X = pd.read_parquet(os.path.join(result_path, 'X.parquet'), engine='pyarrow')
     y = pd.read_parquet(os.path.join(result_path, 'y.parquet'), engine='pyarrow')
     Z = pd.read_parquet(os.path.join(result_path, 'z.parquet'), engine='pyarrow')
-    
+
+    # Encode categorical columns (required for paper 103)
+    X = encode_categorical_columns(X)
+    Z = encode_categorical_columns(Z)
+
     return metadata, X, y, Z
 
 
-def replicate(X, y, Z, metadata):
-    """Run IV-DREEM replication."""
+def replicate(X, y, Z, metadata, first_stage_method='nn'):
+    """
+    Run IV-DREEM replication.
 
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Exogenous variables (including endogenous regressors).
+    y : pd.DataFrame
+        Dependent variable.
+    Z : pd.DataFrame
+        Instruments.
+    metadata : dict
+        Metadata with keys: endogenous_regressors, interest, fe, etc.
+    first_stage_method : str, default='nn'
+        Method for first stage: 'nn' or 'linear'.
+    """
     # Get endogenous regressor indices/names
     endogenous_regressors = metadata.get('endogenous_regressors', [])
 
@@ -92,6 +177,20 @@ def replicate(X, y, Z, metadata):
     else:
         endog_cols = [all_cols[i] for i in endogenous_regressors]
 
+    # Paper 050 fix: endogenous_regressors may point to 'const' column (all 1s)
+    # Filter out constant columns from endogenous
+    endog_cols_filtered = []
+    for col in endog_cols:
+        if col in X.columns:
+            n_unique = X[col].nunique()
+            if n_unique <= 1:
+                print(f"  Warning: Removing constant column '{col}' from endogenous_regressors")
+            else:
+                endog_cols_filtered.append(col)
+        else:
+            endog_cols_filtered.append(col)
+    endog_cols = endog_cols_filtered
+
     # Get interest variable name
     original_interest = metadata.get('interest')
     if isinstance(original_interest, list):
@@ -101,10 +200,16 @@ def replicate(X, y, Z, metadata):
     else:
         interest_col_name = all_cols[original_interest]
 
-    # Check if interest is in endogenous - if not, add it
-    if interest_col_name not in endog_cols:
-        print(f"  Note: Interest '{interest_col_name}' not in endogenous, adding it")
-        endog_cols = [interest_col_name] + endog_cols
+    # If all endogenous were filtered out (paper 050 case), use interest as endogenous
+    if len(endog_cols) == 0:
+        print(f"  Note: No valid endogenous vars, using interest '{interest_col_name}' as endogenous")
+        endog_cols = [interest_col_name]
+
+    # Check if interest is in endogenous
+    # Paper 144 special case: interest is exogenous, other vars are endogenous
+    interest_is_exogenous = interest_col_name not in endog_cols
+    if interest_is_exogenous:
+        print(f"  Note: Interest '{interest_col_name}' not in endogenous_regressors")
 
     # Get FE column names (convert from indices if needed)
     fe_spec = metadata.get('fe', None)
@@ -124,16 +229,21 @@ def replicate(X, y, Z, metadata):
             fe_col_names = [all_cols[i] for i in fe_spec]
 
     # Determine which columns go where:
-    # - exog: endogenous regressors + FE columns (for demeaning)
+    # - exog: endogenous regressors + interest (if exogenous) + FE columns (for demeaning)
     # - exog_control: other exogenous controls
+
+    # Start with endogenous regressors
+    exog_cols = endog_cols.copy()
+
+    # Add interest if it's exogenous (not already in endog_cols)
+    if interest_is_exogenous and interest_col_name not in exog_cols:
+        exog_cols = [interest_col_name] + exog_cols
 
     if fe_col_names is not None:
         # Include FE columns in exog so the model can demean them
-        exog_cols = list(dict.fromkeys(endog_cols + fe_col_names))  # preserve order, remove duplicates
-        control_cols = [c for c in all_cols if c not in exog_cols]
-    else:
-        exog_cols = endog_cols
-        control_cols = [c for c in all_cols if c not in exog_cols]
+        exog_cols = list(dict.fromkeys(exog_cols + fe_col_names))  # preserve order, remove duplicates
+
+    control_cols = [c for c in all_cols if c not in exog_cols]
 
     X_exog = X[exog_cols]
     X_control = X[control_cols] if len(control_cols) > 0 else None
@@ -144,6 +254,20 @@ def replicate(X, y, Z, metadata):
     # Fixed effects as column names in X_exog
     fe_for_model = fe_col_names if fe_col_names is not None else None
 
+    # Determine endogenous_indices for paper 144 pattern
+    # When interest is exogenous, we need to specify which vars get first stage
+    if interest_is_exogenous:
+        # Find indices of actual endogenous vars (excluding interest) in X_exog
+        # Get original endog_cols from metadata (before we added interest)
+        orig_endog_cols = metadata.get('endogenous_regressors', [])
+        if isinstance(orig_endog_cols[0], int):
+            orig_endog_cols = [all_cols[i] for i in orig_endog_cols]
+        endogenous_indices = [list(X_exog.columns).index(c) for c in orig_endog_cols
+                             if c in X_exog.columns]
+        print(f"  endogenous_indices (vars with first stage): {endogenous_indices}")
+    else:
+        endogenous_indices = None  # Default: all vars in exog are endogenous
+
     n = X.shape[0]
 
     # Initialize model
@@ -153,7 +277,8 @@ def replicate(X, y, Z, metadata):
         instruments=Z,
         exog_control=X_control,
         fixed_effects=fe_for_model,
-        interest=[new_interest]
+        interest=[new_interest],
+        endogenous_indices=endogenous_indices
     )
     
     # Adaptive hyperparameters
@@ -237,6 +362,7 @@ def replicate(X, y, Z, metadata):
     # Fit model
     results = model.fit(
         n_folds=n_folds,
+        first_stage_method=first_stage_method,
         first_stage_params=first_stage_params,
         m_params=m_params,
         density_params=density_params,
@@ -244,7 +370,7 @@ def replicate(X, y, Z, metadata):
         lambda_params=lambda_params,
         n_mc_samples=300
     )
-    
+
     return ivdreem_summary_idx0_with_diff_se(results), results
 
 
@@ -298,9 +424,42 @@ def ivdreem_summary_idx0_with_diff_se(res) -> pd.Series:
     )
 
 
-def main():
-    return run_replications(INPUT_DIR)
+def main(first_stage_method='nn', output_file=None):
+    """
+    Run IV replications.
+
+    Parameters
+    ----------
+    first_stage_method : str, default='nn'
+        Method for first stage: 'nn' or 'linear'.
+    output_file : str, optional
+        Output CSV file path.
+    """
+    return run_replications(INPUT_DIR, first_stage_method=first_stage_method,
+                           output_file=output_file)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Run IV-DRNO replications on extracted paper data."
+    )
+    parser.add_argument(
+        '--method', '-m',
+        default='nn',
+        choices=['nn', 'linear', '2sls'],
+        help="First stage method: 'nn' (neural network), 'linear' or '2sls' (OLS). Default: nn"
+    )
+    parser.add_argument(
+        '--output-suffix', '-s',
+        default='',
+        help="Suffix to add to output filename, e.g., '_linear' -> iv_coef_diff_test_linear.csv"
+    )
+    args = parser.parse_args()
+
+    # Construct output file path
+    if args.output_suffix:
+        out_file = os.path.join(output, f"iv_coef_diff_test{args.output_suffix}.csv")
+    else:
+        out_file = None  # Use default
+
+    main(first_stage_method=args.method, output_file=out_file)

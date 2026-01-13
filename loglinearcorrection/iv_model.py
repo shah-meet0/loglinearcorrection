@@ -422,6 +422,82 @@ class IVDoublyRobustElasticityEstimatorModel:
 
         return g_pred
 
+    def _estimate_first_stage_linear(
+        self,
+        train_idx: np.ndarray,
+    ) -> List:
+        """
+        Estimate first stage via OLS: g(Z,W) = E[X|Z,W].
+
+        This provides a traditional 2SLS-style linear first stage as an
+        alternative to the neural network approach.
+
+        Parameters
+        ----------
+        train_idx : ndarray
+            Indices of training observations.
+
+        Returns
+        -------
+        ols_results_list : list
+            List of fitted OLS results, one per endogenous variable.
+        """
+        Z_train = self.instruments[train_idx]
+        X_train = self.exog[train_idx]
+
+        # Build design [Z, W, constant]
+        if self.exog_control is not None:
+            design_train = np.column_stack([Z_train, self.exog_control[train_idx]])
+        else:
+            design_train = Z_train
+        design_train_const = sm.add_constant(design_train)
+
+        # Fit OLS for each endogenous variable
+        k_x = X_train.shape[1] if X_train.ndim > 1 else 1
+        ols_results_list = []
+        for j in range(k_x):
+            Xj = X_train[:, j] if k_x > 1 else X_train.ravel()
+            ols = sm.OLS(Xj, design_train_const)
+            ols_results_list.append(ols.fit())
+
+        return ols_results_list
+
+    def _predict_first_stage_linear(
+        self,
+        ols_results_list: List,
+        Z: np.ndarray,
+        W: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Predict E[X|Z,W] using fitted linear models.
+
+        Parameters
+        ----------
+        ols_results_list : list
+            List of fitted OLS results from _estimate_first_stage_linear.
+        Z : ndarray, shape (n, k_z)
+            Instrument values.
+        W : ndarray, shape (n, k_w), optional
+            Exogenous control values.
+
+        Returns
+        -------
+        g_pred : ndarray, shape (n, k_x)
+            Predicted E[X|Z, W].
+        """
+        if W is not None:
+            design = np.column_stack([Z, W])
+        else:
+            design = Z
+        design_const = sm.add_constant(design)
+
+        k_x = len(ols_results_list)
+        g_pred = np.zeros((Z.shape[0], k_x))
+        for j, ols_res in enumerate(ols_results_list):
+            g_pred[:, j] = ols_res.predict(design_const)
+
+        return g_pred
+
     def _estimate_first_stage_binary(
         self,
         train_idx: np.ndarray,
@@ -500,9 +576,15 @@ class IVDoublyRobustElasticityEstimatorModel:
 
         try:
             probit_results = model.fit(disp=0, maxiter=100)
+            use_sklearn = False
         except Exception as e:
             print(f"    Warning: {method} failed to converge, using regularized fit")
-            probit_results = model.fit_regularized(disp=0, maxiter=100)
+            try:
+                probit_results = model.fit_regularized(disp=0, maxiter=100)
+                use_sklearn = False
+            except Exception as e2:
+                print(f"    Warning: regularized {method} also failed, using sklearn LogisticRegressionCV")
+                use_sklearn = True
 
         # Build full design matrix for prediction
         Z_full = self.instruments
@@ -516,8 +598,33 @@ class IVDoublyRobustElasticityEstimatorModel:
 
         design_full_const = sm.add_constant(design_full)
 
-        # Compute linear index h = design @ params
-        h_full = design_full_const @ probit_results.params
+        if use_sklearn:
+            # sklearn fallback for problematic cases (e.g., paper 129)
+            from sklearn.linear_model import LogisticRegressionCV
+            from sklearn.preprocessing import StandardScaler
+
+            scaler = StandardScaler()
+            design_train_scaled = scaler.fit_transform(design_train)
+            design_full_scaled = scaler.transform(design_full)
+
+            sklearn_model = LogisticRegressionCV(
+                cv=3, penalty='l2', solver='lbfgs',
+                max_iter=1000, random_state=42
+            )
+            sklearn_model.fit(design_train_scaled, X1_train)
+
+            # Compute probabilities and linear index approximation
+            proba_full = sklearn_model.predict_proba(design_full_scaled)[:, 1]
+            # For generalized residuals, approximate h using inverse CDF
+            from scipy.stats import norm
+            proba_full = np.clip(proba_full, 1e-6, 1 - 1e-6)
+            h_full = norm.ppf(proba_full)
+
+            # Store sklearn model for reference (won't have same interface as statsmodels)
+            probit_results = sklearn_model
+        else:
+            # Compute linear index h = design @ params
+            h_full = design_full_const @ probit_results.params
 
         # Compute generalized residuals
         X1_full = self.exog[:, var_idx]
@@ -1203,7 +1310,8 @@ class IVDoublyRobustElasticityEstimatorModel:
         lambda_params: Dict,
         pi_params: Dict,
         plm_params: Dict = None,
-        use_plm: bool = True
+        use_plm: bool = True,
+        first_stage_method: str = 'nn'
     ) -> Dict:
         """
         Fold processing using automatic DML for λ estimation.
@@ -1311,11 +1419,19 @@ class IVDoublyRobustElasticityEstimatorModel:
 
         # Step 1a: Estimate first stage for continuous variables (if any)
         if continuous_indices:
-            print(f"    Continuous variables {continuous_indices}: g(Z) = E[X|Z,W]")
-            # For continuous, use standard first stage
-            g_results = self._estimate_first_stage(train_idx, first_stage_params)
             W_full = self.exog_control if self.exog_control is not None else None
-            g_pred_full = self._predict_first_stage(g_results, self.instruments, W_full)
+
+            if first_stage_method == 'nn':
+                print(f"    Continuous variables {continuous_indices}: g(Z) = E[X|Z,W] (neural network)")
+                g_results = self._estimate_first_stage(train_idx, first_stage_params)
+                g_pred_full = self._predict_first_stage(g_results, self.instruments, W_full)
+            elif first_stage_method in ('linear', '2sls'):
+                print(f"    Continuous variables {continuous_indices}: g(Z) = E[X|Z,W] (linear/2SLS)")
+                g_results = self._estimate_first_stage_linear(train_idx)
+                g_pred_full = self._predict_first_stage_linear(g_results, self.instruments, W_full)
+            else:
+                raise ValueError(f"Unknown first_stage_method: {first_stage_method}. "
+                               f"Use 'nn', 'linear', or '2sls'.")
 
             # Compute additive residuals for continuous variables
             for i in continuous_indices:
@@ -1686,6 +1802,7 @@ class IVDoublyRobustElasticityEstimatorModel:
         self,
         n_folds: int = 5,
         random_state: Optional[int] = None,
+        first_stage_method: str = 'nn',
         first_stage_params: Optional[Dict] = None,
         first_stage_binary_params: Optional[Dict] = None,
         m_params: Optional[Dict] = None,
@@ -1706,8 +1823,13 @@ class IVDoublyRobustElasticityEstimatorModel:
             Number of cross-fitting folds.
         random_state : int, optional
             Random seed for reproducibility.
+        first_stage_method : str, default='nn'
+            Method for first stage estimation of continuous endogenous variables:
+            - 'nn': Neural network (default)
+            - 'linear' or '2sls': OLS regression (traditional 2SLS first stage)
         first_stage_params : dict, optional
             Parameters for first stage g(Z) estimation (continuous variables).
+            Only used when first_stage_method='nn'.
         first_stage_binary_params : dict, optional
             Parameters for binary first stage with keys:
             - 'method': 'probit' (default) or 'logit'
@@ -1765,7 +1887,8 @@ class IVDoublyRobustElasticityEstimatorModel:
                 train_idx, test_idx, weight_fold,
                 interest_indices, first_stage_params, first_stage_binary_params,
                 m_params, density_params, omega_params, lambda_params, pi_params,
-                plm_params=plm_params, use_plm=use_plm
+                plm_params=plm_params, use_plm=use_plm,
+                first_stage_method=first_stage_method
             )
             fold_results.append(fold_result)
             
