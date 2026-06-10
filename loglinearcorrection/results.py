@@ -127,7 +127,8 @@ class DoublyRobustElasticityEstimatorModelResults:
             
         w = self.fold_weights.reshape(-1, 1)
         W = w / w.sum()
-        S = self.moments.T @ (W * self.moments)
+        moments_centered = self.moments - np.average(self.moments, axis=0, weights=self.fold_weights)
+        S = moments_centered.T @ (W * moments_centered)
 
         D = np.average(self.derivative, axis=0, weights=self.fold_weights)
         D_inv = np.linalg.pinv(D)

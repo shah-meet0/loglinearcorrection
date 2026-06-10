@@ -5,6 +5,19 @@ from typing import Literal
 import pyhdfe
 
 
+def _one_hot_encode_fe(fe_cols: np.ndarray) -> np.ndarray:
+    """One-hot encode fixed effect columns, return (n_obs, total_levels) array."""
+    dummies = []
+    for col_idx in range(fe_cols.shape[1]):
+        col = fe_cols[:, col_idx]
+        unique_vals = np.unique(col)
+        one_hot = np.zeros((len(col), len(unique_vals)), dtype=np.float64)
+        for i, val in enumerate(unique_vals):
+            one_hot[:, i] = (col == val).astype(np.float64)
+        dummies.append(one_hot)
+    return np.column_stack(dummies)
+
+
 def _initialize_fixed_effects(fixed_effect_columns:npt.NDArray) -> pyhdfe.Algorithm:
     try:
         import pyhdfe

@@ -3,10 +3,10 @@ from typing import Optional, Dict, Any, List, Tuple, Union
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, StratifiedKFold
 import statsmodels.api as sm
 
-from .utils import _apply_fixed_effects, _detect_variable_types, _delete_redundant, _initialize_fixed_effects, _adjust_names_after_deletion, _adjust_indices_after_deletion, _redundant_columns
+from .utils import _apply_fixed_effects, _detect_variable_types, _delete_redundant, _initialize_fixed_effects, _adjust_names_after_deletion, _adjust_indices_after_deletion, _redundant_columns, _one_hot_encode_fe
 from .nonparametric import NNModelNuisance, NNModelDensity
 from .results import DREEMR
 #from .density import DensityModel, DensityModelResults
@@ -187,9 +187,19 @@ class DoublyRobustElasticityEstimatorModel:
             self.temp_exog_demeaned = exog_demeaned  # store for later use in fit
             self.ols_res = sm.WLS(endog_demeaned, exog_demeaned, weights=self.weights if self.weights else 1).fit()
             self.beta = self.ols_res.params
+
+            # One-hot encode FE columns for NN inputs
+            self.fe_onehot = _one_hot_encode_fe(self.fe_cols)
+            self.exog_augmented = np.column_stack([self.exog, self.fe_onehot])
+            # Composite FE label for stratified CV
+            self.fe_labels = np.array([
+                '_'.join(str(v) for v in row) for row in self.fe_cols
+            ])
         else:
             self.ols_res = sm.WLS(np.log(self.endog), self.exog, weights=self.weights if self.weights else 1).fit()
             self.beta = self.ols_res.params
+            self.exog_augmented = self.exog
+            self.fe_labels = None
 
         # Detect variable types for interest variables
         self.variable_types = _detect_variable_types(
@@ -245,6 +255,8 @@ class DoublyRobustElasticityEstimatorModel:
 
         exog_train = self.exog[train_idx]
         exog_test = self.exog[test_idx]
+        exog_aug_train = self.exog_augmented[train_idx]
+        exog_aug_test = self.exog_augmented[test_idx]
         weights_train = weight_fold[train_idx] if self.weights is not None else None
 
         # Step 1: Estimate OLS coefficients
@@ -262,9 +274,9 @@ class DoublyRobustElasticityEstimatorModel:
 
         # Step 2: Estimate nuisance functions
         m_model = NNModelNuisance(variable_types=self.variable_types, **m_params['arch_params'])
-        m_results = m_model.fit(exog_train, exp_residuals_train, **m_params['fit_params'])
+        m_results = m_model.fit(exog_aug_train, exp_residuals_train, **m_params['fit_params'])
 
-        m_test, m_prime_test = m_results.derivative(exog_test, interest_indices)
+        m_test, m_prime_test = m_results.derivative(exog_aug_test, interest_indices)
         if any(m_test <= 0):
             raise ValueError("Predicted m(x) has non-positive values")
         p_test = exp_residuals_test - m_test
@@ -272,8 +284,8 @@ class DoublyRobustElasticityEstimatorModel:
 
         # Estimate density
         density_model = NNModelDensity(variable_types=self.variable_types, **density_params['arch_params'])
-        f_results = density_model.fit(exog_train, interest=interest_indices, **density_params['fit_params'])
-        alpha_weights = f_results.alpha_weight(exog_test, interest_indices)
+        f_results = density_model.fit(exog_aug_train, interest=interest_indices, **density_params['fit_params'])
+        alpha_weights = f_results.alpha_weight(exog_aug_test, interest_indices)
 
         # Step 3: Construct moments
         n_interest = len(interest_indices)
@@ -295,14 +307,14 @@ class DoublyRobustElasticityEstimatorModel:
                 theta_test = self.beta[var_idx] + m_semi_elast_test
 
                 fold_derivative[:, moment_idx, n_interest:] = identity[moment_idx, :] - (alpha_test * real_resid_fold)[
-                                                                                        :, None] * exog_test[:,
+                                                                                        :, None] * exog_ols_test[:,
                                                                                                    interest_indices]
 
             elif var_type == 'binary':
                 # Binary variable logic (keeping existing implementation)
-                exog_test_flip = exog_test.copy()
-                exog_test_flip[:, var_idx] = 1 - exog_test_flip[:, var_idx]
-                m_shifted_test = m_results.predict(exog_test_flip)
+                exog_aug_test_flip = exog_aug_test.copy()
+                exog_aug_test_flip[:, var_idx] = 1 - exog_aug_test_flip[:, var_idx]
+                m_shifted_test = m_results.predict(exog_aug_test_flip)
                 probability_var = alpha_weights[:, moment_idx]
 
                 alpha_0 = (1 - exog_test[:, var_idx].astype(np.int64)) * m_shifted_test / (
@@ -316,7 +328,7 @@ class DoublyRobustElasticityEstimatorModel:
 
                 derivative_leading_term = np.zeros(shape=(len(test_idx), n_interest))
                 derivative_leading_term[:, moment_idx] = theta_test + 1 + alpha_test * (real_resid_fold - m_test)
-                derivative_second_term = (-1 * alpha_test * real_resid_fold)[:, None] * exog_test[:, interest_indices]
+                derivative_second_term = (-1 * alpha_test * real_resid_fold)[:, None] * exog_ols_test[:, interest_indices]
                 fold_derivative[:, moment_idx, n_interest:] = derivative_leading_term + derivative_second_term
             else:  # ordinal
                 theta_test = 0
@@ -351,11 +363,22 @@ class DoublyRobustElasticityEstimatorModel:
             interest_indices = list(self.interest)
 
         # Set up cross-validation
-        kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+        if self.fe_labels is not None:
+            # Check if all groups have enough obs for stratified splitting
+            _, counts = np.unique(self.fe_labels, return_counts=True)
+            if np.all(counts >= n_folds):
+                kf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+                split_iter = kf.split(self.exog, self.fe_labels)
+            else:
+                kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+                split_iter = kf.split(self.exog)
+        else:
+            kf = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+            split_iter = kf.split(self.exog)
 
         # Process each fold
         fold_results = []
-        for fold_idx, (train_idx, test_idx) in enumerate(kf.split(self.exog)):
+        for fold_idx, (train_idx, test_idx) in enumerate(split_iter):
             weight_fold = np.ones(self.nobs)
             weight_fold[test_idx] = 1e-10  # temporary hack to prevent fe from dying on zero weights
             if self.weights is not None:
@@ -453,7 +476,7 @@ class DoublyRobustElasticityEstimatorModel:
                                        'output_size': 0,
                                        'output_activation': 'identity'}
 
-        m_params['arch_params']['input_size'] = self.exog.shape[1]
+        m_params['arch_params']['input_size'] = self.exog_augmented.shape[1]
         m_params['arch_params']['output_size'] = 1
 
         return m_params
