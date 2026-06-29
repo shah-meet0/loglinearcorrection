@@ -5,10 +5,10 @@ from loglinearcorrection.model import DoublyRobustElasticityEstimatorModel as DR
 import json
 import pandas as pd
 
-INPUT_DIR = # add input here, google drive outputdata folder
-output = # add output here
-paper_list = np.load(r"\retrep\non_iv_reps.npy", allow_pickle=True) # i will give this to you separately
-out = os.path.join(output, "coef_diff_test_high_dropout.csv")
+INPUT_DIR = r"G:\.shortcut-targets-by-id\1UGjf9COV14whS-Q0GMoVQ4jL8pAGnmbw\retrep\outputdata"
+output = r"C:\Users\Meet Shah\Desktop\retransformationbias\projects\applied-micro-pres\Results"
+paper_list = np.load(r"C:\Users\Meet Shah\PycharmProjects\retrep\non_iv_reps_new.npy", allow_pickle=True)
+out = os.path.join(output, "replications_with_fe_jun_2026_var_fix_final.csv")
 unable = []
 
 
@@ -53,22 +53,22 @@ def run_replications(DIR):
                 unable.append(stripped_path[-2] + "_" + stripped_path[-1])
 
 
-
 def process_paper(result_path):
     metadata = os.path.join(result_path, 'metadata.json')
     with open(metadata, 'r') as f:
         metadata = json.load(f)
     print(metadata)
+    if os.path.exists(os.path.join(result_path, 'z.parquet')):
+        raise ValueError("IV required")
     X = pd.read_parquet(os.path.join(result_path, 'X.parquet'))
     y = pd.read_parquet(os.path.join(result_path, 'y.parquet'))
     return metadata, X, y
 
 
-
 def replicate(X, y, metadata):
     fe = metadata.get('fe', None)
     fe = [int(fixed_effect) for fixed_effect in fe] if fe is not None else None
-    n= X.shape[0]
+    n = X.shape[0]
     model = DREEM(
         endog=y,
         exog=X,
@@ -81,7 +81,6 @@ def replicate(X, y, metadata):
     depth = max(4, int(round(np.log(n))))  # ~ log(n)
     width = 20 * int(np.clip(round(n ** (1 / 6)), 5, 16))  # n^(1/6) so that H^2 ~ n^(1/3)
 
-
     arch_params_m = {
         'hidden_layers':  [width] * int(depth),
         'dropout': 0.2,
@@ -90,16 +89,16 @@ def replicate(X, y, metadata):
 
     fit_params_m = {
         "epochs": 300,
-        "batch_size": max(n//50, 64),
+        "batch_size": max(n // 50, 64),
         "learning_rate": 1e-4,
         "weight_decay": 1e-3,
         "patience": 40,
-        "val_frac": 0.2 if n>2000 else 0.1,
+        "val_frac": 0.2 if n > 2000 else 0.1,
         "num_workers": 0 if n < 5000 else 4
     }
 
     params = {
-        'fit_params': {'weight_decay': 1e-3, "num_workers": 0 if n < 5000 else 4, 'epochs':200},
+        'fit_params': {'weight_decay': 1e-3, "num_workers": 0 if n < 5000 else 4, 'epochs': 200},
         'arch_params': {}
     }
 
@@ -123,31 +122,20 @@ def dreem_summary_idx0_with_diff_se(res) -> pd.Series:
         else (res.gamma[var_idx] if has_ppml else np.nan)
     )
 
-    # vcov scaled by n (same scaling as your tests)
-    if res._variance_matrix is None:
-        res.compute_variances()
-    Vn = np.asarray(res._variance_matrix, float) / float(res.nobs)
-    # contrast vectors r for (elast_j - ols_j), (elast_j - ppml_j), (ols_j - ppml_j)
-    r_els_ols = np.zeros(Vn.shape[0])
-    r_els_ols[j] = 1.0
-    r_els_ols[k + j] = -1.0
+    # Comparable coefficients (binary OLS/PPML transformed to exp(b)-1) and their
+    # joint vcov, ordered [Elasticities | OLS | PPML].
+    c, Vt = res.comparable_coefs()
+    ols_cmp = float(c[k + j])
+    ppml_cmp = float(c[2 * k + j]) if has_ppml else np.nan
 
+    # SEs of differences from the comparable-coef vcov: sqrt(V_aa + V_bb - 2 V_ab)
+    se_diff_els_ols = float(np.sqrt(Vt[j, j] + Vt[k + j, k + j] - 2 * Vt[j, k + j]))
     if has_ppml:
-        r_els_ppml = np.zeros(Vn.shape[0])
-        r_els_ppml[j] = 1.0
-        r_els_ppml[2 * k + j] = -1.0
-
-        r_ols_ppml = np.zeros(Vn.shape[0])
-        r_ols_ppml[k + j] = 1.0
-        r_ols_ppml[2 * k + j] = -1.0
+        se_diff_els_ppml = float(np.sqrt(Vt[j, j] + Vt[2 * k + j, 2 * k + j] - 2 * Vt[j, 2 * k + j]))
+        se_diff_ols_ppml = float(np.sqrt(Vt[k + j, k + j] + Vt[2 * k + j, 2 * k + j] - 2 * Vt[k + j, 2 * k + j]))
     else:
-        r_els_ppml = None
-        r_ols_ppml = None
-
-    # SEs of differences: sqrt(r' V r)
-    se_diff_els_ols = float(np.sqrt(r_els_ols @ Vn @ r_els_ols))
-    se_diff_els_ppml = float(np.sqrt(r_els_ppml @ Vn @ r_els_ppml)) if has_ppml else np.nan
-    se_diff_ols_ppml = float(np.sqrt(r_ols_ppml @ Vn @ r_ols_ppml)) if has_ppml else np.nan
+        se_diff_els_ppml = np.nan
+        se_diff_ols_ppml = np.nan
 
     # also grab the test stats/p-values you already compute
     test = res.difference_test(verbose=False)
@@ -164,17 +152,20 @@ def dreem_summary_idx0_with_diff_se(res) -> pd.Series:
             "ols_coef": ols,
             "ppml_coef": ppml if has_ppml else np.nan,
 
-            "diff_elast_minus_ols": float(elast - ols),
+            "ols_coef_comparable": ols_cmp,
+            "ppml_coef_comparable": ppml_cmp,
+
+            "diff_elast_minus_ols": float(elast - ols_cmp),
             "se_diff_elast_minus_ols": se_diff_els_ols,
             "test_elast_vs_ols_stat": float(r_ols.statistic),
             "test_elast_vs_ols_p": float(r_ols.p_value),
 
-            "diff_elast_minus_ppml": float(elast - ppml) if has_ppml else np.nan,
+            "diff_elast_minus_ppml": float(elast - ppml_cmp) if has_ppml else np.nan,
             "se_diff_elast_minus_ppml": se_diff_els_ppml,
             "test_elast_vs_ppml_stat": float(r_ppml.statistic) if has_ppml else np.nan,
             "test_elast_vs_ppml_p": float(r_ppml.p_value) if has_ppml else np.nan,
 
-            "diff_ols_minus_ppml": float(ols - ppml) if has_ppml else np.nan,
+            "diff_ols_minus_ppml": float(ols_cmp - ppml_cmp) if has_ppml else np.nan,
             "se_diff_ols_minus_ppml": se_diff_ols_ppml,
             "test_ols_vs_ppml_stat": float(r_ols_ppml_test.statistic) if has_ppml else np.nan,
             "test_ols_vs_ppml_p": float(r_ols_ppml_test.p_value) if has_ppml else np.nan,
@@ -185,7 +176,10 @@ def dreem_summary_idx0_with_diff_se(res) -> pd.Series:
         name=name,
     )
 
+
 def main():
     return run_replications(INPUT_DIR)
 
-df, res = main()
+
+if __name__ == "__main__":
+    main()

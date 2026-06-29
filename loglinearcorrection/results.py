@@ -344,6 +344,72 @@ class DoublyRobustElasticityEstimatorModelResults:
         
         return np.exp(log_pred) * m_x
 
+    def comparable_coefs(self):
+        """
+        Stacked coefficients [Elasticities | OLS | (PPML)] and their vcov (V / n),
+        with OLS/PPML entries for binary interest variables transformed to
+        exp(b) - 1 via the delta method.
+
+        For a binary variable, theta is a percent change of the arithmetic mean
+        while OLS/PPML coefficients are in log points; the comparable null is
+        exp(b) - 1 = theta (paper, footnote 2). Continuous entries are unchanged
+        (identity Jacobian), so this is a no-op for them.
+
+        Returns
+        -------
+        coefs : ndarray, shape ((2 + ppml) * k,)
+            Transformed coefficient vector.
+        vcov : ndarray
+            Delta-method covariance J (V/n) J' with diagonal Jacobian J.
+        """
+        if self._variance_matrix is None:
+            self.compute_variances()
+
+        k = len(self.interest_indices)
+        names = [self.exog_names[i] for i in self.interest_indices]
+
+        # Elasticities block
+        if self._is_pandas:
+            elast = np.asarray([self.elasticities.loc[n, 'estimate'] for n in names], dtype=float)
+        else:
+            elast = np.asarray(self.elasticities[:k], dtype=float)
+
+        # OLS block
+        if self.beta.shape[0] == k:
+            beta_vec = np.asarray(self.beta[:k], float)
+        else:
+            beta_vec = np.asarray([self.beta[idx] for idx in self.interest_indices], float)
+
+        blocks = [elast, beta_vec]
+
+        # PPML block (optional)
+        if self._ppml_fit:
+            if self.gamma.shape[0] == k:
+                gamma_vec = np.asarray(self.gamma[:k], float)
+            else:
+                gamma_vec = np.asarray([self.gamma[idx] for idx in self.interest_indices], float)
+            blocks.append(gamma_vec)
+
+        coefs = np.concatenate(blocks, axis=0)
+
+        Vn = np.asarray(self._variance_matrix, dtype=float) / float(self.nobs)
+
+        if Vn.shape != (coefs.size, coefs.size):
+            raise ValueError(f"vcov shape {Vn.shape} does not match concatenated coef length {coefs.size}")
+
+        # Delta-method Jacobian: identity for continuous, exp(b) for binary OLS/PPML.
+        jac = np.ones_like(coefs)
+        for j, idx in enumerate(self.interest_indices):
+            if self.variable_types.get(idx) == 'binary':
+                jac[k + j] = np.exp(coefs[k + j])
+                coefs[k + j] = np.exp(coefs[k + j]) - 1.0
+                if self._ppml_fit:
+                    jac[2 * k + j] = np.exp(coefs[2 * k + j])
+                    coefs[2 * k + j] = np.exp(coefs[2 * k + j]) - 1.0
+
+        vcov = Vn * np.outer(jac, jac)
+        return coefs, vcov
+
     def difference_test(self, verbose: bool = True) -> CoefDiffTest:
         """
         Compare elasticities against OLS, and against PPML if available.
