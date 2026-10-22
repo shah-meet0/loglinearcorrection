@@ -3,11 +3,23 @@ import scipy.stats as stats
 
 
 class HypothesisTestResult:
-    def __init__(self, statistic: float, p_value: float, df: int, description: str = ""):
+    def __init__(
+        self,
+        statistic: float,
+        p_value: float,
+        df: int,
+        description: str = "",
+        difference: float | None = None,
+        standard_error: float | None = None,
+    ):
         self.statistic = float(statistic)
         self.p_value = float(p_value)
         self.df = int(df)
         self.description = description
+        self.difference = None if difference is None else float(difference)
+        self.standard_error = (
+            None if standard_error is None else float(standard_error)
+        )
 
     def __repr__(self):
         return (f"HypothesisTestResult(statistic={self.statistic}, "
@@ -71,11 +83,22 @@ class CoefDiffTest:
 
             # Per-coefficient Wald χ²(1)
             diag = np.diag(Vdiff)
-            # numerical guard
-            if np.any(diag <= 0):
-                raise ValueError("Nonpositive variance detected for at least one contrast.")
-
-            stats_chi = (diff ** 2) / diag
+            # Numerical guard. An exactly zero variance is possible when two
+            # estimators are algebraically identical; distinguish that case
+            # from a materially negative covariance estimate.
+            tolerance = np.finfo(float).eps * max(
+                1.0, float(np.max(np.abs(np.diag(self.vcov))))
+            )
+            if np.any(diag < -tolerance):
+                raise ValueError(
+                    "Negative variance detected for at least one contrast."
+                )
+            positive = diag > tolerance
+            stats_chi = np.empty_like(diff, dtype=float)
+            stats_chi[positive] = (diff[positive] ** 2) / diag[positive]
+            stats_chi[~positive] = np.where(
+                np.abs(diff[~positive]) <= np.sqrt(tolerance), 0.0, np.inf
+            )
             pvals = 1.0 - stats.chi2.cdf(stats_chi, df=1)
 
             for j in range(self.k):
@@ -85,7 +108,91 @@ class CoefDiffTest:
                         statistic=stats_chi[j],
                         p_value=pvals[j],
                         df=1,
-                        description=desc
+                        description=desc,
+                        difference=diff[j],
+                        standard_error=np.sqrt(max(diag[j], 0.0)),
                     )
                 )
         return results
+
+
+class InfluenceFunctionDiffTest:
+    """Wald coefficient-difference tests from jointly observed influences.
+
+    Parameters
+    ----------
+    n, k, coefs
+        Have the same block interpretation as :class:`CoefDiffTest`.
+    influence_functions
+        Observation-level influence functions with one column per coefficient
+        in ``coefs``.  Each estimator must admit the linear representation
+        ``theta_hat - theta = sum_i probability_weights[i] * IF[i] + op(1)``.
+    weights
+        Optional non-negative sampling or frequency weights.  The covariance
+        is estimated from the weighted, centered influence functions, so the
+        covariance between estimators is retained in every contrast.
+
+    Notes
+    -----
+    With equal weights this computes ``IF.T @ IF / n**2``.  This is the
+    influence-function counterpart of the covariance matrix supplied directly
+    to :class:`CoefDiffTest` and is useful when two estimates were obtained
+    from the same observations.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        k: int,
+        coefs: np.ndarray,
+        influence_functions: np.ndarray,
+        weights: np.ndarray | None = None,
+    ):
+        self.n = int(n)
+        self.k = int(k)
+        self.coefs = np.asarray(coefs, dtype=float).reshape(-1)
+        influences = np.asarray(influence_functions, dtype=float)
+        if influences.ndim == 1:
+            influences = influences[:, None]
+        if influences.shape != (self.n, self.coefs.size):
+            raise ValueError(
+                "influence_functions must have shape "
+                f"({self.n}, {self.coefs.size}); got {influences.shape}."
+            )
+        if not np.all(np.isfinite(influences)):
+            raise ValueError(
+                "influence_functions must contain only finite values."
+            )
+
+        if weights is None:
+            weights_array = np.ones(self.n, dtype=float)
+        else:
+            weights_array = np.asarray(weights, dtype=float).reshape(-1)
+            if weights_array.shape != (self.n,):
+                raise ValueError(f"weights must have length {self.n}.")
+            if (
+                not np.all(np.isfinite(weights_array))
+                or np.any(weights_array < 0.0)
+                or weights_array.sum() <= 0.0
+            ):
+                raise ValueError(
+                    "weights must be finite, non-negative, and have positive sum."
+                )
+
+        probability_weights = weights_array / weights_array.sum()
+        centered = influences - np.sum(
+            probability_weights[:, None] * influences, axis=0, keepdims=True
+        )
+        weighted = probability_weights[:, None] * centered
+        self.influence_functions = influences
+        self.probability_weights = probability_weights
+        self.vcov = weighted.T @ weighted
+        self.vcov = 0.5 * (self.vcov + self.vcov.T)
+
+        coefficient_test = CoefDiffTest(
+            n=self.n,
+            k=self.k,
+            coefs=self.coefs,
+            vcov=self.vcov,
+        )
+        self.results = coefficient_test.results

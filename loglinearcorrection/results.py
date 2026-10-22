@@ -82,7 +82,9 @@ class DoublyRobustElasticityEstimatorModelResults:
         moments: npt.NDArray[np.float64],
         derivative: npt.NDArray[np.float64],
         fold_weights: npt.NDArray[np.float64],
-        gamma: Optional[npt.NDArray[np.float64]] = None
+        gamma: Optional[npt.NDArray[np.float64]] = None,
+        excluded_obs: Optional[npt.NDArray[np.int64]] = None,
+        max_phi_share: Optional[npt.NDArray[np.float64]] = None
     ):
         self.elasticities = elasticities
         self.beta = beta
@@ -99,6 +101,8 @@ class DoublyRobustElasticityEstimatorModelResults:
         self.fold_weights = fold_weights
         self._ppml_fit = gamma is not None
         self.gamma = gamma
+        self.excluded_obs = excluded_obs if excluded_obs is not None else np.array([], dtype=np.int64)
+        self.max_phi_share = max_phi_share
         self._is_pandas = isinstance(elasticities, pd.DataFrame)
         
         # Will be populated by compute_variances()

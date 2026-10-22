@@ -155,8 +155,8 @@ class NNModel(NPModel):
         return self._create_model_from_config(config)
 
     def _create_model_from_config(self, config):
-        from loglinearcorrection.neural_network_models import FeedForwardNNModel
-        return FeedForwardNNModel(config)
+        from loglinearcorrection.neural_network_models import build_feed_forward_model
+        return build_feed_forward_model(config)
 
 
     def _parse_params(self):
@@ -683,7 +683,7 @@ class NNModelDensity(NNModel):
 
         import torch
         from torch.utils.data import DataLoader, TensorDataset, Subset
-        from loglinearcorrection.neural_network_models import FeedForwardNNModel, NullNN, ScoreMatchingLossRestricted
+        from loglinearcorrection.neural_network_models import build_feed_forward_model, NullNN, ScoreMatchingLossRestricted
 
         if dims["output_size"] == 0:
             return NullNN()
@@ -698,10 +698,12 @@ class NNModelDensity(NNModel):
         # model
         # DROPOUT HAS TO BE 0 FOR SCORE.
         cfg = {**arch_cfg, **dims}
+        if cfg.get("gaussian_reference", False):
+            cfg["gaussian_reference_indices"] = interest_idx
         if cfg['dropout'] > 0.0 and cfg['output_size'] > 1:
             cfg['dropout'] = 0.0
             print('Warning: Dropout in score model biases results with multiple continuous interest, setting to 0.0.')
-        model = FeedForwardNNModel(cfg).to(device)
+        model = build_feed_forward_model(cfg).to(device)
 
         # loss
         loss_fn = ScoreMatchingLossRestricted(interest=interest_idx).to(device)
@@ -758,9 +760,51 @@ class NNModelDensity(NNModel):
         verbose = bool(fit_cfg.get("verbose", True))
 
         best_loss = float("inf")
+        best_core_stein = float("inf")
         best_state = None
         bad = 0
         log_every = max(1, epochs // 10)
+
+        stein_threshold = cfg.get("stein_validation_threshold")
+        if stein_threshold is not None:
+            stein_threshold = float(stein_threshold)
+            if stein_threshold <= 0:
+                raise ValueError("stein_validation_threshold must be positive")
+
+        def validation_metrics():
+            """Return exact score risk and the two core Stein moment errors."""
+            va_sum = va_cnt = 0
+            moment_sum = torch.zeros(
+                (len(interest_idx), 2), dtype=torch.float64, device=device
+            )
+            with torch.enable_grad():
+                for (xb,) in dl_va:
+                    xb = xb.to(device, non_blocking=pin).detach().requires_grad_(True)
+                    h = model(xb)
+                    l = loss_fn(model, xb).detach()
+                    bs_ = xb.size(0)
+                    va_sum += float(l) * bs_
+                    va_cnt += bs_
+                    for out_j, var_k in enumerate(interest_idx):
+                        score = h[:, out_j].detach().double()
+                        coordinate = xb[:, var_k].detach().double()
+                        moment_sum[out_j, 0] += score.sum()
+                        moment_sum[out_j, 1] += (coordinate * score + 1.0).sum()
+            means = moment_sum / max(va_cnt, 1)
+            return va_sum / max(va_cnt, 1), float(means.abs().max().cpu())
+
+        # The Gaussian-reference initialization is already a useful, stable
+        # score.  Treat it as epoch zero so later Hyvarinen improvements cannot
+        # replace it with an empirically unbounded, Stein-violating solution.
+        if dl_va is not None and stein_threshold is not None:
+            model.eval()
+            initial_loss, initial_core = validation_metrics()
+            if initial_core <= stein_threshold:
+                best_loss = initial_loss
+                best_core_stein = initial_core
+                best_state = {
+                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+                }
 
         for ep in range(1, epochs + 1):
             # ---- train
@@ -782,19 +826,12 @@ class NNModelDensity(NNModel):
             # ---- validate
             if dl_va is not None:
                 model.eval()
-                va_sum = va_cnt = 0
-                with torch.enable_grad():  # need grads for score-matching val
-                    for (xb,) in dl_va:
-                        xb = xb.to(device, non_blocking=pin).detach().requires_grad_(True)
-                        l = loss_fn(model, xb).detach()
-                        bs_ = xb.size(0)
-                        va_sum += float(l) * bs_
-                        va_cnt += bs_
-                va_loss = va_sum / max(va_cnt, 1)
-
-                improved = va_loss + min_delta < best_loss
+                va_loss, core_stein = validation_metrics()
+                feasible = stein_threshold is None or core_stein <= stein_threshold
+                improved = feasible and va_loss + min_delta < best_loss
                 if improved:
                     best_loss = va_loss
+                    best_core_stein = core_stein
                     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                     bad = 0
                 else:
@@ -802,11 +839,16 @@ class NNModelDensity(NNModel):
 
                 if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
                     print(
-                        f"[Score ep {ep:>3}/{epochs}] train={tr_loss:.6f} val={va_loss:.6f}{' *' if improved else ''}")
+                        f"[Score ep {ep:>3}/{epochs}] train={tr_loss:.6f} "
+                        f"val={va_loss:.6f} stein={core_stein:.4f}"
+                        f"{' *' if improved else ''}")
 
                 if bad >= patience:
                     if verbose:
-                        print(f"Early stopping score head at epoch {ep} (best val={best_loss:.6f}).")
+                        print(
+                            f"Early stopping score head at epoch {ep} "
+                            f"(best val={best_loss:.6f}, Stein={best_core_stein:.4f})."
+                        )
                     break
             else:
                 if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
@@ -829,7 +871,7 @@ class NNModelDensity(NNModel):
         import torch
         import torch.nn as nn
         from torch.utils.data import DataLoader, TensorDataset, Subset
-        from loglinearcorrection.neural_network_models import FeedForwardNNModel, NullNN
+        from loglinearcorrection.neural_network_models import build_feed_forward_model, NullNN
 
         # no discrete vars to model
         if dims["output_size"] == 0 or len(meta.get("interest_disc_indices", [])) == 0:
@@ -866,7 +908,7 @@ class NNModelDensity(NNModel):
         # model
         cfg = {**arch_cfg, **{"input_size": dims["input_size"], "output_size": dims["output_size"],
                               "output_activation": "identity"}}
-        model = FeedForwardNNModel(cfg).to(device)
+        model = build_feed_forward_model(cfg).to(device)
 
         # loss with optional class weights for imbalance
         class_weights = fit_cfg.get("class_weights", None)
@@ -1232,3 +1274,177 @@ class NNModelNuisanceResults(NPModelResultsNuisance):
             preds = yhat.detach().cpu().numpy()  # (n, q)
             grads = G.detach().cpu().numpy()  # (n, q, K)
             return preds, grads
+
+
+class SplineModelNuisance(NPModel):
+    """
+    Spline-basis Poisson (log-link) nuisance model for m(x) = E[exp(u) | x].
+
+    m(x) = exp(design(x) @ b) is positive by construction, so 1/m and m'/m
+    stay bounded — the two quantities that blow up when an unconstrained NN
+    fit of m drifts towards zero. Continuous variables of interest get a
+    B-spline basis; every other column (binaries, controls, one-hot FEs)
+    enters linearly. Fit by ridge-regularized IRLS, so collinear one-hot
+    blocks and constants are handled without pruning.
+
+    Parameters
+    ----------
+    variable_types : dict
+        Map {col_index: 'continuous'|'binary'|'ordinal'} for interest columns.
+        Continuous interest columns receive the spline basis.
+    degree : int
+        B-spline degree (default cubic).
+    n_knots : int
+        Max number of interior knots (shrunk automatically for small samples).
+    ridge : float
+        Ridge penalty per observation on non-intercept coefficients.
+    max_iter, tol : IRLS controls.
+    """
+
+    def __init__(self, variable_types, degree: int = 3, n_knots: int = 5,
+                 ridge: float = 1e-4, max_iter: int = 100, tol: float = 1e-8, **params):
+        super().__init__(variable_types, **params)
+        self.degree = degree
+        self.n_knots = n_knots
+        self.ridge = ridge
+        self.max_iter = max_iter
+        self.tol = tol
+        self.spline_specs = {}
+        self.linear_cols = []
+        self.linear_mean = None
+        self.linear_scale = None
+        self.coef_ = None
+        self.col_scale_raw = None
+        self.model = None
+
+    def _make_spline_spec(self, x):
+        from scipy.interpolate import BSpline
+        lo, hi = float(np.min(x)), float(np.max(x))
+        n = x.shape[0]
+        n_interior = int(np.clip(n // 50, 1, self.n_knots))
+        qs = np.linspace(0, 1, n_interior + 2)[1:-1]
+        interior = np.unique(np.quantile(x, qs))
+        interior = interior[(interior > lo) & (interior < hi)]
+        deg = self.degree
+        t = np.concatenate([[lo] * (deg + 1), interior, [hi] * (deg + 1)])
+        return t, deg, lo, hi
+
+    def _spline_basis(self, x, spec):
+        from scipy.interpolate import BSpline
+        t, deg, lo, hi = spec
+        xc = np.clip(x, lo, hi)
+        B = BSpline.design_matrix(xc, t, deg).toarray()
+        return B[:, 1:]
+
+    def _build_design(self, X):
+        n = X.shape[0]
+        blocks = [np.ones((n, 1))]
+        for col in sorted(self.spline_specs):
+            blocks.append(self._spline_basis(X[:, col], self.spline_specs[col]))
+        if self.linear_cols:
+            L = (X[:, self.linear_cols] - self.linear_mean) / self.linear_scale
+            blocks.append(L)
+        return np.column_stack(blocks)
+
+    def fit(self, X, y, verbose=True, **fit_params):
+        """Fit ridge-IRLS Poisson regression of y (= exp residuals) on the spline design.
+
+        NN-style fit kwargs (epochs, batch_size, ...) are accepted and ignored
+        so the model is a drop-in replacement for NNModelNuisance.
+        """
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).ravel()
+        n, d = X.shape
+
+        self.col_scale_raw = X.std(axis=0)
+
+        spline_cols = [j for j, t in self.variable_types.items()
+                       if t == 'continuous' and j < d
+                       and len(np.unique(X[:, j])) > 2 * (self.degree + 1)]
+
+        self.spline_specs = {j: self._make_spline_spec(X[:, j]) for j in spline_cols}
+
+        self.linear_cols = [j for j in range(d)
+                            if j not in self.spline_specs and self.col_scale_raw[j] > 1e-12]
+
+        if self.linear_cols:
+            self.linear_mean = X[:, self.linear_cols].mean(axis=0)
+            self.linear_scale = X[:, self.linear_cols].std(axis=0)
+
+        D = self._build_design(X)
+        p = D.shape[1]
+
+        lam_base = self.ridge * n
+        pen_mask = np.ones(p)
+        pen_mask[0] = 0.0
+
+        beta = np.zeros(p)
+        beta[0] = np.log(max(y.mean(), 1e-12))
+
+        lam = lam_base
+        for _ in range(self.max_iter):
+            eta = np.clip(D @ beta, -30.0, 30.0)
+            mu = np.exp(eta)
+            W = mu
+            z = eta + (y - mu) / mu
+            DtW = D.T * W
+            A = DtW @ D + lam * np.diag(pen_mask)
+            b = DtW @ z
+            try:
+                beta_new = np.linalg.solve(A, b)
+            except np.linalg.LinAlgError:
+                lam *= 10.0
+                continue
+            step = np.max(np.abs(beta_new - beta))
+            beta = beta_new
+            if step < self.tol:
+                break
+
+        self.coef_ = beta
+        self.model = self
+
+        eta = np.clip(D @ beta, -30.0, 30.0)
+        mu = np.exp(eta)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            dev_terms = np.where(y > 0, y * np.log(y / mu) - (y - mu), mu)
+        deviance = 2.0 * float(np.sum(dev_terms))
+
+        if verbose:
+            print(f"[SplineNuisance] n={n}, design_cols={p}, "
+                  f"spline_cols={sorted(self.spline_specs)}, deviance={deviance:.4f}")
+
+        return SplineModelNuisanceResults(self, deviance=deviance)
+
+    def _predict(self, X):
+        D = self._build_design(np.asarray(X, dtype=np.float64))
+        return np.exp(np.clip(D @ self.coef_, -30.0, 30.0))
+
+
+class SplineModelNuisanceResults(NPModelResultsNuisance):
+    """Results wrapper for SplineModelNuisance with the NNModelNuisanceResults API."""
+
+    def __init__(self, model, **metrics):
+        super().__init__(model, **metrics)
+        self._spline = model
+
+    def predict(self, X):
+        return self._spline._predict(np.asarray(X, dtype=np.float64))
+
+    def derivative(self, X, var_index):
+        """
+        Returns (pred, grad): pred[i] = m(x_i), grad[i, k] = dm(x_i)/dx_k for k in
+        var_index, via central finite differences (m is smooth in x).
+        """
+        X = np.asarray(X, dtype=np.float64)
+        preds = self._spline._predict(X)
+        grads = np.zeros((X.shape[0], len(var_index)))
+        for out_col, j in enumerate(var_index):
+            sd = self._spline.col_scale_raw[j]
+            if sd <= 1e-12:
+                continue
+            h = 1e-4 * sd
+            Xp, Xm = X.copy(), X.copy()
+            Xp[:, j] += h
+            Xm[:, j] -= h
+            grads[:, out_col] = (self._spline._predict(Xp) - self._spline._predict(Xm)) / (2.0 * h)
+        return preds, grads

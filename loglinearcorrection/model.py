@@ -29,6 +29,7 @@ class DoublyRobustElasticityEstimatorModel:
             fixed_effects: list[str] | list[int] | None = None,
             interest: list[str] | list[int] | None = None,
             ordinal: list[str] | list[int] | None = None,
+            fe_encoding: str = "onehot",
             **kwargs
     ) -> None:
         """
@@ -58,6 +59,11 @@ class DoublyRobustElasticityEstimatorModel:
             variables with exactly 2 unique values will remain classified as binary
             even if specified in the ordinal parameter, as binary is a special case
             that requires specific handling.
+        fe_encoding : {'onehot', 'codes'}, default 'onehot'
+            Representation of fixed effects supplied to neural nuisance models.
+            ``'codes'`` keeps one zero-based category-code column per fixed
+            effect and is intended for embedding-aware neural models. The
+            default preserves the original dense one-hot behavior.
         **kwargs
             Additional keyword arguments (reserved for future use).
 
@@ -115,6 +121,10 @@ class DoublyRobustElasticityEstimatorModel:
         """
         # Store specifications
         self.ordinal = ordinal
+        if fe_encoding not in {"onehot", "codes"}:
+            raise ValueError("fe_encoding must be 'onehot' or 'codes'")
+        self.fe_encoding = fe_encoding
+        self.fe_cardinalities: list[int] = []
 
         # Extract names from pandas objects or generate defaults
         self.endog_names = (
@@ -188,8 +198,17 @@ class DoublyRobustElasticityEstimatorModel:
             self.ols_res = sm.WLS(endog_demeaned, exog_demeaned, weights=self.weights if self.weights else 1).fit()
             self.beta = self.ols_res.params
 
-            # One-hot encode FE columns for NN inputs
-            self.fe_onehot = _one_hot_encode_fe(self.fe_cols)
+            if self.fe_encoding == "codes":
+                encoded_columns = []
+                for column in range(self.fe_cols.shape[1]):
+                    codes, levels = pd.factorize(self.fe_cols[:, column], sort=True)
+                    if np.any(codes < 0):
+                        raise ValueError("fixed effects must not contain missing values")
+                    encoded_columns.append(codes.astype(np.float64))
+                    self.fe_cardinalities.append(len(levels))
+                self.fe_onehot = np.column_stack(encoded_columns)
+            else:
+                self.fe_onehot = _one_hot_encode_fe(self.fe_cols)
             self.exog_augmented = np.column_stack([self.exog, self.fe_onehot])
             # Composite FE label for stratified CV
             self.fe_labels = np.array([
@@ -200,6 +219,8 @@ class DoublyRobustElasticityEstimatorModel:
             self.beta = self.ols_res.params
             self.exog_augmented = self.exog
             self.fe_labels = None
+
+        self.continuous_input_size = self.exog.shape[1]
 
         # Detect variable types for interest variables
         self.variable_types = _detect_variable_types(
@@ -273,7 +294,8 @@ class DoublyRobustElasticityEstimatorModel:
         exp_residuals_train = np.exp(log_residuals_train)
 
         # Step 2: Estimate nuisance functions
-        m_model = NNModelNuisance(variable_types=self.variable_types, **m_params['arch_params'])
+        m_model_cls = m_params.get('model_class', NNModelNuisance)
+        m_model = m_model_cls(variable_types=self.variable_types, **m_params['arch_params'])
         m_results = m_model.fit(exog_aug_train, exp_residuals_train, **m_params['fit_params'])
 
         m_test, m_prime_test = m_results.derivative(exog_aug_test, interest_indices)
@@ -350,8 +372,18 @@ class DoublyRobustElasticityEstimatorModel:
         }
 
     def fit(self, n_folds: int = 5, random_state: Optional[int] = None,
-            m_params: Dict = None, density_params: Dict = None, fit_ppml=False) -> 'DREEMR':
-        """Fit the Doubly Robust Nonparametric Orthogonal elasticity estimator."""
+            m_params: Dict = None, density_params: Dict = None, fit_ppml=False,
+            phi_share_cap: Optional[float] = 0.5) -> 'DREEMR':
+        """Fit the Doubly Robust Nonparametric Orthogonal elasticity estimator.
+
+        phi_share_cap : float or None, default 0.5
+            Observations whose single elasticity moment exceeds this share of
+            the total moment mass (numerical blowups from degenerate nuisance
+            estimates) are removed by zeroing their weight, as are observations
+            with non-finite moments. Set to None to disable removal and keep
+            raw estimates (e.g. for Monte Carlo blowup counting); the
+            max_phi_share diagnostic is reported either way.
+        """
 
         m_params = self._parse_m_params(m_params)
         density_params = self._parse_density_params(density_params)
@@ -413,6 +445,43 @@ class DoublyRobustElasticityEstimatorModel:
             moments[:, 2 * n_interest:] = ppml_moments
             derivative[:, 2 * n_interest:, 2 * n_interest:] = ppml_derivative
 
+        # Remove observations that numerically dominate an elasticity moment.
+        # When the estimated nuisances degenerate at a test point (e.g.
+        # p_hat * m_shifted ~ 0 for a binary regressor), that single phi_i can
+        # carry most of the moment sum (max_phi_share -> 1) and corrupt both the
+        # estimate and the Jacobian. Zeroing the weight drops the observation
+        # from the estimate, S, and D consistently. Genuine heavy tails sit far
+        # below the 0.5 share cap and are untouched.
+        elast_moments = moments[:, :n_interest]
+        if phi_share_cap is not None:
+            excluded = ~np.isfinite(elast_moments).all(axis=1)
+            excluded |= ~np.isfinite(derivative[:, :n_interest, :]).all(axis=(1, 2))
+        else:
+            excluded = np.zeros(self.nobs, dtype=bool)
+        max_phi_share = np.zeros(n_interest)
+        for j in range(n_interest):
+            for _ in range(10):
+                abs_phi = np.abs(elast_moments[:, j]) * fold_weights
+                abs_phi[excluded] = 0.0
+                total = abs_phi.sum()
+                if total <= 0 or not np.isfinite(total):
+                    break
+                top = int(np.argmax(abs_phi))
+                share = abs_phi[top] / total
+                max_phi_share[j] = share
+                if phi_share_cap is not None and share > phi_share_cap:
+                    excluded[top] = True
+                else:
+                    break
+        if excluded.any():
+            print(f"Excluded {int(excluded.sum())} observation(s) with dominating or non-finite "
+                  f"elasticity moments (max_phi_share > {phi_share_cap}).")
+            fold_weights[excluded] = 0.0
+            # Zero the rows as well: a zero weight does not neutralize inf/nan
+            # values in weighted averages (0 * inf = nan).
+            moments[excluded] = 0.0
+            derivative[excluded] = 0.0
+
         # Extract point estimates
         moment_means = np.average(moments, axis=0, weights=fold_weights)
         elasticity_estimates = moment_means[:len(interest_indices)]
@@ -446,7 +515,9 @@ class DoublyRobustElasticityEstimatorModel:
             moments=moments,
             derivative=derivative,
             fold_weights=fold_weights,
-            gamma=ppml_params if fit_ppml else None
+            gamma=ppml_params if fit_ppml else None,
+            excluded_obs=np.where(excluded)[0],
+            max_phi_share=max_phi_share
         )
 
         # Compute variances
@@ -464,8 +535,8 @@ class DoublyRobustElasticityEstimatorModel:
                         'fit_params': {}}
 
         for key in m_params.keys():
-            if key not in ['arch_params', 'fit_params']:
-                raise ValueError(f"Invalid key in m_params: {key} . Must be 'arch_params' or 'fit_params'.")
+            if key not in ['arch_params', 'fit_params', 'model_class']:
+                raise ValueError(f"Invalid key in m_params: {key} . Must be 'arch_params', 'fit_params' or 'model_class'.")
 
         if 'fit_params' not in m_params:
             m_params['fit_params'] = {}

@@ -95,6 +95,147 @@ class FeedForwardNNModel(nn.Module):
         return self.model(x)
 
 
+class EmbeddingFeedForwardNNModel(nn.Module):
+    """MLP with learned embeddings for trailing categorical input columns.
+
+    The first ``continuous_input_size`` columns remain differentiable floating
+    point inputs.  Each remaining column is a zero-based category code.  This
+    representation is particularly useful for high-dimensional fixed effects:
+    it avoids allocating an ``nobs`` by ``n_levels`` dense dummy matrix while
+    retaining category-specific trainable parameters.
+    """
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self.continuous_input_size = int(config["continuous_input_size"])
+        cardinalities = [int(value) for value in config["categorical_cardinalities"]]
+        if any(value < 1 for value in cardinalities):
+            raise ValueError("categorical cardinalities must be positive")
+        cap = int(config.get("embedding_dimension_cap", 32))
+        if cap < 1:
+            raise ValueError("embedding_dimension_cap must be positive")
+        dimensions = [min(cap, max(2, int(round(value ** 0.25 * 4)))) for value in cardinalities]
+        self.embeddings = nn.ModuleList(
+            [nn.Embedding(cardinality, dimension) for cardinality, dimension in zip(cardinalities, dimensions)]
+        )
+        for embedding in self.embeddings:
+            nn.init.normal_(embedding.weight, mean=0.0, std=0.05)
+
+        mlp_config = dict(config)
+        mlp_config["input_size"] = self.continuous_input_size + sum(dimensions)
+        self.mlp = FeedForwardNNModel(mlp_config)
+
+    def forward(self, x):
+        continuous = x[:, : self.continuous_input_size]
+        categorical = x[:, self.continuous_input_size :]
+        if categorical.shape[1] != len(self.embeddings):
+            raise ValueError(
+                f"Expected {len(self.embeddings)} categorical columns; "
+                f"found {categorical.shape[1]}"
+            )
+        features = [continuous]
+        for column, embedding in enumerate(self.embeddings):
+            codes = categorical[:, column].round().long()
+            codes = codes.clamp(0, embedding.num_embeddings - 1)
+            features.append(embedding(codes))
+        return self.mlp(torch.cat(features, dim=1))
+
+
+def build_feed_forward_model(config: dict) -> nn.Module:
+    """Build a plain or categorical-embedding feed-forward model."""
+    cardinalities = config.get("categorical_cardinalities")
+    if cardinalities:
+        model = EmbeddingFeedForwardNNModel(config)
+    else:
+        model = FeedForwardNNModel(config)
+
+    reference_indices = config.get("gaussian_reference_indices")
+    if reference_indices is not None:
+        # Start exactly at the standardized Gaussian score.  Only the residual
+        # output layer is zeroed; the randomly initialized hidden representation
+        # remains trainable and breaks symmetry as usual.
+        output_layer = None
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                output_layer = module
+        if output_layer is None:
+            raise ValueError("Could not find the score network output layer")
+        nn.init.zeros_(output_layer.weight)
+        if output_layer.bias is not None:
+            nn.init.zeros_(output_layer.bias)
+        model = GaussianReferenceScoreModel(model, reference_indices)
+
+    if config.get("positive_log_link", False):
+        output_layer = None
+        for module in model.modules():
+            if isinstance(module, nn.Linear):
+                output_layer = module
+        if output_layer is None:
+            raise ValueError("Could not find the nuisance network output layer")
+        nn.init.zeros_(output_layer.weight)
+        if output_layer.bias is not None:
+            nn.init.zeros_(output_layer.bias)
+        model = BoundedLogLinkModel(
+            model, float(config.get("log_link_max_abs", 3.0))
+        )
+
+    positive_floor = config.get("positive_floor")
+    if positive_floor is not None:
+        model = PositiveFloorModel(model, float(positive_floor))
+    return model
+
+
+class GaussianReferenceScoreModel(nn.Module):
+    """A residual score network around a standard-normal reference score."""
+
+    def __init__(self, residual_model: nn.Module, interest_indices):
+        super().__init__()
+        self.residual_model = residual_model
+        self.register_buffer(
+            "interest_indices",
+            torch.as_tensor(list(interest_indices), dtype=torch.long),
+        )
+
+    def forward(self, x):
+        if self.interest_indices.numel() == 0:
+            return self.residual_model(x)
+        return self.residual_model(x) - x.index_select(1, self.interest_indices)
+
+
+class PositiveFloorModel(nn.Module):
+    """Keep a positive-output network away from floating-point underflow."""
+
+    def __init__(self, model: nn.Module, floor: float):
+        super().__init__()
+        if floor <= 0:
+            raise ValueError("positive_floor must be positive")
+        self.model = model
+        self.floor = float(floor)
+
+    def forward(self, x):
+        return self.model(x) + self.floor
+
+
+class BoundedLogLinkModel(nn.Module):
+    """Positive mean-one link with bounded log predictions.
+
+    A zero-initialized raw output maps exactly to one.  Bounding the log mean
+    prevents tiny fitted means from turning ``m_prime / m`` into a numerical
+    singularity in generalized DREAm.
+    """
+
+    def __init__(self, raw_model: nn.Module, max_abs: float):
+        super().__init__()
+        if max_abs <= 0:
+            raise ValueError("log_link_max_abs must be positive")
+        self.raw_model = raw_model
+        self.max_abs = float(max_abs)
+
+    def forward(self, x):
+        log_mean = self.max_abs * torch.tanh(self.raw_model(x) / self.max_abs)
+        return torch.exp(log_mean)
+
+
 class NullNN(nn.Module):
     def __init__(self, input_size=0, output_size=0):
         super().__init__()
