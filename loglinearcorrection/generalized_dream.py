@@ -26,7 +26,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from .hypothesis import HypothesisTestResult, InfluenceFunctionDiffTest
 from .model import DoublyRobustElasticityEstimatorModel
 from .nonparametric import NNModelDensity, NNModelNuisance
-from .utils import _apply_fixed_effects
+from .utils import _apply_fixed_effects, _initialize_fixed_effects
 
 
 Array = npt.NDArray[np.float64]
@@ -806,12 +806,41 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 )
                 iterator = splitter.split(self.exog, self.fe_labels)
             else:
-                splitter = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
-                iterator = splitter.split(self.exog)
+                return self._fe_spread_splits(n_folds, random_state)
         else:
             splitter = KFold(n_splits=n_folds, shuffle=True, random_state=random_state)
             iterator = splitter.split(self.exog)
         return [(np.asarray(train), np.asarray(test)) for train, test in iterator]
+
+    def _fe_spread_splits(
+        self, n_folds: int, random_state: Optional[int]
+    ) -> list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
+        """Folds that spread every level of the finest fixed effect across folds.
+
+        Rows of each level of the fixed effect with the smallest median group
+        size (e.g. county in a county x state-year panel) are dealt round-robin
+        over the folds from a random starting fold, so a level with at least two
+        rows is never held out entirely and its fixed effect is always estimated
+        on training rows.  Fold sizes stay balanced to within one row per level.
+        """
+        rng = np.random.default_rng(random_state)
+        median_sizes = [
+            np.median(np.unique(self.fe_cols[:, j], return_counts=True)[1])
+            for j in range(self.fe_cols.shape[1])
+        ]
+        codes = pd.factorize(self.fe_cols[:, int(np.argmin(median_sizes))])[0]
+        order = rng.permutation(self.nobs)
+        order = order[np.argsort(codes[order], kind="stable")]
+        sorted_codes = codes[order]
+        starts = np.r_[0, np.flatnonzero(np.diff(sorted_codes)) + 1]
+        rank = np.arange(self.nobs) - np.repeat(starts, np.diff(np.r_[starts, self.nobs]))
+        offset = rng.integers(n_folds, size=codes.max() + 1)
+        fold = np.empty(self.nobs, dtype=np.int64)
+        fold[order] = (rank + offset[sorted_codes]) % n_folds
+        return [
+            (np.flatnonzero(fold != k), np.flatnonzero(fold == k))
+            for k in range(n_folds)
+        ]
 
     def _fold_ols_residuals(
         self,
@@ -821,46 +850,94 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
     ) -> tuple[Any, Array, Array, Array, Array, Array]:
         """Fold OLS and log residuals net of fixed effects.
 
-        With fixed effects, log(y) and X are demeaned on the full sample using
-        ``weight_fold`` (held-out observations carry weight 1e-10), as in
-        :mod:`loglinearcorrection.model`, so the fixed-effect means come from
-        the training fold.  The residuals are then the demeaned residuals, and
-        ``fe_train``/``fe_test`` hold each observation's estimated
-        fixed-effect component, ``(log y - x beta) - residual``.  Without fixed
-        effects the components are zero and the residuals are
+        With fixed effects, log(y) and X are demeaned on the training rows only,
+        giving ``beta`` and the training residuals.  The fixed-effect levels are
+        then recovered from the training rows by sparse least squares, and the
+        held-out residuals are ``log y - x beta`` minus the held-out rows'
+        estimated fixed effects, so no held-out outcome enters its own
+        residual.  A held-out level never seen in training gets the
+        (training-weighted) average level of its fixed effect.  ``fe_train`` /
+        ``fe_test`` hold each observation's estimated fixed-effect component.
+        Without fixed effects the components are zero and the residuals are
         ``log y - x beta``.
         """
         log_y = np.log(self.endog)
         train_weights = weight_fold[train_idx] if self.weights is not None else None
         if self.fixed_effects is None:
-            x_ols, log_y_ols = self.exog, log_y
-        else:
-            log_y_ols, x_ols = _apply_fixed_effects(
-                log_y,
-                self.exog,
-                algorithm=self.fixed_effects,
-                weights=weight_fold.reshape(-1, 1),
-            )
-            log_y_ols = np.asarray(log_y_ols, dtype=np.float64).reshape(-1)
-            x_ols = np.asarray(x_ols, dtype=np.float64)
+            ols = (
+                sm.WLS(log_y[train_idx], self.exog[train_idx], weights=train_weights)
+                if train_weights is not None
+                else sm.OLS(log_y[train_idx], self.exog[train_idx])
+            ).fit()
+            beta = np.asarray(ols.params, dtype=np.float64)
+            residual = log_y - self.exog @ beta
+            zeros = np.zeros(self.nobs, dtype=np.float64)
+            return ols, beta, residual[train_idx], residual[test_idx], zeros[train_idx], zeros[test_idx]
 
+        fe_train_cols = self.fe_cols[train_idx]
+        y_dm, x_dm = _apply_fixed_effects(
+            log_y[train_idx],
+            self.exog[train_idx],
+            algorithm=_initialize_fixed_effects(fe_train_cols),
+            weights=train_weights.reshape(-1, 1) if train_weights is not None else None,
+        )
+        y_dm = np.asarray(y_dm, dtype=np.float64).reshape(-1)
+        x_dm = np.asarray(x_dm, dtype=np.float64)
         ols = (
-            sm.WLS(log_y_ols[train_idx], x_ols[train_idx], weights=train_weights)
+            sm.WLS(y_dm, x_dm, weights=train_weights)
             if train_weights is not None
-            else sm.OLS(log_y_ols[train_idx], x_ols[train_idx])
+            else sm.OLS(y_dm, x_dm)
         ).fit()
         beta = np.asarray(ols.params, dtype=np.float64)
 
-        residual = log_y_ols - x_ols @ beta
-        fe_component = (log_y - self.exog @ beta) - residual
-        return (
-            ols,
-            beta,
-            residual[train_idx],
-            residual[test_idx],
-            fe_component[train_idx],
-            fe_component[test_idx],
+        residual_train = y_dm - x_dm @ beta
+        fe_train = (log_y[train_idx] - self.exog[train_idx] @ beta) - residual_train
+        fe_test = self._predict_fixed_effects(
+            fe_train_cols, fe_train, self.fe_cols[test_idx], train_weights
         )
+        residual_test = log_y[test_idx] - self.exog[test_idx] @ beta - fe_test
+        return ols, beta, residual_train, residual_test, fe_train, fe_test
+
+    @staticmethod
+    def _predict_fixed_effects(
+        fe_train_cols: npt.NDArray,
+        fe_train: Array,
+        fe_test_cols: npt.NDArray,
+        train_weights: Array | None,
+    ) -> Array:
+        """Sum of fixed-effect levels for held-out rows, estimated on training rows."""
+        from scipy import sparse
+        from scipy.sparse.linalg import lsqr
+
+        n_train, n_dims = fe_train_cols.shape
+        w = np.ones(n_train) if train_weights is None else np.asarray(train_weights, dtype=np.float64)
+        level_codes, offsets, levels_per_dim = [], [0], []
+        for j in range(n_dims):
+            levels, codes = np.unique(fe_train_cols[:, j], return_inverse=True)
+            level_codes.append(codes + offsets[-1])
+            levels_per_dim.append(levels)
+            offsets.append(offsets[-1] + len(levels))
+        rows = np.tile(np.arange(n_train), n_dims)
+        design = sparse.csr_matrix(
+            (np.ones(n_train * n_dims), (rows, np.concatenate(level_codes))),
+            shape=(n_train, offsets[-1]),
+        )
+        # fe_train lies exactly in the span of the dummies, so this solve is consistent
+        sqrt_w = np.sqrt(w)
+        solution = lsqr(
+            sparse.diags(sqrt_w) @ design, sqrt_w * fe_train, atol=1e-14, btol=1e-14, iter_lim=100000
+        )[0]
+
+        fe_test = np.zeros(len(fe_test_cols), dtype=np.float64)
+        for j in range(n_dims):
+            values = solution[offsets[j]:offsets[j + 1]]
+            counts = np.bincount(level_codes[j] - offsets[j], weights=w, minlength=len(values))
+            fallback = float(np.average(values, weights=counts))
+            position = np.searchsorted(levels_per_dim[j], fe_test_cols[:, j])
+            position = np.clip(position, 0, len(values) - 1)
+            seen = levels_per_dim[j][position] == fe_test_cols[:, j]
+            fe_test += np.where(seen, values[position], fallback)
+        return fe_test
 
     def _process_generalized_fold_common(
         self,
