@@ -26,7 +26,7 @@ from sklearn.model_selection import KFold, StratifiedKFold
 from .hypothesis import HypothesisTestResult, InfluenceFunctionDiffTest
 from .model import DoublyRobustElasticityEstimatorModel
 from .nonparametric import NNModelDensity, NNModelNuisance
-from .utils import _apply_fixed_effects, _initialize_fixed_effects
+from .utils import _apply_fixed_effects
 
 
 Array = npt.NDArray[np.float64]
@@ -813,6 +813,55 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             iterator = splitter.split(self.exog)
         return [(np.asarray(train), np.asarray(test)) for train, test in iterator]
 
+    def _fold_ols_residuals(
+        self,
+        train_idx: npt.NDArray[np.int64],
+        test_idx: npt.NDArray[np.int64],
+        weight_fold: Array,
+    ) -> tuple[Any, Array, Array, Array, Array, Array]:
+        """Fold OLS and log residuals net of fixed effects.
+
+        With fixed effects, log(y) and X are demeaned on the full sample using
+        ``weight_fold`` (held-out observations carry weight 1e-10), as in
+        :mod:`loglinearcorrection.model`, so the fixed-effect means come from
+        the training fold.  The residuals are then the demeaned residuals, and
+        ``fe_train``/``fe_test`` hold each observation's estimated
+        fixed-effect component, ``(log y - x beta) - residual``.  Without fixed
+        effects the components are zero and the residuals are
+        ``log y - x beta``.
+        """
+        log_y = np.log(self.endog)
+        train_weights = weight_fold[train_idx] if self.weights is not None else None
+        if self.fixed_effects is None:
+            x_ols, log_y_ols = self.exog, log_y
+        else:
+            log_y_ols, x_ols = _apply_fixed_effects(
+                log_y,
+                self.exog,
+                algorithm=self.fixed_effects,
+                weights=weight_fold.reshape(-1, 1),
+            )
+            log_y_ols = np.asarray(log_y_ols, dtype=np.float64).reshape(-1)
+            x_ols = np.asarray(x_ols, dtype=np.float64)
+
+        ols = (
+            sm.WLS(log_y_ols[train_idx], x_ols[train_idx], weights=train_weights)
+            if train_weights is not None
+            else sm.OLS(log_y_ols[train_idx], x_ols[train_idx])
+        ).fit()
+        beta = np.asarray(ols.params, dtype=np.float64)
+
+        residual = log_y_ols - x_ols @ beta
+        fe_component = (log_y - self.exog @ beta) - residual
+        return (
+            ols,
+            beta,
+            residual[train_idx],
+            residual[test_idx],
+            fe_component[train_idx],
+            fe_component[test_idx],
+        )
+
     def _process_generalized_fold_common(
         self,
         train_idx: npt.NDArray[np.int64],
@@ -823,43 +872,13 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         density_params: dict[str, Any],
     ) -> dict[str, Any]:
         """Fit fold components shared by every ``(phi, psi)`` target."""
-        if self.fixed_effects is None:
-            x_ols_train = self.exog[train_idx]
-            log_y_ols_train = np.log(self.endog[train_idx])
-        else:
-            train_weights = (
-                weight_fold[train_idx] if self.weights is not None else None
-            )
-            train_fixed_effects = _initialize_fixed_effects(
-                self.fe_cols[train_idx]
-            )
-            y_dm, x_dm = _apply_fixed_effects(
-                np.log(self.endog[train_idx]),
-                self.exog[train_idx],
-                algorithm=train_fixed_effects,
-                weights=(
-                    train_weights.reshape(-1, 1)
-                    if train_weights is not None
-                    else None
-                ),
-            )
-            x_ols_train = x_dm
-            log_y_ols_train = y_dm
+        ols, beta, residual_train, residual_test, _, fe_test = self._fold_ols_residuals(
+            train_idx, test_idx, weight_fold
+        )
 
-        train_weights = weight_fold[train_idx] if self.weights is not None else None
-        ols = (
-            sm.WLS(log_y_ols_train, x_ols_train, weights=train_weights)
-            if train_weights is not None
-            else sm.OLS(log_y_ols_train, x_ols_train)
-        ).fit()
-        beta = np.asarray(ols.params, dtype=np.float64)
-
-        x_train = self.exog[train_idx]
         x_test = self.exog[test_idx]
         x_aug_train = self.exog_augmented[train_idx]
         x_aug_test = self.exog_augmented[test_idx]
-        residual_train = np.log(self.endog[train_idx]) - x_train @ beta
-        residual_test = np.log(self.endog[test_idx]) - x_test @ beta
 
         density_model = density_model_class(
             variable_types=self.variable_types, **density_params["arch_params"]
@@ -896,6 +915,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             "_x_test": x_test,
             "_residual_train": residual_train,
             "_residual_test": residual_test,
+            "_fe_test": fe_test,
         }
 
     def _process_phi_fold(
@@ -944,7 +964,8 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         if not np.all(np.isfinite(m_hat)) or not np.all(np.isfinite(m_prime)):
             raise ValueError("The fitted nuisance function returned non-finite values")
 
-        linear_predictor = x_test @ beta
+        # Fixed-effect component added back so M_phi(x) is the power mean of y itself
+        linear_predictor = x_test @ beta + np.asarray(common["_fe_test"], dtype=np.float64)
         beta_interest = beta[interest_indices]
         if phi == 0.0:
             conditional_elasticity = beta_interest[None, :] + m_prime
@@ -1669,47 +1690,16 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         m_params: dict[str, Any],
         propensity_params: dict[str, Any],
     ) -> dict[str, Any]:
-        if self.fixed_effects is None:
-            x_ols_train = self.exog[train_idx]
-            log_y_ols_train = np.log(self.endog[train_idx])
-        else:
-            train_weights = (
-                weight_fold[train_idx] if self.weights is not None else None
-            )
-            train_fixed_effects = _initialize_fixed_effects(
-                self.fe_cols[train_idx]
-            )
-            y_dm, x_dm = _apply_fixed_effects(
-                np.log(self.endog[train_idx]),
-                self.exog[train_idx],
-                algorithm=train_fixed_effects,
-                weights=(
-                    train_weights.reshape(-1, 1)
-                    if train_weights is not None
-                    else None
-                ),
-            )
-            x_ols_train = x_dm
-            log_y_ols_train = y_dm
-
-        train_weights = (
-            weight_fold[train_idx] if self.weights is not None else None
+        # Same fold OLS and fixed-effect handling as the continuous estimator
+        ols, beta, residual_train, residual_test, _, fe_test = (
+            GeneralizedDREAM._fold_ols_residuals(self, train_idx, test_idx, weight_fold)
         )
-        ols = (
-            sm.WLS(log_y_ols_train, x_ols_train, weights=train_weights)
-            if train_weights is not None
-            else sm.OLS(log_y_ols_train, x_ols_train)
-        ).fit()
-        beta = np.asarray(ols.params, dtype=np.float64)
 
-        x_train = self.exog[train_idx]
         x_test = self.exog[test_idx]
         x_aug_train = self.exog_augmented[train_idx]
         x_aug_test = self.exog_augmented[test_idx]
         d_train = self.treatment[train_idx]
         d_test = self.treatment[test_idx]
-        residual_train = np.log(self.endog[train_idx]) - x_train @ beta
-        residual_test = np.log(self.endog[test_idx]) - x_test @ beta
 
         if self.phi == 0.0:
             nuisance_target = residual_train
@@ -1755,7 +1745,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             m_predictions[:, arm] = m_hat
             qd_test = x_test.copy()
             qd_test[:, self.treatment_index] = float(arm)
-            linear_predictor = qd_test @ beta
+            # Fixed-effect component added back so M_phi is the power mean of y itself
+            linear_predictor = qd_test @ beta + fe_test
             observed_arm = d_test == arm
             if self.phi == 0.0:
                 log_inner_means[:, arm] = linear_predictor + m_hat
