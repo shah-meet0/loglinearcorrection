@@ -705,6 +705,17 @@ class NNModelDensity(NNModel):
             print('Warning: Dropout in score model biases results with multiple continuous interest, setting to 0.0.')
         model = build_feed_forward_model(cfg).to(device)
 
+        # Fit the score of the standardized interest coordinates z = (x - center) / scale.
+        # The Gaussian reference (-z) assumes standardized inputs; alpha_weight maps
+        # back with d log f / dx = (d log f / dz) / scale.
+        X = np.array(X, dtype=np.float64)
+        center = X[:, interest_idx].mean(axis=0)
+        scale = X[:, interest_idx].std(axis=0)
+        scale[scale <= 0] = 1.0
+        X[:, interest_idx] = (X[:, interest_idx] - center) / scale
+        meta["score_center"] = center
+        meta["score_scale"] = scale
+
         # loss
         loss_fn = ScoreMatchingLossRestricted(interest=interest_idx).to(device)
 
@@ -1166,10 +1177,17 @@ class NNModelDensityResults(NPModelResultsDensity):
 
         scores = None
         if need_scores:
-            Xt = torch.as_tensor(np.asarray(X, dtype=np.float32), dtype=torch.float32, device=self.device)
+            Xs = np.array(X, dtype=np.float64)
+            center = score_meta.get("score_center")
+            scale = score_meta.get("score_scale")
+            if center is not None:
+                Xs[:, cont_int] = (Xs[:, cont_int] - center) / scale
+            Xt = torch.as_tensor(Xs, dtype=torch.float32, device=self.device)
             score_model.eval()
             with torch.no_grad():
                 scores = score_model(Xt).detach().cpu().numpy()  # shape (n, |cont_int|)
+            if scale is not None:
+                scores = scores / scale  # back to d log f / dx in original units
 
         conds = None
         discrete_x = None
