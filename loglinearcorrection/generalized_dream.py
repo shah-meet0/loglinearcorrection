@@ -787,7 +787,22 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
     ) -> tuple[type, dict[str, Any]]:
         supplied = deepcopy(dict(density_params)) if density_params is not None else {}
         model_class = supplied.pop("model_class", NNModelDensity)
+        options = {
+            "score_method": supplied.pop("score_method", "network"),
+            "score_inputs": supplied.pop("score_inputs", "residual"),
+            "dof_correction": bool(supplied.pop("dof_correction", True)),
+            "stein_tolerance": float(supplied.pop("stein_tolerance", 0.25)),
+        }
+        if options["score_method"] not in ("network", "partial_out"):
+            raise ValueError("score_method must be 'network' or 'partial_out'")
+        if options["score_inputs"] not in ("residual", "residual_and_controls"):
+            raise ValueError("score_inputs must be 'residual' or 'residual_and_controls'")
+        if options["score_method"] == "partial_out" and any(
+            self.variable_types.get(j) != "continuous" for j in self.interest
+        ):
+            raise ValueError("score_method='partial_out' requires continuous interest variables")
         parsed = self._parse_density_params(supplied or None)
+        parsed["score_options"] = options
         return model_class, parsed
 
     @staticmethod
@@ -1023,6 +1038,125 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             fe_test += np.where(seen, values[position], fallback)
         return fe_test
 
+    def _partial_out_interest(
+        self,
+        train_idx: npt.NDArray[np.int64],
+        test_idx: npt.NDArray[np.int64],
+        weight_fold: Array,
+        interest_indices: list[int],
+        dof_correction: bool,
+    ) -> dict[str, Array]:
+        """Residualise the interest regressors on the fixed effects and controls.
+
+        Fits ``x = mu(FE, W) + v`` on the training rows, with ``mu`` additive
+        in the fixed effects and linear in the other regressors ``W`` (the same
+        projection as the fold OLS, applied to ``x`` instead of ``log y``).
+        Returns the training residuals ``v_train`` (rescaled by
+        ``sqrt(n / (n - dof))`` for the absorbed degrees of freedom when
+        ``dof_correction``) and held-out residuals ``v_test = x - mu_hat``,
+        where ``mu_hat`` uses only training rows.
+        """
+        controls = [j for j in range(self.exog.shape[1]) if j not in interest_indices]
+        x = self.exog[:, interest_indices]
+        w = self.exog[:, controls]
+        train_weights = weight_fold[train_idx] if self.weights is not None else None
+        sqrt_w = np.ones(len(train_idx)) if train_weights is None else np.sqrt(train_weights)
+
+        if self.fixed_effects is None:
+            has_constant = bool(np.any(np.ptp(w, axis=0) == 0)) if w.shape[1] else False
+            if not has_constant:
+                w = np.column_stack([np.ones(self.nobs), w])
+            gamma = np.linalg.lstsq(
+                w[train_idx] * sqrt_w[:, None], x[train_idx] * sqrt_w[:, None], rcond=None
+            )[0]
+            v = x - w @ gamma
+            absorbed = 0
+            v_train, v_test = v[train_idx], v[test_idx]
+        else:
+            fe_train_cols = self.fe_cols[train_idx]
+            algorithm = _initialize_fixed_effects(fe_train_cols)
+            stacked = np.column_stack([x[train_idx], w[train_idx]])
+            _, stacked_dm = _apply_fixed_effects(
+                np.zeros(len(train_idx)),
+                stacked,
+                algorithm=algorithm,
+                weights=train_weights.reshape(-1, 1) if train_weights is not None else None,
+            )
+            stacked_dm = np.asarray(stacked_dm, dtype=np.float64)
+            x_dm, w_dm = stacked_dm[:, : x.shape[1]], stacked_dm[:, x.shape[1]:]
+            if w_dm.shape[1]:
+                gamma = np.linalg.lstsq(
+                    w_dm * sqrt_w[:, None], x_dm * sqrt_w[:, None], rcond=None
+                )[0]
+                v_train = x_dm - w_dm @ gamma
+                linear = w @ gamma
+            else:
+                v_train = x_dm
+                linear = np.zeros_like(x)
+            v_test = np.empty((len(test_idx), x.shape[1]), dtype=np.float64)
+            for j in range(x.shape[1]):
+                fe_train_j = (x[train_idx, j] - linear[train_idx, j]) - v_train[:, j]
+                fe_test_j = self._predict_fixed_effects(
+                    fe_train_cols, fe_train_j, self.fe_cols[test_idx], train_weights
+                )
+                v_test[:, j] = x[test_idx, j] - linear[test_idx, j] - fe_test_j
+            absorbed = int(getattr(algorithm, "degrees", 0) or 0)
+        absorbed += int(np.linalg.matrix_rank(w[train_idx])) if w.shape[1] else 0
+        if dof_correction:
+            n_train = len(train_idx)
+            if n_train - absorbed <= 0:
+                raise ValueError("No residual degrees of freedom to partial out the fixed effects")
+            v_train = v_train * np.sqrt(n_train / (n_train - absorbed))
+        return {"v_train": v_train, "v_test": v_test, "controls": controls}
+
+    @staticmethod
+    def _stein_diagnostics(score: Array, v_test: Array) -> dict[str, Array]:
+        """Held-out Stein moments for the conditional score ``d log f(x | FE, W) / dx``.
+
+        For any fixed ``g(x, FE, W)``, ``E[s g + dg/dx] = 0``.  With
+        ``g = 1`` and ``g = x - mu_hat(FE, W)`` (``mu_hat`` fitted on the
+        training rows, so fixed on the held-out rows) this gives
+        ``E[s] = 0`` and ``E[s (x - mu_hat)] = -1``.  A score that ignores the
+        fixed effects fails the second: it gives roughly
+        ``-var(x | FE, W) / var(x)``.  Returned per interest variable:
+        ``mean_score`` (``E[s]`` times the sd of ``v``, unit-free) and
+        ``conditional_stein`` (``E[s v] + 1``); both should be near 0.
+        """
+        return {
+            "mean_score": score.mean(axis=0) * v_test.std(axis=0),
+            "conditional_stein": (score * v_test).mean(axis=0) + 1.0,
+        }
+
+    def _report_stein(self, fold_results: Sequence[Mapping[str, Any]], tolerance: float) -> None:
+        """Store ``self.score_diagnostics`` and warn when the score fails the Stein check."""
+        rows = []
+        for fold_number, fold in enumerate(fold_results, start=1):
+            stein = fold["score_stein"]
+            for j, index in enumerate(self.interest):
+                rows.append({
+                    "fold": fold_number,
+                    "variable": self.exog_names[index],
+                    "mean_score": float(stein["mean_score"][j]),
+                    "conditional_stein": float(stein["conditional_stein"][j]),
+                    "n_test": len(fold["test_idx"]),
+                })
+        table = pd.DataFrame(rows)
+        self.score_diagnostics = table
+        pooled = {
+            name: float(np.average(t["conditional_stein"], weights=t["n_test"]))
+            for name, t in table.groupby("variable", sort=False)
+        }
+        for name, value in pooled.items():
+            print(f"Held-out conditional Stein check for {name}: E[s v] + 1 = {value:.3f} (target 0)")
+            if abs(value) > tolerance:
+                warnings.warn(
+                    f"The density score for {name} fails the conditional Stein check "
+                    f"(E[s v] + 1 = {value:.3f}, tolerance {tolerance}); it does not "
+                    "match the conditional density given the fixed effects and controls. "
+                    "See model.score_diagnostics.",
+                    stacklevel=3,
+                )
+
     def _process_generalized_fold_common(
         self,
         train_idx: npt.NDArray[np.int64],
@@ -1040,18 +1174,45 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         x_test = self.exog[test_idx]
         x_aug_train = self.exog_augmented[train_idx]
         x_aug_test = self.exog_augmented[test_idx]
+        options = density_params["score_options"]
+        partialled = self._partial_out_interest(
+            train_idx, test_idx, weight_fold, interest_indices, options["dof_correction"]
+        )
 
-        density_model = density_model_class(
-            variable_types=self.variable_types, **density_params["arch_params"]
-        )
-        density_results = density_model.fit(
-            x_aug_train,
-            interest=interest_indices,
-            **density_params["fit_params"],
-        )
-        density_score = np.asarray(
-            density_results.alpha_weight(x_aug_test, interest_indices), dtype=np.float64
-        )
+        if options["score_method"] == "partial_out":
+            # Location model x = mu(FE, W) + v with v independent of (FE, W):
+            # d log f(x | FE, W) / dx = d log f_v(v) / dv at v = x - mu(FE, W)
+            k_interest = len(interest_indices)
+            score_train, score_test = partialled["v_train"], partialled["v_test"]
+            if options["score_inputs"] == "residual_and_controls":
+                controls = partialled["controls"]
+                score_train = np.column_stack([score_train, self.exog[train_idx][:, controls]])
+                score_test = np.column_stack([score_test, x_test[:, controls]])
+            score_types = {j: "continuous" for j in range(score_train.shape[1])}
+            density_model = density_model_class(
+                variable_types=score_types, **density_params["arch_params"]
+            )
+            density_results = density_model.fit(
+                score_train,
+                interest=list(range(k_interest)),
+                **density_params["fit_params"],
+            )
+            density_score = np.asarray(
+                density_results.alpha_weight(score_test, list(range(k_interest))),
+                dtype=np.float64,
+            )
+        else:
+            density_model = density_model_class(
+                variable_types=self.variable_types, **density_params["arch_params"]
+            )
+            density_results = density_model.fit(
+                x_aug_train,
+                interest=interest_indices,
+                **density_params["fit_params"],
+            )
+            density_score = np.asarray(
+                density_results.alpha_weight(x_aug_test, interest_indices), dtype=np.float64
+            )
         if density_score.ndim == 1 and len(interest_indices) == 1:
             density_score = density_score.reshape(-1, 1)
         expected_shape = (len(test_idx), len(interest_indices))
@@ -1068,6 +1229,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             "ols_results": ols,
             "f_results": density_results,
             "density_score": density_score,
+            "score_stein": self._stein_diagnostics(density_score, partialled["v_test"]),
             "h": h,
             "h_prime": h_prime,
             "train_idx": train_idx,
@@ -1273,6 +1435,23 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         ``min_fe_group_size`` and ``small_fe_groups`` ('warn', 'raise' or
         'ignore') control the check for small fixed-effect groups; the group
         sizes are stored in ``self.fe_group_report``.
+
+        ``density_params`` also accepts:
+
+        - ``score_method``: ``'network'`` (default; the score network sees the
+          regressors and encoded fixed effects) or ``'partial_out'`` (location
+          model: residualise the interest regressors on the fixed effects and
+          controls on the training rows, ``v = x - mu(FE, W)``, and fit the
+          score of ``v``; see :meth:`_partial_out_interest`).
+        - ``score_inputs``: with ``'partial_out'``, ``'residual'`` (default;
+          ``v`` independent of ``(FE, W)``) or ``'residual_and_controls'`` (the
+          score of ``v`` may also depend on the non-fixed-effect controls).
+        - ``dof_correction`` (default True): rescale training residuals ``v``
+          for the degrees of freedom absorbed by the projection.
+        - ``stein_tolerance`` (default 0.25): warn when the pooled held-out
+          conditional Stein moment ``E[s (x - mu_hat)] + 1`` exceeds it.  The
+          per-fold moments are stored in ``self.score_diagnostics`` for either
+          score method.
         """
         interest_indices = list(self.interest)
         k_interest = len(interest_indices)
@@ -1300,6 +1479,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 )
             )
 
+        self._report_stein(fold_results, density_config["score_options"]["stein_tolerance"])
         conditional_elasticity = np.empty((self.nobs, k_interest), dtype=np.float64)
         density_score = np.empty_like(conditional_elasticity)
         h = np.empty_like(conditional_elasticity)
@@ -1508,6 +1688,7 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
                 }
             )
 
+        self._report_stein(fold_results, density_config["score_options"]["stein_tolerance"])
         density_score = np.empty((self.nobs, n_interest), dtype=np.float64)
         h = np.empty_like(density_score)
         h_prime = np.empty_like(density_score)

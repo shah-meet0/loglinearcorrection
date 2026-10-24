@@ -855,7 +855,9 @@ class NNModelDensity(NNModel):
                     best_core_stein = core_stein
                     best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                     bad = 0
-                else:
+                elif best_state is not None or stein_threshold is None:
+                    # With a Stein threshold, patience only runs once a feasible
+                    # state exists, so training is not stopped while still infeasible
                     bad += 1
 
                 if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
@@ -883,8 +885,12 @@ class NNModelDensity(NNModel):
                 f"using the least-violating state (Stein={fallback_core_stein:.4f})."
             )
             best_state = fallback_state
+            best_core_stein = fallback_core_stein
         if best_state is not None:
             model.load_state_dict(best_state)
+        # Validation Stein moments of the selected state (reported, not used to
+        # select it unless stein_validation_threshold is set)
+        meta["validation_stein"] = best_core_stein if np.isfinite(best_core_stein) else None
 
         return model
 
