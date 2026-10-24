@@ -773,6 +773,9 @@ class NNModelDensity(NNModel):
         best_loss = float("inf")
         best_core_stein = float("inf")
         best_state = None
+        # Least Stein-violating state seen, used if no state meets the threshold
+        fallback_core_stein = float("inf")
+        fallback_state = None
         bad = 0
         log_every = max(1, epochs // 10)
 
@@ -810,6 +813,10 @@ class NNModelDensity(NNModel):
         if dl_va is not None and stein_threshold is not None:
             model.eval()
             initial_loss, initial_core = validation_metrics()
+            fallback_core_stein = initial_core
+            fallback_state = {
+                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
+            }
             if initial_core <= stein_threshold:
                 best_loss = initial_loss
                 best_core_stein = initial_core
@@ -838,6 +845,9 @@ class NNModelDensity(NNModel):
             if dl_va is not None:
                 model.eval()
                 va_loss, core_stein = validation_metrics()
+                if stein_threshold is not None and core_stein < fallback_core_stein:
+                    fallback_core_stein = core_stein
+                    fallback_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
                 feasible = stein_threshold is None or core_stein <= stein_threshold
                 improved = feasible and va_loss + min_delta < best_loss
                 if improved:
@@ -865,6 +875,14 @@ class NNModelDensity(NNModel):
                 if verbose and (ep % log_every == 0 or ep == 1 or ep == epochs):
                     print(f"[Score ep {ep:>3}/{epochs}] train={tr_loss:.6f}")
 
+        if best_state is None and fallback_state is not None:
+            # No state met the Stein threshold: keep the least-violating one rather
+            # than the unvalidated last-epoch network
+            print(
+                f"Warning: no score state met stein_validation_threshold={stein_threshold}; "
+                f"using the least-violating state (Stein={fallback_core_stein:.4f})."
+            )
+            best_state = fallback_state
         if best_state is not None:
             model.load_state_dict(best_state)
 
