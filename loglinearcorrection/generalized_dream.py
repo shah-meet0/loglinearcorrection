@@ -796,7 +796,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             "score_inputs": supplied.pop("score_inputs", "residual"),
             "dof_correction": bool(supplied.pop("dof_correction", True)),
             "stein_tolerance": float(supplied.pop("stein_tolerance", 0.25)),
+            "score_calibration": supplied.pop("score_calibration", None),
         }
+        if options["score_calibration"] not in (None, "stein"):
+            raise ValueError("score_calibration must be None or 'stein'")
         if options["score_method"] not in ("network", "partial_out"):
             raise ValueError("score_method must be 'network' or 'partial_out'")
         if options["score_inputs"] not in ("residual", "residual_and_controls"):
@@ -1042,6 +1045,56 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             fe_test += np.where(seen, values[position], fallback)
         return fe_test
 
+    def _sample_weight_kwargs(self, rows: npt.NDArray[np.int64]) -> dict[str, Any]:
+        """``{"sample_weight": weights[rows]}`` when the model is weighted and
+        ``weighted_nuisance`` is on, else ``{}`` (so unweighted fits and custom
+        model classes are called exactly as before)."""
+        if self.weights is None or not getattr(self, "_weighted_nuisance", True):
+            return {}
+        return {"sample_weight": np.asarray(self.weights, dtype=np.float64)[rows]}
+
+    def _report_target_weights(
+        self,
+        targets: Sequence[Target],
+        k_weights: Sequence[Array],
+        fold_weights: Array,
+        min_effective_n: float,
+    ) -> None:
+        """Store ``self.target_diagnostics``: how concentrated each target's weights are.
+
+        A target averages with weights ``w * M_phi^psi``.  For psi != 0 these
+        can sit on a few observations, and then the influence-function SEs are
+        unreliable.  Reported per target: the Kish effective sample size of the
+        combined weights, the same for the sample weights alone, and the share
+        of the weight on the top 1% of observations.  Warns below
+        ``min_effective_n``.
+        """
+        def kish(a: Array) -> float:
+            return float(a.sum() ** 2 / np.sum(a ** 2))
+
+        rows = []
+        base = kish(fold_weights)
+        for (phi, psi), k in zip(targets, k_weights):
+            combined = fold_weights * np.asarray(k, dtype=np.float64).reshape(-1)
+            top = np.sort(combined)[::-1][: max(1, int(np.ceil(0.01 * len(combined))))]
+            rows.append({
+                "phi": phi,
+                "psi": psi,
+                "effective_n": kish(combined),
+                "effective_n_sample_weights": base,
+                "top_1pct_weight_share": float(top.sum() / combined.sum()),
+            })
+        self.target_diagnostics = pd.DataFrame(rows)
+        for row in rows:
+            if row["effective_n"] < min_effective_n:
+                warnings.warn(
+                    f"Target (phi={row['phi']:g}, psi={row['psi']:g}) puts its weight on few "
+                    f"observations (effective n {row['effective_n']:.0f} of {len(fold_weights)}; "
+                    f"top 1% hold {row['top_1pct_weight_share']:.0%}); its standard error is "
+                    "unreliable. See model.target_diagnostics.",
+                    stacklevel=3,
+                )
+
     def _partial_out_interest(
         self,
         train_idx: npt.NDArray[np.int64],
@@ -1114,7 +1167,9 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         return {"v_train": v_train, "v_test": v_test, "controls": controls}
 
     @staticmethod
-    def _stein_diagnostics(score: Array, v_test: Array) -> dict[str, Array]:
+    def _stein_diagnostics(
+        score: Array, v_test: Array, weights: Array | None = None
+    ) -> dict[str, Array]:
         """Held-out Stein moments for the conditional score ``d log f(x | FE, W) / dx``.
 
         For any fixed ``g(x, FE, W)``, ``E[s g + dg/dx] = 0``.  With
@@ -1124,12 +1179,35 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         fixed effects fails the second: it gives roughly
         ``-var(x | FE, W) / var(x)``.  Returned per interest variable:
         ``mean_score`` (``E[s]`` times the sd of ``v``, unit-free) and
-        ``conditional_stein`` (``E[s v] + 1``); both should be near 0.
+        ``conditional_stein`` (``E[s v] + 1``); both should be near 0.  With
+        ``weights`` the moments are weighted (the identity then holds for the
+        score of the weighted density, which is the one GEAM uses).
         """
+        sd = np.sqrt(np.average((v_test - np.average(v_test, axis=0, weights=weights)) ** 2,
+                                axis=0, weights=weights))
         return {
-            "mean_score": score.mean(axis=0) * v_test.std(axis=0),
-            "conditional_stein": (score * v_test).mean(axis=0) + 1.0,
+            "mean_score": np.average(score, axis=0, weights=weights) * sd,
+            "conditional_stein": np.average(score * v_test, axis=0, weights=weights) + 1.0,
         }
+
+    @staticmethod
+    def _calibrate_score(
+        score: Array, v_test: Array, weights: Array | None = None
+    ) -> tuple[Array, Array]:
+        """Rescale each score column so the held-out moment ``E[s v] = -1`` holds.
+
+        With small fixed-effect groups the held-out residuals ``v`` are noisier
+        than the training residuals the score was fitted on, so the fitted
+        score is too steep (or, when it is shrunk, too flat) on held-out rows.
+        One scale factor per column and fold, ``c = -1 / E[s v]``, restores
+        Stein's identity for ``g = x - mu_hat``.  It uses held-out ``x`` only,
+        never the outcome.  Columns with ``E[s v] >= 0`` (the score has the
+        wrong sign) are left unchanged and get a factor of NaN.
+        """
+        moment = np.average(score * v_test, axis=0, weights=weights)
+        factor = np.where(moment < 0, -1.0 / np.where(moment < 0, moment, -1.0), np.nan)
+        calibrated = score * np.where(np.isfinite(factor), factor, 1.0)[None, :]
+        return calibrated, factor
 
     def _report_stein(self, fold_results: Sequence[Mapping[str, Any]], tolerance: float) -> None:
         """Store ``self.score_diagnostics`` and warn when the score fails the Stein check."""
@@ -1142,16 +1220,22 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                     "variable": self.exog_names[index],
                     "mean_score": float(stein["mean_score"][j]),
                     "conditional_stein": float(stein["conditional_stein"][j]),
+                    "conditional_stein_before_calibration": float(
+                        stein.get("before_calibration", stein["conditional_stein"])[j]
+                    ),
+                    "calibration_factor": float(stein.get("factor", np.full(len(self.interest), np.nan))[j]),
                     "n_test": len(fold["test_idx"]),
                 })
         table = pd.DataFrame(rows)
         self.score_diagnostics = table
         pooled = {
-            name: float(np.average(t["conditional_stein"], weights=t["n_test"]))
+            name: float(np.average(t["conditional_stein_before_calibration"], weights=t["n_test"]))
             for name, t in table.groupby("variable", sort=False)
         }
         for name, value in pooled.items():
-            print(f"Held-out conditional Stein check for {name}: E[s v] + 1 = {value:.3f} (target 0)")
+            factors = table.loc[table["variable"] == name, "calibration_factor"]
+            calibrated = f"; calibration factors {factors.min():.2f} to {factors.max():.2f}" if factors.notna().any() else ""
+            print(f"Held-out conditional Stein check for {name}: E[s v] + 1 = {value:.3f} (target 0){calibrated}")
             if abs(value) > tolerance:
                 warnings.warn(
                     f"The density score for {name} fails the conditional Stein check "
@@ -1200,6 +1284,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 score_train,
                 interest=list(range(k_interest)),
                 **density_params["fit_params"],
+                **self._sample_weight_kwargs(train_idx),
             )
             density_score = np.asarray(
                 density_results.alpha_weight(score_test, list(range(k_interest))),
@@ -1213,6 +1298,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 x_aug_train,
                 interest=interest_indices,
                 **density_params["fit_params"],
+                **self._sample_weight_kwargs(train_idx),
             )
             density_score = np.asarray(
                 density_results.alpha_weight(x_aug_test, interest_indices), dtype=np.float64
@@ -1227,13 +1313,24 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         if not np.all(np.isfinite(density_score)):
             raise ValueError("The fitted density score returned non-finite values")
 
+        test_weights = None if self.weights is None else np.asarray(self.weights, dtype=np.float64)[test_idx]
+        stein = self._stein_diagnostics(density_score, partialled["v_test"], test_weights)
+        if options["score_calibration"] == "stein":
+            stein["before_calibration"] = stein["conditional_stein"]
+            density_score, stein["factor"] = self._calibrate_score(
+                density_score, partialled["v_test"], test_weights
+            )
+            stein["conditional_stein"] = self._stein_diagnostics(
+                density_score, partialled["v_test"], test_weights
+            )["conditional_stein"]
+
         h, h_prime = self._evaluate_policy(x_test, interest_indices)
         return {
             "beta": beta,
             "ols_results": ols,
             "f_results": density_results,
             "density_score": density_score,
-            "score_stein": self._stein_diagnostics(density_score, partialled["v_test"]),
+            "score_stein": stein,
             "h": h,
             "h_prime": h_prime,
             "train_idx": train_idx,
@@ -1280,7 +1377,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             variable_types=self.variable_types, **m_params["arch_params"]
         )
         m_results = m_model.fit(
-            x_aug_train, nuisance_target, **m_params["fit_params"]
+            x_aug_train,
+            nuisance_target,
+            **m_params["fit_params"],
+            **self._sample_weight_kwargs(common["train_idx"]),
         )
         m_hat, m_prime = m_results.derivative(
             self.exog_augmented[test_idx], interest_indices
@@ -1429,6 +1529,8 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         min_fe_group_size: int = 5,
         small_fe_groups: str = "warn",
         max_small_fe_share: float = 0.01,
+        weighted_nuisance: bool = True,
+        min_target_effective_n: float = 100.0,
     ) -> GeneralizedDREAMResults:
         """Fit the cross-fitted continuous GEAM estimator.
 
@@ -1459,12 +1561,24 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
           conditional Stein moment ``E[s (x - mu_hat)] + 1`` exceeds it.  The
           per-fold moments are stored in ``self.score_diagnostics`` for either
           score method.
+        - ``score_calibration``: ``None`` (default) or ``'stein'``: rescale the
+          score per fold and column so the held-out moment holds exactly (see
+          :meth:`_calibrate_score`); the moment before calibration and the
+          factor are kept in ``self.score_diagnostics``.
+
+        ``weighted_nuisance`` (default True): with sample weights, fit the
+        nuisance and score networks with the same weights used to average the
+        moments (weighted squared error and weighted Hyvarinen loss).
+        ``min_target_effective_n`` (default 100): warn when a target's weights
+        ``w * M^psi`` leave fewer effective observations; the diagnostics are in
+        ``self.target_diagnostics``.
         """
         interest_indices = list(self.interest)
         k_interest = len(interest_indices)
         m_config = self._prepare_m_params(m_params)
         density_model_class, density_config = self._prepare_density_params(density_params)
         _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
+        self._weighted_nuisance = bool(weighted_nuisance)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -1523,6 +1637,9 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         influence_moments = target_solution["influence_moments"]
         influence = target_solution["influence_functions"]
         k_weight = target_solution["k_weights"]
+        self._report_target_weights(
+            [(self.phi, self.psi)], [k_weight], fold_weights, min_target_effective_n
+        )
         log_normalizer = target_solution["log_normalizer"]
         normalizer = target_solution["normalizer"]
         denominator = target_solution["denominator"]
@@ -1647,6 +1764,8 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         min_fe_group_size: int = 5,
         small_fe_groups: str = "warn",
         max_small_fe_share: float = 0.01,
+        weighted_nuisance: bool = True,
+        min_target_effective_n: float = 100.0,
     ) -> JointGeneralizedDREAMResults:
         """Fit all requested targets and their joint covariance matrix.
 
@@ -1663,6 +1782,7 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
             density_params
         )
         _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
+        self._weighted_nuisance = bool(weighted_nuisance)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -1767,6 +1887,12 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
 
         k_weights = np.column_stack(
             [solution["k_weights"] for solution in target_solutions]
+        )
+        self._report_target_weights(
+            self.targets,
+            [solution["k_weights"] for solution in target_solutions],
+            fold_weights,
+            min_target_effective_n,
         )
         log_normalizers = np.asarray(
             [solution["log_normalizer"] for solution in target_solutions],
@@ -2049,6 +2175,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         ]
 
     _predict_fixed_effects = staticmethod(GeneralizedDREAM._predict_fixed_effects)
+    _sample_weight_kwargs = GeneralizedDREAM._sample_weight_kwargs
 
     @staticmethod
     def _coerce_prediction(
@@ -2115,6 +2242,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
                 x_aug_train[arm_train],
                 nuisance_target[arm_train],
                 **m_params["fit_params"],
+                **self._sample_weight_kwargs(train_idx[arm_train]),
             )
             qd_aug_test = x_aug_test.copy()
             qd_aug_test[:, self.treatment_index] = float(arm)
@@ -2163,6 +2291,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             w_aug_train,
             d_train.astype(np.float64),
             **propensity_params["fit_params"],
+            **self._sample_weight_kwargs(train_idx),
         )
         propensity_raw = self._coerce_prediction(
             propensity_results.predict(w_aug_test),
@@ -2331,6 +2460,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         min_fe_group_size: int = 5,
         small_fe_groups: str = "warn",
         max_small_fe_share: float = 0.01,
+        weighted_nuisance: bool = True,
+        min_target_effective_n: float = 100.0,
     ) -> GPCAMResults:
         """Fit the cross-fitted binary-treatment GPCAM estimator.
 
@@ -2339,7 +2470,9 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         the package's ``arch_params``/``fit_params``/``model_class`` convention;
         ``pi_params`` is accepted as an alias for ``propensity_params``.
         ``min_fe_group_size``, ``max_small_fe_share`` and ``small_fe_groups`` are as in
-        :meth:`GeneralizedDREAM.fit`.
+        :meth:`GeneralizedDREAM.fit`; ``weighted_nuisance`` fits the arm and
+        propensity networks with the sample weights.  ``min_target_effective_n``
+        is accepted for a common signature and not used by GPCAM.
         """
         if propensity_params is not None and pi_params is not None:
             raise ValueError("Supply propensity_params or pi_params, not both")
@@ -2349,6 +2482,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         m_config = self._prepare_m_params(m_params)
         propensity_config = self._prepare_propensity_params(propensity_params)
         _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
+        self._weighted_nuisance = bool(weighted_nuisance)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []

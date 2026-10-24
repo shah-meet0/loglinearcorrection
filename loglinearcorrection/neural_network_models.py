@@ -270,7 +270,7 @@ class ScoreMatchingLossRestricted(nn.Module):
         self.register_buffer("interest_idx", torch.tensor(interest, dtype=torch.long))
 
     @torch.enable_grad()
-    def forward(self, model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, model: nn.Module, x: torch.Tensor, weight: torch.Tensor | None = None) -> torch.Tensor:
         """
         Compute restricted Hyvärinen loss on a batch.
 
@@ -280,11 +280,13 @@ class ScoreMatchingLossRestricted(nn.Module):
             Score model, output shape (n, |I|) in `interest` order.
         x : torch.Tensor, shape (n, d)
             Inputs with requires_grad True inside.
+        weight : torch.Tensor, shape (n,), optional
+            Per-sample weights; the loss is then the weighted mean.
 
         Returns
         -------
         torch.Tensor
-            Scalar loss (mean over batch).
+            Scalar loss (mean, or weighted mean, over batch).
         """
         if self.interest_idx.numel() == 0:
             return torch.zeros((), device=x.device, dtype=x.dtype)
@@ -313,8 +315,11 @@ class ScoreMatchingLossRestricted(nn.Module):
             div_terms.append(g)
         div = torch.stack(div_terms, dim=1).sum(dim=1)  # (n,)
 
-        loss = (sq + div).mean()
-        return loss
+        per_sample = sq + div
+        if weight is None:
+            return per_sample.mean()
+        weight = weight.to(per_sample.dtype).reshape(-1)
+        return (weight * per_sample).sum() / weight.sum()
 
 # class SlicedScoreMatchingLoss(nn.Module):
 #     def __init__(self, M:int=1):

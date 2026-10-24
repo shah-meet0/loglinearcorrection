@@ -305,6 +305,7 @@ class NNModelNuisance(NNModel):
             verbose: bool = True,
             train_idx=None,
             val_idx=None,
+            sample_weight=None,
     ) -> "NNModelNuisanceResults":
         """
            Train m(x) via MSE on (X, y), with optional fixed split or random split.
@@ -330,6 +331,9 @@ class NNModelNuisance(NNModel):
                Print training logs if True.
            train_idx, val_idx : array_like or None
                Predefined index splits. If both None, a random split is used.
+           sample_weight : array_like, shape (n,), optional
+               Per-observation weights; training and validation then use the
+               weighted mean squared error (weights rescaled to mean 1).
 
            Returns
            -------
@@ -362,8 +366,16 @@ class NNModelNuisance(NNModel):
         X_tr, y_tr = X[train_idx], y[train_idx]
         X_va, y_va = X[val_idx], y[val_idx]
 
-        ds_tr = TensorDataset(X_tr, y_tr)
-        ds_va = TensorDataset(X_va, y_va)
+        if sample_weight is None:
+            ds_tr = TensorDataset(X_tr, y_tr)
+            ds_va = TensorDataset(X_va, y_va)
+        else:
+            W = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if W.shape != (N,) or not np.all(np.isfinite(W)) or np.any(W < 0) or W.sum() <= 0:
+                raise ValueError("sample_weight must be finite, non-negative and match X")
+            W = torch.as_tensor(W / W.mean(), dtype=torch.float32)
+            ds_tr = TensorDataset(X_tr, y_tr, W[train_idx])
+            ds_va = TensorDataset(X_va, y_va, W[val_idx])
 
         dl_tr = DataLoader(
             ds_tr,
@@ -470,12 +482,17 @@ class NNModelNuisance(NNModel):
         """
         import torch
         import torch.nn.functional as F
-        xb, yb = batch
+        xb, yb = batch[0], batch[1]
         xb = xb.to(self.device, non_blocking=(self.device.type == "cuda"))
         yb = yb.to(self.device, non_blocking=(self.device.type == "cuda"))
         pred = self.model(xb)
         if pred.shape != yb.shape:
             pred = pred.view_as(yb)
+        if len(batch) == 3:
+            # weighted mean squared error (batch[2] = per-sample weights)
+            wb = batch[2].to(self.device, non_blocking=(self.device.type == "cuda")).reshape(-1)
+            per_sample = ((pred - yb) ** 2).reshape(len(wb), -1).mean(dim=1)
+            return (wb * per_sample).sum() / wb.sum()
         return F.mse_loss(pred, yb)
 
     # ---------- PER-BATCH LOSS: VAL ----------
@@ -600,6 +617,7 @@ class NNModelDensity(NNModel):
             num_workers: int = 0,
             shuffle: bool = True,
             verbose: bool = True,
+            sample_weight=None,
             **kwargs
     ) -> "NNModelDensityResults":
         """
@@ -615,6 +633,9 @@ class NNModelDensity(NNModel):
                Variables of interest; partitioned into continuous vs discrete.
            epochs, batch_size, learning_rate, weight_decay, val_frac, patience,
            min_delta, grad_clip_norm, num_workers, shuffle, verbose : see base.
+           sample_weight : array_like, shape (n,), optional
+               Per-observation weights for the score head (weighted
+               Hyvarinen loss, so the score is that of the weighted density).
            **kwargs : dict
                Head-specific kwargs using prefixes 'score__' and 'cond__'.
 
@@ -644,7 +665,9 @@ class NNModelDensity(NNModel):
         score_dims, score_meta = dims_dict["score"]
         cond_dims, cond_meta = dims_dict["cond"]
 
-        score_model = self._fit_score_model(X=X, dims=score_dims, meta=score_meta, arch_cfg = score_arch_cfg,fit_cfg=score_fit_cfg)
+        if sample_weight is not None and cond_dims["output_size"] > 0:
+            raise NotImplementedError("sample_weight is not supported for discrete interest variables")
+        score_model = self._fit_score_model(X=X, dims=score_dims, meta=score_meta, arch_cfg = score_arch_cfg,fit_cfg=score_fit_cfg, sample_weight=sample_weight)
         cond_model = self._fit_conditional_model(X=X, dims=cond_dims, meta=cond_meta, arch_cfg=cond_arch_cfg, fit_cfg=cond_fit_cfg)
 
         self.model = {
@@ -657,7 +680,7 @@ class NNModelDensity(NNModel):
             **{}
         )
 
-    def _fit_score_model(self, X, dims,meta, arch_cfg, fit_cfg):
+    def _fit_score_model(self, X, dims,meta, arch_cfg, fit_cfg, sample_weight=None):
         """
         Train a score network on all inputs X to predict scores for interested
         continuous coordinates only.
@@ -709,8 +732,11 @@ class NNModelDensity(NNModel):
         # The Gaussian reference (-z) assumes standardized inputs; alpha_weight maps
         # back with d log f / dx = (d log f / dz) / scale.
         X = np.array(X, dtype=np.float64)
-        center = X[:, interest_idx].mean(axis=0)
-        scale = X[:, interest_idx].std(axis=0)
+        # Weighted moments when sample weights are given, so the Gaussian
+        # reference is centred on the weighted distribution
+        w_std = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        center = np.average(X[:, interest_idx], axis=0, weights=w_std)
+        scale = np.sqrt(np.average((X[:, interest_idx] - center) ** 2, axis=0, weights=w_std))
         scale[scale <= 0] = 1.0
         X[:, interest_idx] = (X[:, interest_idx] - center) / scale
         meta["score_center"] = center
@@ -729,8 +755,16 @@ class NNModelDensity(NNModel):
         X_tr = torch.as_tensor(X[tr_idx], dtype=torch.float32)
         X_va = torch.as_tensor(X[val_idx], dtype=torch.float32) if n_val > 0 else None
 
-        ds_tr = TensorDataset(X_tr)
-        ds_va = TensorDataset(X_va) if n_val > 0 else None
+        # Per-sample weights (all ones when unweighted), rescaled to mean 1
+        if sample_weight is None:
+            W_all = torch.ones(n, dtype=torch.float32)
+        else:
+            W = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if W.shape != (n,) or not np.all(np.isfinite(W)) or np.any(W < 0) or W.sum() <= 0:
+                raise ValueError("sample_weight must be finite, non-negative and match X")
+            W_all = torch.as_tensor(W / W.mean(), dtype=torch.float32)
+        ds_tr = TensorDataset(X_tr, W_all[tr_idx])
+        ds_va = TensorDataset(X_va, W_all[val_idx]) if n_val > 0 else None
 
         pin = (device.type == "cuda")
         bs = int(fit_cfg.get("batch_size", 128))
@@ -792,18 +826,20 @@ class NNModelDensity(NNModel):
                 (len(interest_idx), 2), dtype=torch.float64, device=device
             )
             with torch.enable_grad():
-                for (xb,) in dl_va:
+                for xb, wb in dl_va:
                     xb = xb.to(device, non_blocking=pin).detach().requires_grad_(True)
+                    wb = wb.to(device, non_blocking=pin)
                     h = model(xb)
-                    l = loss_fn(model, xb).detach()
-                    bs_ = xb.size(0)
+                    l = loss_fn(model, xb, wb).detach()
+                    bs_ = float(wb.sum())
                     va_sum += float(l) * bs_
                     va_cnt += bs_
+                    wd = wb.double()
                     for out_j, var_k in enumerate(interest_idx):
                         score = h[:, out_j].detach().double()
                         coordinate = xb[:, var_k].detach().double()
-                        moment_sum[out_j, 0] += score.sum()
-                        moment_sum[out_j, 1] += (coordinate * score + 1.0).sum()
+                        moment_sum[out_j, 0] += (wd * score).sum()
+                        moment_sum[out_j, 1] += (wd * (coordinate * score + 1.0)).sum()
             means = moment_sum / max(va_cnt, 1)
             return va_sum / max(va_cnt, 1), float(means.abs().max().cpu())
 
@@ -828,10 +864,11 @@ class NNModelDensity(NNModel):
             # ---- train
             model.train()
             tr_sum = tr_cnt = 0
-            for (xb,) in dl_tr:
+            for xb, wb in dl_tr:
                 xb = xb.to(device, non_blocking=pin)
+                wb = wb.to(device, non_blocking=pin)
                 opt.zero_grad(set_to_none=True)
-                loss = loss_fn(model, xb)
+                loss = loss_fn(model, xb, wb)
                 loss.backward()
                 if grad_clip:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
