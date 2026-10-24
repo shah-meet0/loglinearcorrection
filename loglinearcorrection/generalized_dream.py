@@ -70,8 +70,12 @@ def fixed_effect_group_report(
     return pd.DataFrame(rows)
 
 
-def _check_fixed_effect_groups(model: Any, min_group_size: int, small_fe_groups: str) -> None:
-    """Store ``model.fe_group_report`` and warn or raise when groups are small."""
+def _check_fixed_effect_groups(
+    model: Any, min_group_size: int, small_fe_groups: str, max_small_share: float = 0.01
+) -> None:
+    """Store ``model.fe_group_report`` and warn or raise when more than
+    ``max_small_share`` of the rows are in fixed-effect groups smaller than
+    ``min_group_size``."""
     if small_fe_groups not in ("warn", "raise", "ignore"):
         raise ValueError("small_fe_groups must be 'warn', 'raise' or 'ignore'")
     if model.fe_cols is None:
@@ -80,7 +84,7 @@ def _check_fixed_effect_groups(model: Any, min_group_size: int, small_fe_groups:
     names = [f"fixed_effect_column_{j}" for j in model.fe_indices]
     report = fixed_effect_group_report(model.fe_cols, min_group_size, names)
     model.fe_group_report = report
-    flagged = report[report["rows_in_small_groups"] > 0]
+    flagged = report[report["share_rows_in_small_groups"] > max_small_share]
     if len(flagged) == 0 or small_fe_groups == "ignore":
         return
     detail = "; ".join(
@@ -89,7 +93,7 @@ def _check_fixed_effect_groups(model: Any, min_group_size: int, small_fe_groups:
         for r in flagged.itertuples()
     )
     message = (
-        f"Small fixed-effect groups ({detail}). The cross-fitted fixed effects are "
+        f"Small fixed-effect groups ({detail}; tolerance {max_small_share:.1%}). The cross-fitted fixed effects are "
         "estimated from very few training rows, so the estimator is not reliable; "
         "see model.fe_group_report."
     )
@@ -1424,6 +1428,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         *,
         min_fe_group_size: int = 5,
         small_fe_groups: str = "warn",
+        max_small_fe_share: float = 0.01,
     ) -> GeneralizedDREAMResults:
         """Fit the cross-fitted continuous GEAM estimator.
 
@@ -1432,9 +1437,11 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         density configuration and may also contain ``model_class``, which is
         useful for alternative score estimators and isolated testing.
 
-        ``min_fe_group_size`` and ``small_fe_groups`` ('warn', 'raise' or
-        'ignore') control the check for small fixed-effect groups; the group
-        sizes are stored in ``self.fe_group_report``.
+        ``min_fe_group_size``, ``max_small_fe_share`` and ``small_fe_groups``
+        ('warn', 'raise' or 'ignore') control the check for small fixed-effect
+        groups: it fires when more than ``max_small_fe_share`` of the rows are in
+        groups with fewer than ``min_fe_group_size`` rows.  The group sizes are
+        stored in ``self.fe_group_report``.
 
         ``density_params`` also accepts:
 
@@ -1457,7 +1464,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         k_interest = len(interest_indices)
         m_config = self._prepare_m_params(m_params)
         density_model_class, density_config = self._prepare_density_params(density_params)
-        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups)
+        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -1639,10 +1646,11 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         *,
         min_fe_group_size: int = 5,
         small_fe_groups: str = "warn",
+        max_small_fe_share: float = 0.01,
     ) -> JointGeneralizedDREAMResults:
         """Fit all requested targets and their joint covariance matrix.
 
-        ``min_fe_group_size`` and ``small_fe_groups`` are as in
+        ``min_fe_group_size``, ``max_small_fe_share`` and ``small_fe_groups`` are as in
         :meth:`GeneralizedDREAM.fit`.
         """
         interest_indices = list(self.interest)
@@ -1654,7 +1662,7 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         density_model_class, density_config = self._prepare_density_params(
             density_params
         )
-        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups)
+        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -2322,6 +2330,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         pi_params: Optional[Mapping[str, Any]] = None,
         min_fe_group_size: int = 5,
         small_fe_groups: str = "warn",
+        max_small_fe_share: float = 0.01,
     ) -> GPCAMResults:
         """Fit the cross-fitted binary-treatment GPCAM estimator.
 
@@ -2329,7 +2338,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         ``propensity_params`` configures the propensity regression.  Both use
         the package's ``arch_params``/``fit_params``/``model_class`` convention;
         ``pi_params`` is accepted as an alias for ``propensity_params``.
-        ``min_fe_group_size`` and ``small_fe_groups`` are as in
+        ``min_fe_group_size``, ``max_small_fe_share`` and ``small_fe_groups`` are as in
         :meth:`GeneralizedDREAM.fit`.
         """
         if propensity_params is not None and pi_params is not None:
@@ -2339,7 +2348,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         )
         m_config = self._prepare_m_params(m_params)
         propensity_config = self._prepare_propensity_params(propensity_params)
-        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups)
+        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
