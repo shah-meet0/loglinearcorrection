@@ -11,6 +11,7 @@ implementation below follows the binary-treatment score in the same paper.
 
 from __future__ import annotations
 
+import warnings
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import combinations
@@ -32,6 +33,69 @@ from .utils import _apply_fixed_effects, _initialize_fixed_effects
 Array = npt.NDArray[np.float64]
 Policy = Callable[[Array], npt.ArrayLike]
 Target = tuple[float, float]
+
+
+def fixed_effect_group_report(
+    fe_cols: npt.ArrayLike, min_group_size: int = 5, names: Sequence[str] | None = None
+) -> pd.DataFrame:
+    """Group sizes of each fixed-effect dimension.
+
+    One row per dimension: number of levels, smallest and median group size,
+    singleton groups, and the number and share of rows in groups with fewer
+    than ``min_group_size`` rows.  In small groups the cross-fitted fixed
+    effects rest on one or two training rows, so fold residuals are shrunk
+    towards zero on training rows and inflated on held-out rows, and the
+    estimator should not be used.
+    """
+    fe_cols = np.asarray(fe_cols)
+    if fe_cols.ndim == 1:
+        fe_cols = fe_cols.reshape(-1, 1)
+    names = list(names) if names is not None else [f"FE{j}" for j in range(fe_cols.shape[1])]
+    rows = []
+    for j, name in enumerate(names):
+        codes = pd.factorize(fe_cols[:, j])[0]
+        if np.any(codes < 0):
+            raise ValueError(f"Fixed effect {name} contains missing values")
+        sizes = np.bincount(codes)
+        small = int(np.sum(sizes[codes] < min_group_size))
+        rows.append({
+            "fixed_effect": name,
+            "levels": len(sizes),
+            "smallest_group": int(sizes.min()),
+            "median_group": float(np.median(sizes)),
+            "singleton_groups": int(np.sum(sizes == 1)),
+            "rows_in_small_groups": small,
+            "share_rows_in_small_groups": small / len(codes),
+        })
+    return pd.DataFrame(rows)
+
+
+def _check_fixed_effect_groups(model: Any, min_group_size: int, small_fe_groups: str) -> None:
+    """Store ``model.fe_group_report`` and warn or raise when groups are small."""
+    if small_fe_groups not in ("warn", "raise", "ignore"):
+        raise ValueError("small_fe_groups must be 'warn', 'raise' or 'ignore'")
+    if model.fe_cols is None:
+        model.fe_group_report = None
+        return
+    names = [f"fixed_effect_column_{j}" for j in model.fe_indices]
+    report = fixed_effect_group_report(model.fe_cols, min_group_size, names)
+    model.fe_group_report = report
+    flagged = report[report["rows_in_small_groups"] > 0]
+    if len(flagged) == 0 or small_fe_groups == "ignore":
+        return
+    detail = "; ".join(
+        f"{r.fixed_effect}: smallest group {r.smallest_group}, "
+        f"{r.share_rows_in_small_groups:.1%} of rows in groups under {min_group_size}"
+        for r in flagged.itertuples()
+    )
+    message = (
+        f"Small fixed-effect groups ({detail}). The cross-fitted fixed effects are "
+        "estimated from very few training rows, so the estimator is not reliable; "
+        "see model.fe_group_report."
+    )
+    if small_fe_groups == "raise":
+        raise ValueError(message)
+    warnings.warn(message, stacklevel=3)
 
 
 @dataclass
@@ -813,7 +877,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         return [(np.asarray(train), np.asarray(test)) for train, test in iterator]
 
     def _fe_spread_splits(
-        self, n_folds: int, random_state: Optional[int]
+        self,
+        n_folds: int,
+        random_state: Optional[int],
+        strata: npt.NDArray[np.int64] | None = None,
     ) -> list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
         """Folds that spread every level of the finest fixed effect across folds.
 
@@ -822,6 +889,9 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         over the folds from a random starting fold, so a level with at least two
         rows is never held out entirely and its fixed effect is always estimated
         on training rows.  Fold sizes stay balanced to within one row per level.
+        With ``strata`` (e.g. a binary treatment) rows are ordered by stratum
+        within each level before dealing, so each level's strata are also
+        spread over the folds.
         """
         rng = np.random.default_rng(random_state)
         median_sizes = [
@@ -830,7 +900,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         ]
         codes = pd.factorize(self.fe_cols[:, int(np.argmin(median_sizes))])[0]
         order = rng.permutation(self.nobs)
-        order = order[np.argsort(codes[order], kind="stable")]
+        if strata is None:
+            order = order[np.argsort(codes[order], kind="stable")]
+        else:
+            order = order[np.lexsort((strata[order], codes[order]))]
         sorted_codes = codes[order]
         starts = np.r_[0, np.flatnonzero(np.diff(sorted_codes)) + 1]
         rank = np.arange(self.nobs) - np.repeat(starts, np.diff(np.r_[starts, self.nobs]))
@@ -883,6 +956,17 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         )
         y_dm = np.asarray(y_dm, dtype=np.float64).reshape(-1)
         x_dm = np.asarray(x_dm, dtype=np.float64)
+        # A regressor of interest can vary only across rows that the training
+        # fixed effects absorb (e.g. T=2 panels with two folds); OLS would then
+        # silently return beta = 0 for it.
+        x_train = self.exog[train_idx]
+        for j in self.interest:
+            spread = np.linalg.norm(x_train[:, j] - x_train[:, j].mean())
+            if spread > 0 and np.linalg.norm(x_dm[:, j]) <= 1e-8 * spread:
+                raise ValueError(
+                    f"{self.exog_names[j]} is absorbed by the fixed effects on a "
+                    "training fold; use more folds or fewer fixed effects"
+                )
         ols = (
             sm.WLS(y_dm, x_dm, weights=train_weights)
             if train_weights is not None
@@ -1175,6 +1259,9 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         random_state: Optional[int] = None,
         m_params: Optional[Mapping[str, Any]] = None,
         density_params: Optional[Mapping[str, Any]] = None,
+        *,
+        min_fe_group_size: int = 5,
+        small_fe_groups: str = "warn",
     ) -> GeneralizedDREAMResults:
         """Fit the cross-fitted continuous GEAM estimator.
 
@@ -1182,11 +1269,16 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         contain ``model_class``.  ``density_params`` follows the existing
         density configuration and may also contain ``model_class``, which is
         useful for alternative score estimators and isolated testing.
+
+        ``min_fe_group_size`` and ``small_fe_groups`` ('warn', 'raise' or
+        'ignore') control the check for small fixed-effect groups; the group
+        sizes are stored in ``self.fe_group_report``.
         """
         interest_indices = list(self.interest)
         k_interest = len(interest_indices)
         m_config = self._prepare_m_params(m_params)
         density_model_class, density_config = self._prepare_density_params(density_params)
+        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -1364,8 +1456,15 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         random_state: Optional[int] = None,
         m_params: Optional[Mapping[str, Any]] = None,
         density_params: Optional[Mapping[str, Any]] = None,
+        *,
+        min_fe_group_size: int = 5,
+        small_fe_groups: str = "warn",
     ) -> JointGeneralizedDREAMResults:
-        """Fit all requested targets and their joint covariance matrix."""
+        """Fit all requested targets and their joint covariance matrix.
+
+        ``min_fe_group_size`` and ``small_fe_groups`` are as in
+        :meth:`GeneralizedDREAM.fit`.
+        """
         interest_indices = list(self.interest)
         n_interest = len(interest_indices)
         unique_phis = tuple(dict.fromkeys(phi for phi, _ in self.targets))
@@ -1375,6 +1474,7 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         density_model_class, density_config = self._prepare_density_params(
             density_params
         )
+        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -1740,6 +1840,17 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
                 "n_folds must be an integer between 2 and the size of the "
                 "smaller treatment arm"
             )
+        if self.fe_cols is not None:
+            # Same fixed-effect spreading as GEAM, so held-out rows' fixed
+            # effects are estimated on training rows of the same level, with
+            # treatment arms spread within each level
+            splits = GeneralizedDREAM._fe_spread_splits(
+                self, n_folds, random_state, strata=self.treatment
+            )
+            for train, _ in splits:
+                if np.unique(self.treatment[train]).size < 2:
+                    raise ValueError("A training fold contains only one treatment arm")
+            return splits
         splitter = StratifiedKFold(
             n_splits=n_folds, shuffle=True, random_state=random_state
         )
@@ -1747,6 +1858,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             (np.asarray(train), np.asarray(test))
             for train, test in splitter.split(self.exog, self.treatment)
         ]
+
+    _predict_fixed_effects = staticmethod(GeneralizedDREAM._predict_fixed_effects)
 
     @staticmethod
     def _coerce_prediction(
@@ -2026,6 +2139,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         propensity_params: Optional[Mapping[str, Any]] = None,
         *,
         pi_params: Optional[Mapping[str, Any]] = None,
+        min_fe_group_size: int = 5,
+        small_fe_groups: str = "warn",
     ) -> GPCAMResults:
         """Fit the cross-fitted binary-treatment GPCAM estimator.
 
@@ -2033,6 +2148,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         ``propensity_params`` configures the propensity regression.  Both use
         the package's ``arch_params``/``fit_params``/``model_class`` convention;
         ``pi_params`` is accepted as an alias for ``propensity_params``.
+        ``min_fe_group_size`` and ``small_fe_groups`` are as in
+        :meth:`GeneralizedDREAM.fit`.
         """
         if propensity_params is not None and pi_params is not None:
             raise ValueError("Supply propensity_params or pi_params, not both")
@@ -2041,6 +2158,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         )
         m_config = self._prepare_m_params(m_params)
         propensity_config = self._prepare_propensity_params(propensity_params)
+        _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups)
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
@@ -2135,6 +2253,7 @@ JGEAMResults = JointGeneralizedDREAMResults
 
 
 __all__ = [
+    "fixed_effect_group_report",
     "GEAM",
     "GEAMResults",
     "GPCAM",
