@@ -882,7 +882,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         self, n_folds: int, random_state: Optional[int]
     ) -> list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
         if not isinstance(n_folds, int) or n_folds < 2 or n_folds > self.nobs:
-            raise ValueError("n_folds must be an integer between 2 and nobs")
+            raise ValueError("n_folds must be 1 (no cross-fitting) or an integer between 2 and nobs")
 
         if self.fe_labels is not None:
             _, counts = np.unique(self.fe_labels, return_counts=True)
@@ -921,6 +921,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             for j in range(self.fe_cols.shape[1])
         ]
         codes = pd.factorize(self.fe_cols[:, int(np.argmin(median_sizes))])[0]
+        if n_folds == 1:
+            # No cross-fitting: nuisances are fitted and evaluated on all rows.
+            everything = np.arange(self.nobs)
+            return [(everything, everything)]
         order = rng.permutation(self.nobs)
         if strata is None:
             order = order[np.argsort(codes[order], kind="stable")]
@@ -1584,7 +1588,8 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         fold_results: list[dict[str, Any]] = []
         for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
             weight_fold = np.ones(self.nobs, dtype=np.float64)
-            weight_fold[test_idx] = 1e-10
+            if n_folds > 1:
+                weight_fold[test_idx] = 1e-10
             if self.weights is not None:
                 weight_fold *= self.weights
             print(f"Processing generalized DREAm fold {fold_number}/{n_folds}")
@@ -1788,7 +1793,8 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         fold_results: list[dict[str, Any]] = []
         for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
             weight_fold = np.ones(self.nobs, dtype=np.float64)
-            weight_fold[test_idx] = 1e-10
+            if n_folds > 1:
+                weight_fold[test_idx] = 1e-10
             if self.weights is not None:
                 weight_fold *= self.weights
             print(
@@ -2488,7 +2494,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         fold_results: list[dict[str, Any]] = []
         for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
             weight_fold = np.ones(self.nobs, dtype=np.float64)
-            weight_fold[test_idx] = 1e-10
+            if n_folds > 1:
+                weight_fold[test_idx] = 1e-10
             if self.weights is not None:
                 weight_fold *= self.weights
             print(f"Processing GPCAM fold {fold_number}/{n_folds}")
