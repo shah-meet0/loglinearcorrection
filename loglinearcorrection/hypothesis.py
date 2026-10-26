@@ -1,5 +1,69 @@
+from itertools import combinations
+
 import numpy as np
+import pandas as pd
 import scipy.stats as stats
+
+
+def _cluster_codes(clusters, n: int) -> np.ndarray:
+    """Integer codes, one column per clustering dimension, for ``n`` rows."""
+    frame = pd.DataFrame(clusters) if np.ndim(clusters) > 1 else pd.DataFrame({0: np.asarray(clusters)})
+    if frame.shape[0] != n:
+        raise ValueError(f"clusters must have {n} rows; got {frame.shape[0]}.")
+    if frame.isna().to_numpy().any():
+        raise ValueError("clusters must not contain missing values.")
+    return np.column_stack([pd.factorize(frame[c])[0] for c in frame.columns])
+
+
+def influence_covariance(
+    influence_functions: np.ndarray,
+    probability_weights: np.ndarray,
+    clusters=None,
+    *,
+    center: bool = False,
+    small_sample: bool = True,
+) -> np.ndarray:
+    """Covariance of estimators with ``theta_hat - theta = sum_i p_i IF_i``.
+
+    Without ``clusters`` this is ``(p IF).T @ (p IF)``, the row-level
+    (heteroskedasticity-robust) covariance. ``clusters`` is an array of labels
+    with one row per observation: one column for one-way clustering, or several
+    columns for multiway clustering (Cameron, Gelbach and Miller, 2011), where
+    the covariance is the inclusion-exclusion sum over every intersection of the
+    clustering dimensions and negative eigenvalues are set to zero. Within each
+    term the weighted influences are summed by cluster, and with
+    ``small_sample`` the term is scaled by ``G / (G - 1)`` for its ``G`` clusters.
+    """
+    influences = np.asarray(influence_functions, dtype=float)
+    if influences.ndim == 1:
+        influences = influences[:, None]
+    p = np.asarray(probability_weights, dtype=float).reshape(-1)
+    if center:
+        influences = influences - np.sum(p[:, None] * influences, axis=0, keepdims=True)
+    weighted = p[:, None] * influences
+    if clusters is None:
+        covariance = weighted.T @ weighted
+        return 0.5 * (covariance + covariance.T)
+
+    codes = _cluster_codes(clusters, weighted.shape[0])
+    dims = codes.shape[1]
+    covariance = np.zeros((weighted.shape[1], weighted.shape[1]))
+    for size in range(1, dims + 1):
+        for subset in combinations(range(dims), size):
+            _, groups = np.unique(codes[:, subset], axis=0, return_inverse=True)
+            groups = groups.reshape(-1)
+            n_groups = int(groups.max()) + 1
+            sums = np.zeros((n_groups, weighted.shape[1]))
+            np.add.at(sums, groups, weighted)
+            term = sums.T @ sums
+            if small_sample and n_groups > 1:
+                term *= n_groups / (n_groups - 1)
+            covariance += term if size % 2 == 1 else -term
+    covariance = 0.5 * (covariance + covariance.T)
+    if dims > 1:
+        values, vectors = np.linalg.eigh(covariance)
+        covariance = (vectors * np.maximum(values, 0.0)) @ vectors.T
+    return covariance
 
 
 class HypothesisTestResult:
@@ -131,6 +195,11 @@ class InfluenceFunctionDiffTest:
         Optional non-negative sampling or frequency weights.  The covariance
         is estimated from the weighted, centered influence functions, so the
         covariance between estimators is retained in every contrast.
+    clusters
+        Optional cluster labels (one column per clustering dimension) for a
+        cluster-robust covariance; see :func:`influence_covariance`.
+    small_sample
+        With ``clusters``, scale each clustering term by ``G / (G - 1)``.
 
     Notes
     -----
@@ -147,6 +216,8 @@ class InfluenceFunctionDiffTest:
         coefs: np.ndarray,
         influence_functions: np.ndarray,
         weights: np.ndarray | None = None,
+        clusters=None,
+        small_sample: bool = True,
     ):
         self.n = int(n)
         self.k = int(k)
@@ -180,14 +251,11 @@ class InfluenceFunctionDiffTest:
                 )
 
         probability_weights = weights_array / weights_array.sum()
-        centered = influences - np.sum(
-            probability_weights[:, None] * influences, axis=0, keepdims=True
-        )
-        weighted = probability_weights[:, None] * centered
         self.influence_functions = influences
         self.probability_weights = probability_weights
-        self.vcov = weighted.T @ weighted
-        self.vcov = 0.5 * (self.vcov + self.vcov.T)
+        self.vcov = influence_covariance(
+            influences, probability_weights, clusters, center=True, small_sample=small_sample
+        )
 
         coefficient_test = CoefDiffTest(
             n=self.n,

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import combinations
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -24,7 +24,7 @@ import statsmodels.api as sm
 from scipy import stats
 from sklearn.model_selection import KFold, StratifiedKFold
 
-from .hypothesis import HypothesisTestResult, InfluenceFunctionDiffTest
+from .hypothesis import HypothesisTestResult, InfluenceFunctionDiffTest, influence_covariance
 from .model import DoublyRobustElasticityEstimatorModel
 from .nonparametric import NNModelDensity, NNModelNuisance
 from .utils import _apply_fixed_effects, _initialize_fixed_effects
@@ -137,6 +137,7 @@ class GeneralizedDREAMResults:
     normalizer: float
     denominator: float
     _is_pandas: bool
+    clusters: Any = None
 
     def __post_init__(self) -> None:
         z = float(stats.norm.ppf(0.975))
@@ -162,6 +163,19 @@ class GeneralizedDREAMResults:
             )
         else:
             self.elasticities = self.estimates.copy()
+
+    def with_clusters(self, clusters, small_sample: bool = True) -> "GeneralizedDREAMResults":
+        """Copy with cluster-robust covariance and standard errors.
+
+        ``clusters`` holds one label per observation (one column per clustering
+        dimension; several columns give multiway clustering). ``None`` restores
+        the row-level covariance. See :func:`influence_covariance`.
+        """
+        covariance = influence_covariance(
+            self.influence_functions, self.fold_weights / self.fold_weights.sum(),
+            clusters, small_sample=small_sample)
+        return replace(self, covariance_matrix=covariance, clusters=clusters,
+                       standard_errors=np.sqrt(np.maximum(np.diag(covariance), 0.0)))
 
     def get_elasticity(self, var_name: str) -> tuple[float, float]:
         """Return the estimate and standard error for ``var_name``."""
@@ -236,6 +250,7 @@ class JointGeneralizedDREAMResults:
     normalizers: Array
     denominators: Array
     _is_pandas: bool
+    clusters: Any = None
 
     def __post_init__(self) -> None:
         n_targets = len(self.targets)
@@ -288,6 +303,20 @@ class JointGeneralizedDREAMResults:
     @property
     def interest_names(self) -> list[str]:
         return [self.exog_names[index] for index in self.interest_indices]
+
+    def with_clusters(self, clusters, small_sample: bool = True) -> "JointGeneralizedDREAMResults":
+        """Copy with cluster-robust joint covariance and standard errors.
+
+        ``clusters`` holds one label per observation (one column per clustering
+        dimension; several columns give multiway clustering). ``None`` restores
+        the row-level covariance. Difference tests then use the same clusters.
+        """
+        covariance = influence_covariance(
+            self.influence_functions, self.fold_weights / self.fold_weights.sum(),
+            clusters, small_sample=small_sample)
+        standard_errors = np.sqrt(np.maximum(np.diag(covariance), 0.0)).reshape(self.estimates.shape)
+        return replace(self, covariance_matrix=covariance, standard_errors=standard_errors,
+                       clusters=clusters)
 
     @property
     def parameter_labels(self) -> list[tuple[float, float, str]]:
@@ -396,6 +425,7 @@ class JointGeneralizedDREAMResults:
                 ]
             ),
             weights=self.fold_weights,
+            clusters=self.clusters,
         )
         result = test.results[0]
         result.description = (
@@ -526,6 +556,7 @@ class GPCAMResults:
     log_arm_means: Array
     score_derivative: float
     score_scale_log: float
+    clusters: Any = None
 
     def __post_init__(self) -> None:
         z_value = float(stats.norm.ppf(0.975))
@@ -541,6 +572,14 @@ class GPCAMResults:
         self.scores = self.moments
         self.fold_diagnostics = self.fold_results
         self.treatment_beta = float(self.beta[self.treatment_index])
+
+    def with_clusters(self, clusters, small_sample: bool = True) -> "GPCAMResults":
+        """Copy with a cluster-robust standard error (``None``: row-level)."""
+        covariance = influence_covariance(
+            self.influence_functions, self.fold_weights / self.fold_weights.sum(),
+            clusters, small_sample=small_sample)
+        return replace(self, covariance_matrix=covariance, clusters=clusters,
+                       standard_error=float(np.sqrt(max(covariance[0, 0], 0.0))))
 
     def get_percentage_change(self) -> tuple[float, float]:
         """Return the percentage-change estimate and its standard error."""
@@ -577,6 +616,7 @@ class GPCAMResults:
                 [self.influence_functions, comparator_influence]
             ),
             weights=self.fold_weights,
+            clusters=self.clusters,
         )
         result = test.results[0]
         result.description = (
@@ -881,6 +921,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
     def _make_splits(
         self, n_folds: int, random_state: Optional[int]
     ) -> list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
+        if n_folds == 1:
+            # No cross-fitting: nuisances are fitted and evaluated on all rows.
+            everything = np.arange(self.nobs)
+            return [(everything, everything)]
         if not isinstance(n_folds, int) or n_folds < 2 or n_folds > self.nobs:
             raise ValueError("n_folds must be 1 (no cross-fitting) or an integer between 2 and nobs")
 
@@ -921,10 +965,6 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             for j in range(self.fe_cols.shape[1])
         ]
         codes = pd.factorize(self.fe_cols[:, int(np.argmin(median_sizes))])[0]
-        if n_folds == 1:
-            # No cross-fitting: nuisances are fitted and evaluated on all rows.
-            everything = np.arange(self.nobs)
-            return [(everything, everything)]
         order = rng.permutation(self.nobs)
         if strata is None:
             order = order[np.argsort(codes[order], kind="stable")]
@@ -1535,6 +1575,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         max_small_fe_share: float = 0.01,
         weighted_nuisance: bool = True,
         min_target_effective_n: float = 100.0,
+        clusters=None,
     ) -> GeneralizedDREAMResults:
         """Fit the cross-fitted continuous GEAM estimator.
 
@@ -1576,6 +1617,9 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         ``min_target_effective_n`` (default 100): warn when a target's weights
         ``w * M^psi`` leave fewer effective observations; the diagnostics are in
         ``self.target_diagnostics``.
+        ``clusters`` (default None): cluster labels, one per observation (several
+        columns for multiway clustering), for cluster-robust standard errors and
+        difference tests; see :meth:`GeneralizedDREAMResults.with_clusters`.
         """
         interest_indices = list(self.interest)
         k_interest = len(interest_indices)
@@ -1672,7 +1716,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             )
             fold["correction_weight"] = fold["alpha_x"]
 
-        return GeneralizedDREAMResults(
+        results = GeneralizedDREAMResults(
             estimates=np.asarray(estimates, dtype=np.float64),
             standard_errors=np.asarray(standard_errors, dtype=np.float64),
             exog_names=list(self.exog_names),
@@ -1699,6 +1743,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             denominator=denominator,
             _is_pandas=self._original_is_pandas,
         )
+        return results if clusters is None else results.with_clusters(clusters)
 
 
 class JointGeneralizedDREAM(GeneralizedDREAM):
@@ -1771,11 +1816,12 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         max_small_fe_share: float = 0.01,
         weighted_nuisance: bool = True,
         min_target_effective_n: float = 100.0,
+        clusters=None,
     ) -> JointGeneralizedDREAMResults:
         """Fit all requested targets and their joint covariance matrix.
 
-        ``min_fe_group_size``, ``max_small_fe_share`` and ``small_fe_groups`` are as in
-        :meth:`GeneralizedDREAM.fit`.
+        ``min_fe_group_size``, ``max_small_fe_share``, ``small_fe_groups`` and
+        ``clusters`` are as in :meth:`GeneralizedDREAM.fit`.
         """
         interest_indices = list(self.interest)
         n_interest = len(interest_indices)
@@ -1945,7 +1991,7 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
                     "correction_weight": alpha,
                 }
 
-        return JointGeneralizedDREAMResults(
+        results = JointGeneralizedDREAMResults(
             targets=self.targets,
             estimates=estimates,
             standard_errors=standard_errors,
@@ -1971,6 +2017,7 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
             denominators=denominators,
             _is_pandas=self._original_is_pandas,
         )
+        return results if clusters is None else results.with_clusters(clusters)
 
 
 class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
@@ -2468,6 +2515,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         max_small_fe_share: float = 0.01,
         weighted_nuisance: bool = True,
         min_target_effective_n: float = 100.0,
+        clusters=None,
     ) -> GPCAMResults:
         """Fit the cross-fitted binary-treatment GPCAM estimator.
 
@@ -2478,7 +2526,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         ``min_fe_group_size``, ``max_small_fe_share`` and ``small_fe_groups`` are as in
         :meth:`GeneralizedDREAM.fit`; ``weighted_nuisance`` fits the arm and
         propensity networks with the sample weights.  ``min_target_effective_n``
-        is accepted for a common signature and not used by GPCAM.
+        is accepted for a common signature and not used by GPCAM.  ``clusters``
+        gives a cluster-robust standard error, as in :meth:`GeneralizedDREAM.fit`.
         """
         if propensity_params is not None and pi_params is not None:
             raise ValueError("Supply propensity_params or pi_params, not both")
@@ -2544,7 +2593,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             fold["moments"] = solution["moments"][idx]
             fold["influence_functions"] = influence[idx]
 
-        return GPCAMResults(
+        results = GPCAMResults(
             estimate=solution["estimate"],
             standard_error=standard_error,
             phi=self.phi,
@@ -2568,6 +2617,7 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             score_derivative=solution["score_derivative"],
             score_scale_log=solution["score_scale_log"],
         )
+        return results if clusters is None else results.with_clusters(clusters)
 
 
 # Paper terminology and explicit long-form aliases.
