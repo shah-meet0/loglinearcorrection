@@ -119,7 +119,9 @@ class NNModel(NPModel):
                 """
         import torch
         super().__init__(variable_types, **params)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # device_count() also respects an empty CUDA_VISIBLE_DEVICES, which is_available() can miss
+        use_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+        self.device = torch.device("cuda" if use_cuda else "cpu")
         self.model = None
         if build_now:
             self.model = self._create_model().to(self.device)
@@ -1514,8 +1516,9 @@ class FESplineModelNuisance(NPModel):
     Additive penalized-spline nuisance model with high-dimensional fixed effects.
 
         eta(x) = c + sum_j f_j(x_j) + sum_l b_l x_l + sum_k alpha_k[g_k]
-        m(x)   = eta(x)          (least squares; default, e.g. phi = 0)
-        m(x)   = exp(eta(x))     (positive_log_link=True: Poisson, log link; phi != 0)
+        m(x)   = eta(x)              (link='identity': least squares; e.g. phi = 0)
+        m(x)   = exp(eta(x))         (link='log': Poisson quasi-likelihood; phi != 0)
+        m(x)   = 1 / (1 + e^-eta(x)) (link='logit': Bernoulli; propensity scores)
 
     Continuous columns get a cubic B-spline f_j with quantile knots and a
     second-difference penalty; outside the training range f_j is extended
@@ -1538,11 +1541,19 @@ class FESplineModelNuisance(NPModel):
     variable_types : dict
         Map {col_index: 'continuous'|'binary'|'ordinal'} for interest columns.
         Columns typed 'binary' or 'ordinal' enter linearly.
-    continuous_input_size : int, optional
-        Number of leading covariate columns; the remaining columns are FE codes.
-        Defaults to all columns (no FE codes).
+    non_fe_inputs : int, optional
+        Number of leading regressor columns; the remaining columns are FE codes.
+        Defaults to all columns (no FE codes). GeneralizedDREAM and
+        GeneralizedPCAM pass it automatically when ``fe_encoding='codes'``.
+    categorical_cardinalities : list of int, optional
+        Number of levels of each FE (passed automatically with the codes).
+    link : {'identity', 'log', 'logit'}, optional
+        Link function. By default it follows the neural-network convention the
+        estimators already use: ``positive_log_link=True`` gives 'log',
+        ``output_activation='sigmoid'`` gives 'logit', otherwise 'identity'.
+        'log' requires y >= 0 and 'logit' requires y in [0, 1].
     positive_log_link : bool
-        Fit E[y | x] = exp(eta) by Poisson quasi-likelihood (requires y >= 0).
+        Same as ``link='log'`` (set by GeneralizedDREAM for phi != 0).
     degree : int
         B-spline degree (default cubic).
     n_knots : int
@@ -1558,12 +1569,21 @@ class FESplineModelNuisance(NPModel):
         and ignored so the class is a drop-in ``model_class``.
     """
 
-    def __init__(self, variable_types, continuous_input_size=None, positive_log_link: bool = False,
+    def __init__(self, variable_types, non_fe_inputs=None, categorical_cardinalities=None,
+                 link: str | None = None, positive_log_link: bool = False,
                  degree: int = 3, n_knots: int = 10, penalty_grid=tuple(10.0 ** np.arange(-6, 2)),
                  val_frac: float = 0.2, max_iter: int = 1000, **params):
         super().__init__(variable_types, **params)
-        self.continuous_input_size = continuous_input_size
-        self.positive_log_link = bool(positive_log_link)
+        self.non_fe_inputs = non_fe_inputs
+        self.categorical_cardinalities = categorical_cardinalities
+        if link is None:
+            sigmoid = params.get("output_activation") == "sigmoid"
+            link = "log" if positive_log_link else "logit" if sigmoid else "identity"
+        if link not in ("identity", "log", "logit"):
+            raise ValueError("link must be 'identity', 'log' or 'logit'")
+        if positive_log_link and link != "log":
+            raise ValueError("positive_log_link=True requires link='log'")
+        self.link = link
         self.degree = int(degree)
         self.n_knots = int(n_knots)
         self.penalty_grid = tuple(float(p) for p in penalty_grid)
@@ -1627,8 +1647,11 @@ class FESplineModelNuisance(NPModel):
         wt = torch.as_tensor(w / w.mean(), dtype=torch.float64)
         Pt = torch.as_tensor(self.penalty_, dtype=torch.float64)
         ct = [torch.as_tensor(c, dtype=torch.long) for c in codes.T]
-        c0 = np.average(y, weights=w)
-        c0 = float(np.log(max(c0, 1e-12))) if self.positive_log_link else float(c0)
+        c0 = float(np.average(y, weights=w))
+        if self.link == "log":
+            c0 = float(np.log(max(c0, 1e-12)))
+        elif self.link == "logit":
+            c0 = float(np.log(np.clip(c0, 1e-6, 1 - 1e-6) / (1 - np.clip(c0, 1e-6, 1 - 1e-6))))
         params = [torch.tensor([c0], dtype=torch.float64), torch.zeros(D.shape[1], dtype=torch.float64)]
         params += [torch.zeros(k, dtype=torch.float64) for k in self.cardinalities_]
         for p in params:
@@ -1641,8 +1664,10 @@ class FESplineModelNuisance(NPModel):
             eta = params[0] + Dt @ params[1]
             for alpha, c in zip(params[2:], ct):
                 eta = eta + alpha[c]
-            if self.positive_log_link:
+            if self.link == "log":
                 loss = torch.mean(wt * (torch.exp(eta) - yt * eta))
+            elif self.link == "logit":
+                loss = torch.mean(wt * (torch.nn.functional.softplus(eta) - yt * eta))
             else:
                 loss = 0.5 * torch.mean(wt * (yt - eta) ** 2)
             loss = loss + lam * (params[1] @ Pt @ params[1])
@@ -1663,9 +1688,21 @@ class FESplineModelNuisance(NPModel):
 
     def _loss(self, D, codes, y, w, params):
         eta = self._eta(D, codes, params)
-        if self.positive_log_link:
+        if self.link == "log":
             return float(np.average(np.exp(np.clip(eta, -50, 50)) - y * eta, weights=w))
+        if self.link == "logit":
+            return float(np.average(np.logaddexp(0.0, eta) - y * eta, weights=w))
         return float(np.average((y - eta) ** 2, weights=w))
+
+    def _mean(self, eta):
+        """Inverse link and its derivative d m / d eta."""
+        if self.link == "log":
+            mean = np.exp(eta)
+            return mean, mean
+        if self.link == "logit":
+            mean = 0.5 * (1.0 + np.tanh(0.5 * eta))  # overflow-free sigmoid
+            return mean, mean * (1.0 - mean)
+        return eta, np.ones_like(eta)
 
     def fit(self, X, y, *, sample_weight=None, verbose: bool = False, random_state: int = 0, **fit_params):
         """Fit the penalized additive model; NN-style fit kwargs (epochs, ...) are ignored."""
@@ -1676,8 +1713,10 @@ class FESplineModelNuisance(NPModel):
         n, d = X.shape
         if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
             raise ValueError("X and y must be finite")
-        if self.positive_log_link and np.any(y < 0):
-            raise ValueError("positive_log_link requires a non-negative target")
+        if self.link == "log" and np.any(y < 0):
+            raise ValueError("link='log' requires a non-negative target")
+        if self.link == "logit" and np.any((y < 0) | (y > 1)):
+            raise ValueError("link='logit' requires a target in [0, 1]")
         if sample_weight is None:
             w = np.ones(n)
         else:
@@ -1686,13 +1725,18 @@ class FESplineModelNuisance(NPModel):
                 raise ValueError("sample_weight must be finite, non-negative and match X")
 
         self.n_columns_ = d
-        self.n_cont_ = d if self.continuous_input_size is None else int(self.continuous_input_size)
+        self.n_cont_ = d if self.non_fe_inputs is None else int(self.non_fe_inputs)
         if not 0 <= self.n_cont_ <= d:
-            raise ValueError("continuous_input_size must be between 0 and the number of columns")
+            raise ValueError("non_fe_inputs must be between 0 and the number of columns")
         cont, codes = self._split(X)
         if np.any(codes < 0) or not np.allclose(X[:, self.n_cont_:], codes):
             raise ValueError("fixed-effect columns must hold non-negative integer codes")
         self.cardinalities_ = [int(c.max()) + 1 if n else 0 for c in codes.T]
+        if self.categorical_cardinalities is not None:
+            if len(self.categorical_cardinalities) != codes.shape[1]:
+                raise ValueError("categorical_cardinalities must have one entry per FE column")
+            self.cardinalities_ = [max(int(k), seen) for k, seen in
+                                   zip(self.categorical_cardinalities, self.cardinalities_)]
 
         self.blocks_ = []
         for col in range(self.n_cont_):
@@ -1728,10 +1772,12 @@ class FESplineModelNuisance(NPModel):
             lam = self.penalty_grid[len(self.penalty_grid) // 2]
         params = self._fit_penalized(D, codes, y, w, lam)
 
-        # Center each FE dimension on its weighted mean so unseen levels map to the average level
+        # Center each FE dimension on its weighted mean so unseen levels map to the average level;
+        # levels without positive-weight training rows were never fitted and are set to exactly 0
         for k, c in enumerate(codes.T):
+            seen = np.bincount(c, weights=w, minlength=len(params[2 + k])) > 0
             shift = float(np.average(params[2 + k][c], weights=w))
-            params[2 + k] = params[2 + k] - shift
+            params[2 + k] = np.where(seen, params[2 + k] - shift, 0.0)
             params[0] = params[0] + shift
         self.params_ = params
         self.penalty_value_ = lam
@@ -1740,7 +1786,7 @@ class FESplineModelNuisance(NPModel):
         train_loss = self._loss(D, codes, y, w, params)
         if verbose:
             n_spline = sum(kind == "spline" for kind, _, _ in self.blocks_)
-            print(f"[FESplineNuisance] n={n}, spline_cols={n_spline}, linear_cols={len(self.blocks_) - n_spline}, "
+            print(f"[FESplineNuisance] n={n}, link={self.link}, spline_cols={n_spline}, linear_cols={len(self.blocks_) - n_spline}, "
                   f"fe_levels={self.cardinalities_}, penalty={lam:g}, loss={train_loss:.6g}")
         return FESplineModelNuisanceResults(self, penalty=lam, train_loss=train_loss,
                                             validation_losses=val_losses)
@@ -1759,7 +1805,7 @@ class FESplineModelNuisanceResults(NPModelResultsNuisance):
 
     def predict(self, X):
         eta, _ = self._eta(X)
-        return np.exp(eta) if self._spline.positive_log_link else eta
+        return self._spline._mean(eta)[0]
 
     def derivative(self, X, var_index):
         """
@@ -1773,7 +1819,5 @@ class FESplineModelNuisanceResults(NPModelResultsNuisance):
             if not 0 <= j < self._spline.n_cont_:
                 raise ValueError(f"Column {j} is a fixed-effect code; derivatives are not defined")
             grads[:, out_col] = self._spline._design(cont, derivative_col=j) @ self._spline.params_[1]
-        if self._spline.positive_log_link:
-            pred = np.exp(eta)
-            return pred, pred[:, None] * grads
-        return eta, grads
+        pred, dmean = self._spline._mean(eta)
+        return pred, dmean[:, None] * grads

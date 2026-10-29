@@ -12,6 +12,8 @@ implementation below follows the binary-treatment score in the same paper.
 from __future__ import annotations
 
 import warnings
+import zlib
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from itertools import combinations
@@ -33,6 +35,60 @@ from .utils import _apply_fixed_effects, _initialize_fixed_effects
 Array = npt.NDArray[np.float64]
 Policy = Callable[[Array], npt.ArrayLike]
 Target = tuple[float, float]
+
+
+def _validate_seed(seed: Any) -> int | None:
+    if seed is None:
+        return None
+    if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)) or seed < 0:
+        raise ValueError("seed must be None or a non-negative integer")
+    return int(seed)
+
+
+def _derived_seed(seed: int | None, *key: Any) -> int | None:
+    """Child seed for one randomized step, e.g. ``("folds",)`` or ``(fold, "m", phi)``.
+
+    Seeds depend only on ``seed`` and the key, not on the order of the fits.
+    """
+    if seed is None:
+        return None
+    words = [zlib.crc32(repr(part).encode()) for part in key]
+    return int(np.random.SeedSequence([seed, *words]).generate_state(1)[0])
+
+
+@contextmanager
+def _seeded_rng(seed: int | None):
+    """Run one nuisance fit on fixed torch and numpy random streams.
+
+    Weight initialization, validation splits, shuffling and dropout all draw
+    from ``seed``, and deterministic torch kernels are requested (warn-only) so
+    GPU runs repeat as well. The global generators and torch flags are restored
+    on exit. ``seed=None`` leaves everything untouched.
+    """
+    if seed is None:
+        yield
+        return
+    import os
+    import torch
+
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # deterministic cuBLAS
+    numpy_state = np.random.get_state()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    cudnn = torch.backends.cudnn
+    cudnn_flags = (cudnn.deterministic, cudnn.benchmark)
+    devices = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+    with torch.random.fork_rng(devices=devices):
+        torch.manual_seed(seed)
+        np.random.seed(seed % 2**32)
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        cudnn.deterministic, cudnn.benchmark = True, False
+        try:
+            yield
+        finally:
+            np.random.set_state(numpy_state)
+            torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+            cudnn.deterministic, cudnn.benchmark = cudnn_flags
 
 
 def fixed_effect_group_report(
@@ -729,8 +785,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         psi: float = 0.0,
         h: Policy | None = None,
         h_derivative: Policy | None = None,
+        seed: int | None = None,
         **kwargs: Any,
     ) -> None:
+        self.seed = _validate_seed(seed)
         self.phi = self._finite_scalar(phi, "phi")
         self.psi = self._finite_scalar(psi, "psi")
         self.h = h
@@ -824,6 +882,8 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         if target_phi != 0.0:
             parsed["arch_params"].setdefault("positive_log_link", True)
             parsed["arch_params"].setdefault("log_link_max_abs", 3.0)
+        for key, value in self._fe_code_arch_params().items():
+            parsed["arch_params"].setdefault(key, value)
         return parsed
 
     def _prepare_density_params(
@@ -849,6 +909,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         ):
             raise ValueError("score_method='partial_out' requires continuous interest variables")
         parsed = self._parse_density_params(supplied or None)
+        if options["score_method"] == "network":
+            shared = parsed["arch_params"].setdefault("shared", {})
+            for key, value in self._fe_code_arch_params().items():
+                shared.setdefault(key, value)
         parsed["score_options"] = options
         return model_class, parsed
 
@@ -1089,6 +1153,10 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             fe_test += np.where(seen, values[position], fallback)
         return fe_test
 
+    def _nuisance_seed(self, *component: Any) -> int | None:
+        """Seed of one nuisance fit in the current fold (``None`` without ``seed``)."""
+        return _derived_seed(self.seed, getattr(self, "_fold_number", 0), *component)
+
     def _sample_weight_kwargs(self, rows: npt.NDArray[np.int64]) -> dict[str, Any]:
         """``{"sample_weight": weights[rows]}`` when the model is weighted and
         ``weighted_nuisance`` is on, else ``{}`` (so unweighted fits and custom
@@ -1321,29 +1389,31 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 score_train = np.column_stack([score_train, self.exog[train_idx][:, controls]])
                 score_test = np.column_stack([score_test, x_test[:, controls]])
             score_types = {j: "continuous" for j in range(score_train.shape[1])}
-            density_model = density_model_class(
-                variable_types=score_types, **density_params["arch_params"]
-            )
-            density_results = density_model.fit(
-                score_train,
-                interest=list(range(k_interest)),
-                **density_params["fit_params"],
-                **self._sample_weight_kwargs(train_idx),
-            )
+            with _seeded_rng(self._nuisance_seed("score")):
+                density_model = density_model_class(
+                    variable_types=score_types, **density_params["arch_params"]
+                )
+                density_results = density_model.fit(
+                    score_train,
+                    interest=list(range(k_interest)),
+                    **density_params["fit_params"],
+                    **self._sample_weight_kwargs(train_idx),
+                )
             density_score = np.asarray(
                 density_results.alpha_weight(score_test, list(range(k_interest))),
                 dtype=np.float64,
             )
         else:
-            density_model = density_model_class(
-                variable_types=self.variable_types, **density_params["arch_params"]
-            )
-            density_results = density_model.fit(
-                x_aug_train,
-                interest=interest_indices,
-                **density_params["fit_params"],
-                **self._sample_weight_kwargs(train_idx),
-            )
+            with _seeded_rng(self._nuisance_seed("score")):
+                density_model = density_model_class(
+                    variable_types=self.variable_types, **density_params["arch_params"]
+                )
+                density_results = density_model.fit(
+                    x_aug_train,
+                    interest=interest_indices,
+                    **density_params["fit_params"],
+                    **self._sample_weight_kwargs(train_idx),
+                )
             density_score = np.asarray(
                 density_results.alpha_weight(x_aug_test, interest_indices), dtype=np.float64
             )
@@ -1417,15 +1487,16 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 )
 
         m_model_class = m_params.get("model_class", NNModelNuisance)
-        m_model = m_model_class(
-            variable_types=self.variable_types, **m_params["arch_params"]
-        )
-        m_results = m_model.fit(
-            x_aug_train,
-            nuisance_target,
-            **m_params["fit_params"],
-            **self._sample_weight_kwargs(common["train_idx"]),
-        )
+        with _seeded_rng(self._nuisance_seed("m", float(phi))):
+            m_model = m_model_class(
+                variable_types=self.variable_types, **m_params["arch_params"]
+            )
+            m_results = m_model.fit(
+                x_aug_train,
+                nuisance_target,
+                **m_params["fit_params"],
+                **self._sample_weight_kwargs(common["train_idx"]),
+            )
         m_hat, m_prime = m_results.derivative(
             self.exog_augmented[test_idx], interest_indices
         )
@@ -1627,10 +1698,13 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         density_model_class, density_config = self._prepare_density_params(density_params)
         _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
         self._weighted_nuisance = bool(weighted_nuisance)
+        if random_state is None:
+            random_state = _derived_seed(self.seed, "folds")
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
         for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
+            self._fold_number = fold_number
             weight_fold = np.ones(self.nobs, dtype=np.float64)
             if n_folds > 1:
                 weight_fold[test_idx] = 1e-10
@@ -1834,10 +1908,13 @@ class JointGeneralizedDREAM(GeneralizedDREAM):
         )
         _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
         self._weighted_nuisance = bool(weighted_nuisance)
+        if random_state is None:
+            random_state = _derived_seed(self.seed, "folds")
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
         for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
+            self._fold_number = fold_number
             weight_fold = np.ones(self.nobs, dtype=np.float64)
             if n_folds > 1:
                 weight_fold[test_idx] = 1e-10
@@ -2072,8 +2149,10 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         phi: float = 1.0,
         psi: float = 1.0,
         propensity_clip: float = 0.01,
+        seed: int | None = None,
         **kwargs: Any,
     ) -> None:
+        self.seed = _validate_seed(seed)
         if treatment is not None and interest is not None:
             raise ValueError("Supply treatment or interest, not both")
         selected_treatment = treatment if treatment is not None else interest
@@ -2173,6 +2252,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         if self.phi != 0.0:
             parsed["arch_params"].setdefault("positive_log_link", True)
             parsed["arch_params"].setdefault("log_link_max_abs", 3.0)
+        for key, value in self._fe_code_arch_params().items():
+            parsed["arch_params"].setdefault(key, value)
         return parsed
 
     def _prepare_propensity_params(
@@ -2193,6 +2274,8 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             parsed["arch_params"]["output_activation"] = "sigmoid"
         parsed["arch_params"].pop("positive_log_link", None)
         parsed["arch_params"].pop("positive_floor", None)
+        for key, value in self._fe_code_arch_params().items():
+            parsed["arch_params"].setdefault(key, value)
         return parsed
 
     def _make_splits(
@@ -2287,16 +2370,17 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
             arm_train = d_train == arm
             if not np.any(arm_train):
                 raise ValueError(f"Treatment arm {arm} is absent from a training fold")
-            m_model = m_model_class(
-                variable_types=self.variable_types,
-                **m_params["arch_params"],
-            )
-            m_result = m_model.fit(
-                x_aug_train[arm_train],
-                nuisance_target[arm_train],
-                **m_params["fit_params"],
-                **self._sample_weight_kwargs(train_idx[arm_train]),
-            )
+            with _seeded_rng(GeneralizedDREAM._nuisance_seed(self, "m", int(arm))):
+                m_model = m_model_class(
+                    variable_types=self.variable_types,
+                    **m_params["arch_params"],
+                )
+                m_result = m_model.fit(
+                    x_aug_train[arm_train],
+                    nuisance_target[arm_train],
+                    **m_params["fit_params"],
+                    **self._sample_weight_kwargs(train_idx[arm_train]),
+                )
             qd_aug_test = x_aug_test.copy()
             qd_aug_test[:, self.treatment_index] = float(arm)
             m_hat = self._coerce_prediction(
@@ -2330,22 +2414,23 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         propensity_model_class = propensity_params.get(
             "model_class", NNModelNuisance
         )
-        propensity_model = propensity_model_class(
-            variable_types=self.variable_types,
-            **propensity_params["arch_params"],
-        )
         # The treatment column is fixed before fitting and predicting so the
         # propensity model only receives W (plus any encoded fixed effects).
         w_aug_train = x_aug_train.copy()
         w_aug_test = x_aug_test.copy()
         w_aug_train[:, self.treatment_index] = 0.0
         w_aug_test[:, self.treatment_index] = 0.0
-        propensity_results = propensity_model.fit(
-            w_aug_train,
-            d_train.astype(np.float64),
-            **propensity_params["fit_params"],
-            **self._sample_weight_kwargs(train_idx),
-        )
+        with _seeded_rng(GeneralizedDREAM._nuisance_seed(self, "propensity")):
+            propensity_model = propensity_model_class(
+                variable_types=self.variable_types,
+                **propensity_params["arch_params"],
+            )
+            propensity_results = propensity_model.fit(
+                w_aug_train,
+                d_train.astype(np.float64),
+                **propensity_params["fit_params"],
+                **self._sample_weight_kwargs(train_idx),
+            )
         propensity_raw = self._coerce_prediction(
             propensity_results.predict(w_aug_test),
             len(test_idx),
@@ -2538,10 +2623,13 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         propensity_config = self._prepare_propensity_params(propensity_params)
         _check_fixed_effect_groups(self, min_fe_group_size, small_fe_groups, max_small_fe_share)
         self._weighted_nuisance = bool(weighted_nuisance)
+        if random_state is None:
+            random_state = _derived_seed(self.seed, "folds")
         splits = self._make_splits(n_folds, random_state)
 
         fold_results: list[dict[str, Any]] = []
         for fold_number, (train_idx, test_idx) in enumerate(splits, start=1):
+            self._fold_number = fold_number
             weight_fold = np.ones(self.nobs, dtype=np.float64)
             if n_folds > 1:
                 weight_fold[test_idx] = 1e-10

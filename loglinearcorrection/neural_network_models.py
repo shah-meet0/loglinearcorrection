@@ -99,7 +99,7 @@ class FeedForwardNNModel(nn.Module):
 class EmbeddingFeedForwardNNModel(nn.Module):
     """MLP with learned embeddings for trailing categorical input columns.
 
-    The first ``continuous_input_size`` columns remain differentiable floating
+    The first ``non_fe_inputs`` columns remain differentiable floating
     point inputs.  Each remaining column is a zero-based category code.  This
     representation is particularly useful for high-dimensional fixed effects:
     it avoids allocating an ``nobs`` by ``n_levels`` dense dummy matrix while
@@ -108,7 +108,7 @@ class EmbeddingFeedForwardNNModel(nn.Module):
 
     def __init__(self, config: dict):
         super().__init__()
-        self.continuous_input_size = int(config["continuous_input_size"])
+        self.non_fe_inputs = int(config["non_fe_inputs"])
         cardinalities = [int(value) for value in config["categorical_cardinalities"]]
         if any(value < 1 for value in cardinalities):
             raise ValueError("categorical cardinalities must be positive")
@@ -123,12 +123,12 @@ class EmbeddingFeedForwardNNModel(nn.Module):
             nn.init.normal_(embedding.weight, mean=0.0, std=0.05)
 
         mlp_config = dict(config)
-        mlp_config["input_size"] = self.continuous_input_size + sum(dimensions)
+        mlp_config["input_size"] = self.non_fe_inputs + sum(dimensions)
         self.mlp = FeedForwardNNModel(mlp_config)
 
     def forward(self, x):
-        continuous = x[:, : self.continuous_input_size]
-        categorical = x[:, self.continuous_input_size :]
+        continuous = x[:, : self.non_fe_inputs]
+        categorical = x[:, self.non_fe_inputs :]
         if categorical.shape[1] != len(self.embeddings):
             raise ValueError(
                 f"Expected {len(self.embeddings)} categorical columns; "

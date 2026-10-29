@@ -30,6 +30,7 @@ class DoublyRobustElasticityEstimatorModel:
             interest: list[str] | list[int] | None = None,
             ordinal: list[str] | list[int] | None = None,
             fe_encoding: str = "onehot",
+            nuisance_fixed_effects: list[str] | list[int] | int | None = None,
             **kwargs
     ) -> None:
         """
@@ -64,6 +65,15 @@ class DoublyRobustElasticityEstimatorModel:
             ``'codes'`` keeps one zero-based category-code column per fixed
             effect and is intended for embedding-aware neural models. The
             default preserves the original dense one-hot behavior.
+        nuisance_fixed_effects : list or int, optional
+            Which fixed effects also enter the nuisance inputs. Every fixed
+            effect is always absorbed additively in the linear part. ``None``
+            (default) passes all of them to the nuisance models; a list passes
+            only that subset of ``fixed_effects``; an integer ``k`` passes all
+            of them but pools the levels with fewer than ``k`` rows into one
+            shared level, so those small groups enter only additively. A fixed
+            effect whose levels are all pooled is left out of the nuisance
+            inputs. ``model.nuisance_fe_report`` summarizes the result.
         **kwargs
             Additional keyword arguments (reserved for future use).
 
@@ -159,6 +169,7 @@ class DoublyRobustElasticityEstimatorModel:
         if fixed_effects is None:
             non_fe_indices = list(range(self.exog.shape[1]))
             self.fe_indices = []
+            self.fe_names = []
             self.fixed_effects = None
             self.fe_cols = None
         else:
@@ -168,6 +179,7 @@ class DoublyRobustElasticityEstimatorModel:
                 fe_indices = list(set(fixed_effects))
 
             self.fe_indices = fe_indices
+            self.fe_names = [self.exog_names[i] for i in fe_indices]
             self.fe_cols = self.exog[:, fe_indices]
             self.fixed_effects = _initialize_fixed_effects(self.exog[:, fe_indices])
             non_fe_indices = [i for i in range(self.exog.shape[1]) if i not in fe_indices]
@@ -198,17 +210,14 @@ class DoublyRobustElasticityEstimatorModel:
             self.ols_res = sm.WLS(endog_demeaned, exog_demeaned, weights=self.weights if self.weights else 1).fit()
             self.beta = self.ols_res.params
 
-            if self.fe_encoding == "codes":
-                encoded_columns = []
-                for column in range(self.fe_cols.shape[1]):
-                    codes, levels = pd.factorize(self.fe_cols[:, column], sort=True)
-                    if np.any(codes < 0):
-                        raise ValueError("fixed effects must not contain missing values")
-                    encoded_columns.append(codes.astype(np.float64))
-                    self.fe_cardinalities.append(len(levels))
-                self.fe_onehot = np.column_stack(encoded_columns)
+            nuisance_codes = self._nuisance_fe_codes(nuisance_fixed_effects)
+            if not nuisance_codes:
+                self.fe_onehot = np.zeros((self.nobs, 0))
+            elif self.fe_encoding == "codes":
+                self.fe_cardinalities = [int(codes.max()) + 1 for codes in nuisance_codes]
+                self.fe_onehot = np.column_stack(nuisance_codes).astype(np.float64)
             else:
-                self.fe_onehot = _one_hot_encode_fe(self.fe_cols)
+                self.fe_onehot = _one_hot_encode_fe(np.column_stack(nuisance_codes))
             self.exog_augmented = np.column_stack([self.exog, self.fe_onehot])
             # Composite FE label for stratified CV
             self.fe_labels = np.array([
@@ -217,10 +226,14 @@ class DoublyRobustElasticityEstimatorModel:
         else:
             self.ols_res = sm.WLS(np.log(self.endog), self.exog, weights=self.weights if self.weights else 1).fit()
             self.beta = self.ols_res.params
+            if nuisance_fixed_effects is not None and not isinstance(nuisance_fixed_effects, (int, np.integer)):
+                if len(list(np.atleast_1d(nuisance_fixed_effects))) > 0:
+                    raise ValueError("nuisance_fixed_effects requires fixed_effects")
+            self.nuisance_fe_report = None
             self.exog_augmented = self.exog
             self.fe_labels = None
 
-        self.continuous_input_size = self.exog.shape[1]
+        self.non_fe_inputs = self.exog.shape[1]
 
         # Detect variable types for interest variables
         self.variable_types = _detect_variable_types(
@@ -524,6 +537,62 @@ class DoublyRobustElasticityEstimatorModel:
         results.compute_variances()
 
         return results
+
+    def _nuisance_fe_codes(self, nuisance_fixed_effects) -> list[npt.NDArray[np.int64]]:
+        """Zero-based codes of the fixed effects that enter the nuisance inputs
+        (see ``nuisance_fixed_effects``); also sets ``self.nuisance_fe_report``."""
+        min_rows = 0
+        if nuisance_fixed_effects is None:
+            keep = list(range(self.fe_cols.shape[1]))
+        elif isinstance(nuisance_fixed_effects, (int, np.integer)) and not isinstance(nuisance_fixed_effects, bool):
+            if nuisance_fixed_effects < 1:
+                raise ValueError("an integer nuisance_fixed_effects must be at least 1")
+            keep = list(range(self.fe_cols.shape[1]))
+            min_rows = int(nuisance_fixed_effects)
+        else:
+            keep = []
+            for item in np.atleast_1d(np.asarray(nuisance_fixed_effects, dtype=object)).tolist():
+                if isinstance(item, str) and item in self.fe_names:
+                    position = self.fe_names.index(item)
+                elif isinstance(item, (int, np.integer)) and not isinstance(item, bool) and item in self.fe_indices:
+                    position = self.fe_indices.index(int(item))
+                else:
+                    raise ValueError(f"nuisance_fixed_effects entry {item!r} is not one of the fixed_effects")
+                if position not in keep:
+                    keep.append(position)
+
+        codes_out, rows = [], []
+        for j in range(self.fe_cols.shape[1]):
+            codes = pd.factorize(self.fe_cols[:, j], sort=True)[0]
+            if np.any(codes < 0):
+                raise ValueError("fixed effects must not contain missing values")
+            counts = np.bincount(codes)
+            small = counts < min_rows
+            in_nuisance = j in keep and not small.all()
+            if in_nuisance and small.any():
+                # Levels with fewer than min_rows rows share one pooled level after the large ones
+                relabel = np.cumsum(~small) - 1
+                relabel[small] = int((~small).sum())
+                codes = relabel[codes]
+            rows.append({
+                "fixed_effect": self.fe_names[j],
+                "levels": len(counts),
+                "in_nuisance": in_nuisance,
+                "pooled_levels": int(small.sum()) if j in keep else 0,
+                "rows_pooled": int(counts[small].sum()) if j in keep else 0,
+            })
+            if in_nuisance:
+                codes_out.append(codes)
+        self.nuisance_fe_report = pd.DataFrame(rows)
+        return codes_out
+
+    def _fe_code_arch_params(self) -> dict:
+        """Nuisance input layout when fixed effects are passed as codes: the first
+        ``non_fe_inputs`` columns are regressors, each later column one FE's codes."""
+        if self.fe_encoding != "codes" or not self.fe_cardinalities:
+            return {}
+        return {"non_fe_inputs": self.non_fe_inputs,
+                "categorical_cardinalities": list(self.fe_cardinalities)}
 
     def _parse_m_params(self, m_params):
         if m_params is None:
