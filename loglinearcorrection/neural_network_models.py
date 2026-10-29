@@ -28,7 +28,7 @@ class FeedForwardNNModel(nn.Module):
           - input_size : int > 0
           - hidden_layers : list[int]
           - output_size : int > 0
-          - activation : {'relu','tanh','sigmoid','leaky_relu'}
+          - activation : {'relu','tanh','sigmoid','leaky_relu','silu'}
           - output_activation : {'identity','relu','tanh','sigmoid','softmax','log_softmax'}
           - dropout : float in [0,1)
           - bias : bool
@@ -44,6 +44,7 @@ class FeedForwardNNModel(nn.Module):
             "tanh": nn.Tanh,
             "sigmoid": nn.Sigmoid,
             "leaky_relu": nn.LeakyReLU,
+            "silu": nn.SiLU,
             "softplus": nn.Softplus,
             "identity": nn.Identity,
             "softmax": lambda: nn.Softmax(dim=1),
@@ -149,22 +150,6 @@ def build_feed_forward_model(config: dict) -> nn.Module:
     else:
         model = FeedForwardNNModel(config)
 
-    reference_indices = config.get("gaussian_reference_indices")
-    if reference_indices is not None:
-        # Start exactly at the standardized Gaussian score.  Only the residual
-        # output layer is zeroed; the randomly initialized hidden representation
-        # remains trainable and breaks symmetry as usual.
-        output_layer = None
-        for module in model.modules():
-            if isinstance(module, nn.Linear):
-                output_layer = module
-        if output_layer is None:
-            raise ValueError("Could not find the score network output layer")
-        nn.init.zeros_(output_layer.weight)
-        if output_layer.bias is not None:
-            nn.init.zeros_(output_layer.bias)
-        model = GaussianReferenceScoreModel(model, reference_indices)
-
     if config.get("positive_log_link", False):
         output_layer = None
         for module in model.modules():
@@ -183,23 +168,6 @@ def build_feed_forward_model(config: dict) -> nn.Module:
     if positive_floor is not None:
         model = PositiveFloorModel(model, float(positive_floor))
     return model
-
-
-class GaussianReferenceScoreModel(nn.Module):
-    """A residual score network around a standard-normal reference score."""
-
-    def __init__(self, residual_model: nn.Module, interest_indices):
-        super().__init__()
-        self.residual_model = residual_model
-        self.register_buffer(
-            "interest_indices",
-            torch.as_tensor(list(interest_indices), dtype=torch.long),
-        )
-
-    def forward(self, x):
-        if self.interest_indices.numel() == 0:
-            return self.residual_model(x)
-        return self.residual_model(x) - x.index_select(1, self.interest_indices)
 
 
 class PositiveFloorModel(nn.Module):

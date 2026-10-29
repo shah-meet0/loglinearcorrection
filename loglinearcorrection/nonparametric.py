@@ -174,7 +174,7 @@ class NNModel(NPModel):
             - output_size : int > 0
 
         Optional keys with defaults:
-            - activation : str in {'relu','tanh','sigmoid','leaky_relu'}            [default: 'relu']
+            - activation : str in {'relu','tanh','sigmoid','leaky_relu','silu'}     [default: 'silu']
             - output_activation : str or None in {'identity','relu','tanh','sigmoid','softmax','log_softmax'}  [default: 'identity']
             - learning_rate : float > 0                                            [default: 1e-3]
             - dropout : float in [0,1)                                             [default: 0.0]
@@ -196,7 +196,7 @@ class NNModel(NPModel):
             raise ValueError("self.params must be a dictionary of hyperparameters")
 
         defaults = {
-            "activation": "relu",
+            "activation": "silu",
             "output_activation": "identity",
             "learning_rate": 1e-3,
             "dropout": 0.0,
@@ -222,7 +222,7 @@ class NNModel(NPModel):
                 isinstance(n, int) and n > 0 for n in parsed["hidden_layers"]):
             raise ValueError("hidden_layers must be a list of positive integers")
 
-        if parsed["activation"] not in {"relu", "tanh", "sigmoid", "leaky_relu"}:
+        if parsed["activation"] not in {"relu", "tanh", "sigmoid", "leaky_relu", "silu"}:
             raise ValueError("Unsupported activation function")
 
         if parsed["output_activation"] not in {"identity", "softplus", "relu", "tanh", "sigmoid", "softmax", "log_softmax"}:
@@ -566,7 +566,7 @@ class NNModelDensity(NNModel):
 
         shared_defaults = {
             "hidden_layers": [1024, 1024, 1024, 1024, 1024],
-            "activation": "leaky_relu",
+            "activation": "silu",
             "output_activation": "identity",
             "dropout": 0.3,
             "bias": True,
@@ -585,7 +585,7 @@ class NNModelDensity(NNModel):
             hl = cfg.get("hidden_layers")
             if not (isinstance(hl, list) and all(isinstance(n, int) and n > 0 for n in hl)):
                 raise ValueError(f"{name}.hidden_layers must be list of positive ints")
-            if cfg["activation"] not in {"relu", "tanh", "sigmoid", "leaky_relu"}:
+            if cfg["activation"] not in {"relu", "tanh", "sigmoid", "leaky_relu", "silu"}:
                 raise ValueError(f"{name}.activation invalid")
             if cfg["output_activation"] not in {"identity","relu","tanh","sigmoid","softmax","log_softmax"}:
                 raise ValueError(f"{name}.output_activation invalid")
@@ -721,19 +721,16 @@ class NNModelDensity(NNModel):
         # model
         # DROPOUT HAS TO BE 0 FOR SCORE.
         cfg = {**arch_cfg, **dims}
-        if cfg.get("gaussian_reference", False):
-            cfg["gaussian_reference_indices"] = interest_idx
         if cfg['dropout'] > 0.0 and cfg['output_size'] > 1:
             cfg['dropout'] = 0.0
             print('Warning: Dropout in score model biases results with multiple continuous interest, setting to 0.0.')
         model = build_feed_forward_model(cfg).to(device)
 
-        # Fit the score of the standardized interest coordinates z = (x - center) / scale.
-        # The Gaussian reference (-z) assumes standardized inputs; alpha_weight maps
-        # back with d log f / dx = (d log f / dz) / scale.
+        # Fit the score of the standardized interest coordinates z = (x - center) / scale
+        # for numerical conditioning; alpha_weight maps back with
+        # d log f / dx = (d log f / dz) / scale.
         X = np.array(X, dtype=np.float64)
-        # Weighted moments when sample weights are given, so the Gaussian
-        # reference is centred on the weighted distribution
+        # Weighted moments when sample weights are given
         w_std = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64).reshape(-1)
         center = np.average(X[:, interest_idx], axis=0, weights=w_std)
         scale = np.sqrt(np.average((X[:, interest_idx] - center) ** 2, axis=0, weights=w_std))
@@ -842,23 +839,6 @@ class NNModelDensity(NNModel):
                         moment_sum[out_j, 1] += (wd * (coordinate * score + 1.0)).sum()
             means = moment_sum / max(va_cnt, 1)
             return va_sum / max(va_cnt, 1), float(means.abs().max().cpu())
-
-        # The Gaussian-reference initialization is already a useful, stable
-        # score.  Treat it as epoch zero so later Hyvarinen improvements cannot
-        # replace it with an empirically unbounded, Stein-violating solution.
-        if dl_va is not None and stein_threshold is not None:
-            model.eval()
-            initial_loss, initial_core = validation_metrics()
-            fallback_core_stein = initial_core
-            fallback_state = {
-                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-            }
-            if initial_core <= stein_threshold:
-                best_loss = initial_loss
-                best_core_stein = initial_core
-                best_state = {
-                    k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-                }
 
         for ep in range(1, epochs + 1):
             # ---- train
@@ -1527,3 +1507,273 @@ class SplineModelNuisanceResults(NPModelResultsNuisance):
             Xm[:, j] -= h
             grads[:, out_col] = (self._spline._predict(Xp) - self._spline._predict(Xm)) / (2.0 * h)
         return preds, grads
+
+
+class FESplineModelNuisance(NPModel):
+    """
+    Additive penalized-spline nuisance model with high-dimensional fixed effects.
+
+        eta(x) = c + sum_j f_j(x_j) + sum_l b_l x_l + sum_k alpha_k[g_k]
+        m(x)   = eta(x)          (least squares; default, e.g. phi = 0)
+        m(x)   = exp(eta(x))     (positive_log_link=True: Poisson, log link; phi != 0)
+
+    Continuous columns get a cubic B-spline f_j with quantile knots and a
+    second-difference penalty; outside the training range f_j is extended
+    linearly, so derivatives do not vanish in the tails. Columns with few
+    distinct values (binaries, ordinals, one-hot dummies) enter linearly.
+    Fixed effects are supplied as zero-based integer codes in the trailing
+    columns (fe_encoding='codes') and get one unpenalized scalar per level
+    and FE dimension, as in HDFE regression, so the cost does not depend on a
+    dense dummy matrix. The objective is convex in (c, f, b, alpha) and is
+    minimized by full-batch L-BFGS. The penalty is chosen from
+    ``penalty_grid`` on a random holdout of ``val_frac`` rows, then the model
+    is refit on all rows.
+
+    The model is additive: there are no interactions between covariates and
+    no FE-specific slopes, so the derivative in x_j does not depend on the
+    fixed effects.
+
+    Parameters
+    ----------
+    variable_types : dict
+        Map {col_index: 'continuous'|'binary'|'ordinal'} for interest columns.
+        Columns typed 'binary' or 'ordinal' enter linearly.
+    continuous_input_size : int, optional
+        Number of leading covariate columns; the remaining columns are FE codes.
+        Defaults to all columns (no FE codes).
+    positive_log_link : bool
+        Fit E[y | x] = exp(eta) by Poisson quasi-likelihood (requires y >= 0).
+    degree : int
+        B-spline degree (default cubic).
+    n_knots : int
+        Number of interior knots per continuous column.
+    penalty_grid : sequence of float
+        Candidate smoothing penalties.
+    val_frac : float
+        Holdout share used to choose the penalty.
+    max_iter : int
+        L-BFGS iterations per fit.
+    **params
+        Other architecture keys (e.g. neural ``hidden_layers``) are accepted
+        and ignored so the class is a drop-in ``model_class``.
+    """
+
+    def __init__(self, variable_types, continuous_input_size=None, positive_log_link: bool = False,
+                 degree: int = 3, n_knots: int = 10, penalty_grid=tuple(10.0 ** np.arange(-6, 2)),
+                 val_frac: float = 0.2, max_iter: int = 1000, **params):
+        super().__init__(variable_types, **params)
+        self.continuous_input_size = continuous_input_size
+        self.positive_log_link = bool(positive_log_link)
+        self.degree = int(degree)
+        self.n_knots = int(n_knots)
+        self.penalty_grid = tuple(float(p) for p in penalty_grid)
+        self.val_frac = float(val_frac)
+        self.max_iter = int(max_iter)
+        if self.degree < 1 or self.n_knots < 1:
+            raise ValueError("degree and n_knots must be positive")
+        if not self.penalty_grid or min(self.penalty_grid) < 0:
+            raise ValueError("penalty_grid must contain non-negative values")
+        if not 0.0 <= self.val_frac < 1.0:
+            raise ValueError("val_frac must be in [0, 1)")
+
+    def _make_spline_spec(self, x):
+        from scipy.interpolate import BSpline
+        lo, hi = float(np.min(x)), float(np.max(x))
+        interior = np.unique(np.quantile(x, np.linspace(0, 1, self.n_knots + 2)[1:-1]))
+        interior = interior[(interior > lo) & (interior < hi)]
+        deg = self.degree
+        t = np.concatenate([[lo] * (deg + 1), interior, [hi] * (deg + 1)])
+        n_basis = len(t) - deg - 1
+        basis = BSpline(t, np.eye(n_basis), deg)
+        return {"basis": basis, "dbasis": basis.derivative(), "lo": lo, "hi": hi, "n_basis": n_basis}
+
+    @staticmethod
+    def _spline_block(x, spec, derivative=False):
+        # Linear extension beyond [lo, hi]; first basis column dropped (sum-to-one with the intercept)
+        xc = np.clip(x, spec["lo"], spec["hi"])
+        dB = spec["dbasis"](xc)
+        if derivative:
+            return dB[:, 1:]
+        return (spec["basis"](xc) + (x - xc)[:, None] * dB)[:, 1:]
+
+    def _design(self, cont, derivative_col=None):
+        n = cont.shape[0]
+        blocks = []
+        for kind, col, spec in self.blocks_:
+            if derivative_col is None:
+                if kind == "spline":
+                    blocks.append(self._spline_block(cont[:, col], spec))
+                else:
+                    blocks.append(((cont[:, col] - spec["mean"]) / spec["scale"])[:, None])
+            elif col != derivative_col:
+                blocks.append(np.zeros((n, spec["n_basis"] - 1 if kind == "spline" else 1)))
+            elif kind == "spline":
+                blocks.append(self._spline_block(cont[:, col], spec, derivative=True))
+            else:
+                blocks.append(np.full((n, 1), 1.0 / spec["scale"]))
+        return np.column_stack(blocks) if blocks else np.zeros((n, 0))
+
+    def _split(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.shape[1] != self.n_columns_:
+            raise ValueError(f"Expected a 2-D array with {self.n_columns_} columns")
+        codes = np.rint(X[:, self.n_cont_:]).astype(np.int64)
+        return X[:, :self.n_cont_], codes
+
+    def _fit_penalized(self, D, codes, y, w, lam):
+        import torch
+        Dt = torch.as_tensor(D, dtype=torch.float64)
+        yt = torch.as_tensor(y, dtype=torch.float64)
+        wt = torch.as_tensor(w / w.mean(), dtype=torch.float64)
+        Pt = torch.as_tensor(self.penalty_, dtype=torch.float64)
+        ct = [torch.as_tensor(c, dtype=torch.long) for c in codes.T]
+        c0 = np.average(y, weights=w)
+        c0 = float(np.log(max(c0, 1e-12))) if self.positive_log_link else float(c0)
+        params = [torch.tensor([c0], dtype=torch.float64), torch.zeros(D.shape[1], dtype=torch.float64)]
+        params += [torch.zeros(k, dtype=torch.float64) for k in self.cardinalities_]
+        for p in params:
+            p.requires_grad_(True)
+        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=self.max_iter, tolerance_grad=1e-10,
+                                tolerance_change=1e-14, history_size=50, line_search_fn="strong_wolfe")
+
+        def closure():
+            opt.zero_grad()
+            eta = params[0] + Dt @ params[1]
+            for alpha, c in zip(params[2:], ct):
+                eta = eta + alpha[c]
+            if self.positive_log_link:
+                loss = torch.mean(wt * (torch.exp(eta) - yt * eta))
+            else:
+                loss = 0.5 * torch.mean(wt * (yt - eta) ** 2)
+            loss = loss + lam * (params[1] @ Pt @ params[1])
+            # Tiny ridge pins the directions the intercept, dummies and FE levels share
+            loss = loss + 1e-8 * ((params[1] ** 2).sum() + sum((a ** 2).sum() for a in params[2:]))
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        return [p.detach().numpy().copy() for p in params]
+
+    def _eta(self, D, codes, params):
+        eta = params[0][0] + D @ params[1]
+        for alpha, c, k in zip(params[2:], codes.T, self.cardinalities_):
+            seen = (c >= 0) & (c < k)
+            eta = eta + np.where(seen, alpha[np.clip(c, 0, k - 1)], 0.0)  # unseen level -> average level
+        return eta
+
+    def _loss(self, D, codes, y, w, params):
+        eta = self._eta(D, codes, params)
+        if self.positive_log_link:
+            return float(np.average(np.exp(np.clip(eta, -50, 50)) - y * eta, weights=w))
+        return float(np.average((y - eta) ** 2, weights=w))
+
+    def fit(self, X, y, *, sample_weight=None, verbose: bool = False, random_state: int = 0, **fit_params):
+        """Fit the penalized additive model; NN-style fit kwargs (epochs, ...) are ignored."""
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).ravel()
+        if X.ndim != 2 or X.shape[0] != y.shape[0]:
+            raise ValueError("X must be 2-D with one row per element of y")
+        n, d = X.shape
+        if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
+            raise ValueError("X and y must be finite")
+        if self.positive_log_link and np.any(y < 0):
+            raise ValueError("positive_log_link requires a non-negative target")
+        if sample_weight is None:
+            w = np.ones(n)
+        else:
+            w = np.asarray(sample_weight, dtype=np.float64).ravel()
+            if w.shape[0] != n or not np.all(np.isfinite(w)) or np.any(w < 0) or w.sum() <= 0:
+                raise ValueError("sample_weight must be finite, non-negative and match X")
+
+        self.n_columns_ = d
+        self.n_cont_ = d if self.continuous_input_size is None else int(self.continuous_input_size)
+        if not 0 <= self.n_cont_ <= d:
+            raise ValueError("continuous_input_size must be between 0 and the number of columns")
+        cont, codes = self._split(X)
+        if np.any(codes < 0) or not np.allclose(X[:, self.n_cont_:], codes):
+            raise ValueError("fixed-effect columns must hold non-negative integer codes")
+        self.cardinalities_ = [int(c.max()) + 1 if n else 0 for c in codes.T]
+
+        self.blocks_ = []
+        for col in range(self.n_cont_):
+            x = cont[:, col]
+            n_unique = len(np.unique(x))
+            if n_unique <= 1:
+                continue  # constant: absorbed by the intercept
+            linear = (self.variable_types.get(col) in ("binary", "ordinal")
+                      or n_unique <= self.n_knots + self.degree + 1)
+            if linear:
+                self.blocks_.append(("linear", col, {"mean": float(x.mean()), "scale": float(x.std())}))
+            else:
+                self.blocks_.append(("spline", col, self._make_spline_spec(x)))
+
+        sizes = [spec["n_basis"] - 1 if kind == "spline" else 1 for kind, _, spec in self.blocks_]
+        self.penalty_ = np.zeros((sum(sizes), sum(sizes)))
+        offset = 0
+        for (kind, _, spec), size in zip(self.blocks_, sizes):
+            if kind == "spline":
+                diff = np.diff(np.eye(spec["n_basis"]), n=2, axis=0)[:, 1:]
+                self.penalty_[offset:offset + size, offset:offset + size] = diff.T @ diff
+            offset += size
+
+        D = self._design(cont)
+        val_losses = []
+        if len(self.penalty_grid) > 1 and self.val_frac > 0 and n >= 50:
+            val = np.random.default_rng(random_state).random(n) < self.val_frac
+            for lam in self.penalty_grid:
+                params = self._fit_penalized(D[~val], codes[~val], y[~val], w[~val], lam)
+                val_losses.append(self._loss(D[val], codes[val], y[val], w[val], params))
+            lam = self.penalty_grid[int(np.argmin(val_losses))]
+        else:
+            lam = self.penalty_grid[len(self.penalty_grid) // 2]
+        params = self._fit_penalized(D, codes, y, w, lam)
+
+        # Center each FE dimension on its weighted mean so unseen levels map to the average level
+        for k, c in enumerate(codes.T):
+            shift = float(np.average(params[2 + k][c], weights=w))
+            params[2 + k] = params[2 + k] - shift
+            params[0] = params[0] + shift
+        self.params_ = params
+        self.penalty_value_ = lam
+        self.model = self
+
+        train_loss = self._loss(D, codes, y, w, params)
+        if verbose:
+            n_spline = sum(kind == "spline" for kind, _, _ in self.blocks_)
+            print(f"[FESplineNuisance] n={n}, spline_cols={n_spline}, linear_cols={len(self.blocks_) - n_spline}, "
+                  f"fe_levels={self.cardinalities_}, penalty={lam:g}, loss={train_loss:.6g}")
+        return FESplineModelNuisanceResults(self, penalty=lam, train_loss=train_loss,
+                                            validation_losses=val_losses)
+
+
+class FESplineModelNuisanceResults(NPModelResultsNuisance):
+    """Results wrapper for FESplineModelNuisance with the NNModelNuisanceResults API."""
+
+    def __init__(self, model, **metrics):
+        super().__init__(model, **metrics)
+        self._spline = model
+
+    def _eta(self, X):
+        cont, codes = self._spline._split(X)
+        return self._spline._eta(self._spline._design(cont), codes, self._spline.params_), cont
+
+    def predict(self, X):
+        eta, _ = self._eta(X)
+        return np.exp(eta) if self._spline.positive_log_link else eta
+
+    def derivative(self, X, var_index):
+        """
+        Returns (pred, grad): pred[i] = m(x_i), grad[i, k] = dm(x_i)/dx_k for k in
+        var_index, computed analytically from the spline basis.
+        """
+        eta, cont = self._eta(X)
+        var_index = list(np.atleast_1d(var_index))
+        grads = np.zeros((len(eta), len(var_index)))
+        for out_col, j in enumerate(var_index):
+            if not 0 <= j < self._spline.n_cont_:
+                raise ValueError(f"Column {j} is a fixed-effect code; derivatives are not defined")
+            grads[:, out_col] = self._spline._design(cont, derivative_col=j) @ self._spline.params_[1]
+        if self._spline.positive_log_link:
+            pred = np.exp(eta)
+            return pred, pred[:, None] * grads
+        return eta, grads
