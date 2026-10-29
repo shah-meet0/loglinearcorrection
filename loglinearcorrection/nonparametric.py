@@ -1704,8 +1704,13 @@ class FESplineModelNuisance(NPModel):
             return mean, mean * (1.0 - mean)
         return eta, np.ones_like(eta)
 
-    def fit(self, X, y, *, sample_weight=None, verbose: bool = False, random_state: int = 0, **fit_params):
-        """Fit the penalized additive model; NN-style fit kwargs (epochs, ...) are ignored."""
+    def fit(self, X, y, *, sample_weight=None, verbose: bool = False, random_state: int | None = None,
+            **fit_params):
+        """Fit the penalized additive model; NN-style fit kwargs (epochs, ...) are ignored.
+
+        The penalty holdout is drawn with ``random_state`` if given, else from numpy's
+        global generator, which the estimators' ``seed`` fixes for each nuisance fit.
+        """
         X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.float64).ravel()
         if X.ndim != 2 or X.shape[0] != y.shape[0]:
@@ -1763,7 +1768,8 @@ class FESplineModelNuisance(NPModel):
         D = self._design(cont)
         val_losses = []
         if len(self.penalty_grid) > 1 and self.val_frac > 0 and n >= 50:
-            val = np.random.default_rng(random_state).random(n) < self.val_frac
+            draws = np.random.random(n) if random_state is None else np.random.default_rng(random_state).random(n)
+            val = draws < self.val_frac
             for lam in self.penalty_grid:
                 params = self._fit_penalized(D[~val], codes[~val], y[~val], w[~val], lam)
                 val_losses.append(self._loss(D[val], codes[val], y[val], w[val], params))
