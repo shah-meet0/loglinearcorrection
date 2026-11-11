@@ -177,3 +177,14 @@ def test_gpcam_end_to_end(n_folds, phi, psi):
     assert abs(np.log1p(result.estimate) - 0.5) < 0.3 if psi == 1.0 else abs(result.estimate - 0.5) < 0.3
     assert len(result.fold_results) == n_folds
     assert result.estimate == run().estimate
+
+
+def test_max_seconds_caps_training():
+    x, g, y, _ = _data(n=3000, n_levels=30)
+    X = np.column_stack([x, g])
+    kw = dict(non_fe_inputs=2, categorical_cardinalities=[30], hidden_layers=[64, 64], batch_size=32,
+              epochs=10_000, patience=10_000, device="cpu")
+    result = FENNModelNuisance({}, **kw).fit(X, y, random_state=0, max_seconds=1.0)
+    assert result.metrics["timed_out"] and not result.metrics["refitted"]
+    assert result.metrics["seconds"] < 10
+    assert np.all(np.isfinite(result.predict(X)))

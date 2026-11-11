@@ -1908,6 +1908,10 @@ class FENNModelNuisance(NPModel):
         Refit on all rows for the selected number of epochs after early stopping.
     grad_clip_norm : float or None
         Clip the global gradient norm.
+    max_seconds : float or None
+        Wall-clock cap on training (holdout phase and refit together). When it
+        is reached the best holdout state so far is kept and the refit is
+        skipped; ``metrics['timed_out']`` records it.
     max_abs_eta : float
         Clamp of the log/logit linear predictor (numerical safety only).
     device : str or None
@@ -1923,7 +1927,7 @@ class FENNModelNuisance(NPModel):
     """
 
     TRAIN_KEYS = ("learning_rate", "fe_learning_rate", "weight_decay", "batch_size", "epochs",
-                  "patience", "min_delta", "val_frac", "refit", "grad_clip_norm", "verbose")
+                  "patience", "min_delta", "val_frac", "refit", "grad_clip_norm", "max_seconds", "verbose")
 
     def __init__(self, variable_types, non_fe_inputs=None, categorical_cardinalities=None,
                  link: str | None = None, positive_log_link: bool = False,
@@ -1932,7 +1936,8 @@ class FENNModelNuisance(NPModel):
                  learning_rate: float = 1e-3, fe_learning_rate: float | None = None,
                  weight_decay: float = 1e-4, batch_size: int | None = 512, epochs: int = 500,
                  patience: int = 20, min_delta: float = 1e-4, val_frac: float = 0.2,
-                 refit: bool = True, grad_clip_norm: float | None = None, max_abs_eta: float = 30.0,
+                 refit: bool = True, grad_clip_norm: float | None = None, max_seconds: float | None = None,
+                 max_abs_eta: float = 30.0,
                  device: str | None = None, dtype: str = "float32", verbose: bool = False, **params):
         super().__init__(variable_types, **params)
         self.non_fe_inputs = non_fe_inputs
@@ -1967,7 +1972,7 @@ class FENNModelNuisance(NPModel):
             "learning_rate": learning_rate, "fe_learning_rate": fe_learning_rate,
             "weight_decay": weight_decay, "batch_size": batch_size, "epochs": epochs,
             "patience": patience, "min_delta": min_delta, "val_frac": val_frac, "refit": refit,
-            "grad_clip_norm": grad_clip_norm, "verbose": verbose,
+            "grad_clip_norm": grad_clip_norm, "max_seconds": max_seconds, "verbose": verbose,
         }
         self._check_train(self.train_defaults)
 
@@ -1994,6 +1999,8 @@ class FENNModelNuisance(NPModel):
             raise ValueError("val_frac must be in [0, 1)")
         if cfg["grad_clip_norm"] is not None and not cfg["grad_clip_norm"] > 0:
             raise ValueError("grad_clip_norm must be positive or None")
+        if cfg["max_seconds"] is not None and not cfg["max_seconds"] > 0:
+            raise ValueError("max_seconds must be positive or None")
 
     def _split(self, X):
         X = np.asarray(X, dtype=np.float64)
@@ -2106,8 +2113,9 @@ class FENNModelNuisance(NPModel):
         opt.step(closure)
 
     def _train(self, z, codes, y, w, cfg, z_val=None, codes_val=None, y_val=None, w_val=None,
-               n_epochs=None, generator=None):
-        """Initialize and train one network; returns (net, best_epoch, history)."""
+               n_epochs=None, generator=None, deadline=None):
+        """Initialize and train one network; returns (net, best_epoch, history, timed_out)."""
+        import time
         import torch
         n = z.shape[0]
         net = self._build_net()
@@ -2124,16 +2132,24 @@ class FENNModelNuisance(NPModel):
                   {"params": no_decay, "weight_decay": 0.0, "lr": lr},
                   {"params": [net.intercept, *net.alphas], "weight_decay": 0.0, "lr": fe_lr}]
         groups = [g for g in groups if g["params"]]
-        opt = torch.optim.AdamW(groups, lr=lr)
+        # Fused AdamW on CUDA: one kernel per step instead of one per parameter group (elementwise,
+        # so as deterministic as the unfused version)
+        opt = torch.optim.AdamW(groups, lr=lr, fused=self.device.type == "cuda")
         bs = cfg["batch_size"]
         bs = n if bs is None or int(bs) >= n else int(bs)
         max_epochs = int(cfg["epochs"]) if n_epochs is None else int(n_epochs)
         patience, min_delta = int(cfg["patience"]), float(cfg["min_delta"])
         clip = cfg["grad_clip_norm"]
         params = [p for g in groups for p in g["params"]]
+        packed = torch.cat([z, y[:, None], w[:, None]], dim=1) if bs < n else None
         best, best_epoch, best_state, bad = float("inf"), max_epochs, None, 0
         history = []
+        timed_out = False
         for epoch in range(1, max_epochs + 1):
+            if deadline is not None and epoch > 1 and time.perf_counter() > deadline:
+                timed_out = True
+                best_epoch = min(best_epoch, epoch - 1)
+                break
             net.train()
             if bs == n:
                 batches = [None]
@@ -2144,7 +2160,9 @@ class FENNModelNuisance(NPModel):
                 if idx is None:
                     zb, cb, yb, wb = z, codes, y, w
                 else:
-                    zb, cb, yb, wb = z[idx], codes[idx], y[idx], w[idx]
+                    rows = packed[idx]  # one gather for z, y and w
+                    zb, yb, wb = rows[:, :-2], rows[:, -2], rows[:, -1]
+                    cb = codes[idx]
                 opt.zero_grad(set_to_none=True)
                 # Penalty per batch scaled so a full epoch applies it once per row
                 loss = self._loss_tensor(self._eta_tensor(net, zb, cb), yb, wb) + self._penalty(net, n)
@@ -2168,7 +2186,7 @@ class FENNModelNuisance(NPModel):
         if best_state is not None:
             net.load_state_dict(best_state)
         net.eval()
-        return net, best_epoch, history
+        return net, best_epoch, history, timed_out
 
     def _evaluate(self, net, z, codes, y, w, chunk=262144):
         import torch
@@ -2266,15 +2284,24 @@ class FENNModelNuisance(NPModel):
             va, tr = np.sort(perm[:n_val]), np.sort(perm[n_val:])
         else:
             tr, va = np.arange(n), None
+        deadline = None if cfg["max_seconds"] is None else started + float(cfg["max_seconds"])
+        refitted = False
         if va is not None and len(va):
             trt, vat = torch.as_tensor(tr, device=dev), torch.as_tensor(va, device=dev)
-            net, best_epoch, history = self._train(Z[trt], C[trt], Y[trt], W[trt], cfg,
-                                                   Z[vat], C[vat], Y[vat], W[vat], generator=generator)
+            net, best_epoch, history, timed_out = self._train(
+                Z[trt], C[trt], Y[trt], W[trt], cfg, Z[vat], C[vat], Y[vat], W[vat],
+                generator=generator, deadline=deadline)
             best_val = float(np.min(history)) if history else float("nan")
-            if cfg["refit"]:
-                net, _, _ = self._train(Z, C, Y, W, cfg, n_epochs=best_epoch, generator=generator)
+            if cfg["refit"] and not timed_out:
+                refit_net, _, _, refit_timed_out = self._train(Z, C, Y, W, cfg, n_epochs=best_epoch,
+                                                               generator=generator, deadline=deadline)
+                if refit_timed_out:
+                    timed_out = True  # keep the holdout-selected network
+                else:
+                    net, refitted = refit_net, True
         else:
-            net, best_epoch, history = self._train(Z, C, Y, W, cfg, generator=generator)
+            net, best_epoch, history, timed_out = self._train(Z, C, Y, W, cfg, generator=generator,
+                                                              deadline=deadline)
             best_val = float("nan")
 
         # Center each FE on its weighted training mean so unseen levels map to the average
@@ -2298,7 +2325,8 @@ class FENNModelNuisance(NPModel):
             print(f"[FENNNuisance] n={n}, link={self.link}, cont={self.n_cont_}, fe_levels={self.cardinalities_}, "
                   f"best_epoch={best_epoch}, val={best_val:.6g}, train={train_loss:.6g}, {seconds:.1f}s")
         return FENNModelNuisanceResults(self, best_epoch=best_epoch, val_loss=best_val, train_loss=train_loss,
-                                        validation_history=history, seconds=seconds, device=str(dev))
+                                        validation_history=history, seconds=seconds, device=str(dev),
+                                        refitted=refitted, timed_out=timed_out)
 
 
 class FENNModelNuisanceResults(NPModelResultsNuisance):
