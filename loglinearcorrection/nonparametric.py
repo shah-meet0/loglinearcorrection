@@ -1827,3 +1827,550 @@ class FESplineModelNuisanceResults(NPModelResultsNuisance):
             grads[:, out_col] = self._spline._design(cont, derivative_col=j) @ self._spline.params_[1]
         pred, dmean = self._spline._mean(eta)
         return pred, dmean[:, None] * grads
+
+
+class FENNModelNuisance(NPModel):
+    """
+    Neural-network nuisance model with additive high-dimensional fixed effects.
+
+        eta(x) = c + s * [MLP(z) + b'z] + sum_k alpha_k[g_k],   z = standardized non-FE columns
+        m(x)   = eta(x)              (link='identity': least squares; e.g. phi = 0)
+        m(x)   = exp(eta(x))         (link='log': Poisson quasi-likelihood; phi != 0)
+        m(x)   = 1 / (1 + e^-eta(x)) (link='logit': Bernoulli; propensity scores)
+
+    The drop-in neural counterpart of :class:`FESplineModelNuisance`: the same
+    constructor arguments are passed by GeneralizedDREAM / GeneralizedPCAM when
+    ``fe_encoding='codes'`` (``non_fe_inputs``, ``categorical_cardinalities``,
+    ``positive_log_link``, ``output_activation``), the fixed effects are
+    zero-based integer codes in the trailing columns, and each FE level gets one
+    scalar ``alpha_k[g]`` (no interactions with x, so the derivative in x does
+    not depend on the fixed effects). The scalars carry a light ridge penalty
+    ``fe_penalty * kappa * sum alpha^2 / (2 n)``, with ``kappa`` the curvature of
+    the loss at the overall mean (1, mean(y), p(1-p)), so a level with ``n_g``
+    rows is shrunk by about ``n_g / (n_g + fe_penalty)`` for every link, i.e.
+    ``fe_penalty`` pseudo-observations at the average level.
+
+    Non-FE columns are standardized with the training mean and standard
+    deviation; for the identity link the target is standardized too (``s`` is
+    its standard deviation, ``c`` its mean) so ``weight_decay`` and the learning
+    rate do not depend on units. The MLP's output layer starts at zero and the
+    intercept and FE scalars are warm-started by a FE-only L-BFGS fit, so
+    training starts at the FE-only model. Training is AdamW (weight decay on the
+    MLP and linear weight matrices only) on the weighted loss of the link
+    (squared error / Poisson deviance / Bernoulli log-loss), full batch or
+    minibatch, with early stopping on a random holdout of ``val_frac`` rows;
+    with ``refit=True`` the model is then refitted on all rows for the selected
+    number of epochs. Derivatives are taken by autograd on the raw scale of x.
+
+    Fixed seed: everything random (holdout, initialization, minibatch order,
+    dropout) draws from torch's and numpy's global generators, which the
+    estimators' ``seed`` fixes for each nuisance fit (``_seeded_rng``), or from
+    ``random_state`` if given to :meth:`fit`.
+
+    Parameters
+    ----------
+    variable_types : dict
+        Map {col_index: 'continuous'|'binary'|'ordinal'} (all enter the MLP).
+    non_fe_inputs : int, optional
+        Number of leading regressor columns; the remaining columns are FE codes.
+        Defaults to all columns (no FE codes).
+    categorical_cardinalities : list of int, optional
+        Number of levels of each FE (passed automatically with the codes).
+    link : {'identity', 'log', 'logit'}, optional
+        As in :class:`FESplineModelNuisance` (default follows
+        ``positive_log_link`` / ``output_activation``).
+    hidden_layers : list of int
+        Widths of the hidden layers (``[]`` gives the linear-index model).
+    activation : {'silu', 'gelu', 'tanh', 'softplus', 'relu', 'leaky_relu', 'elu'}
+        Hidden activation. Smooth activations give smooth derivatives in x.
+    dropout : float
+        Dropout after each hidden layer.
+    linear_skip : bool
+        Add the linear term ``b'z`` next to the MLP.
+    fe_penalty : float
+        Ridge pseudo-count on the FE scalars (see above); 0 leaves them free.
+    learning_rate, fe_learning_rate : float
+        AdamW step for the network and for the FE scalars and intercept
+        (``fe_learning_rate=None`` uses ``learning_rate``).
+    weight_decay : float
+        AdamW decoupled weight decay on the weight matrices.
+    batch_size : int or None
+        Minibatch size; ``None`` or ``>= n`` trains full batch.
+    epochs : int
+        Maximum number of epochs.
+    patience : int
+        Early-stopping patience in epochs (on the holdout loss).
+    min_delta : float
+        Minimum relative improvement of the holdout loss to reset patience.
+    val_frac : float
+        Holdout share; 0 disables early stopping (all ``epochs`` are run).
+    refit : bool
+        Refit on all rows for the selected number of epochs after early stopping.
+    grad_clip_norm : float or None
+        Clip the global gradient norm.
+    max_abs_eta : float
+        Clamp of the log/logit linear predictor (numerical safety only).
+    device : str or None
+        'cuda', 'cpu' or None (CUDA when available).
+    dtype : {'float32', 'float64'}
+        Training precision.
+    **params
+        Other keys the estimators pass (``input_size``, ``output_size``,
+        ``log_link_max_abs``, ...) are accepted and ignored. Every training key
+        above can also be passed to :meth:`fit`, which overrides the
+        constructor's value, so a run can put them in ``arch_params`` or
+        ``fit_params``.
+    """
+
+    TRAIN_KEYS = ("learning_rate", "fe_learning_rate", "weight_decay", "batch_size", "epochs",
+                  "patience", "min_delta", "val_frac", "refit", "grad_clip_norm", "verbose")
+
+    def __init__(self, variable_types, non_fe_inputs=None, categorical_cardinalities=None,
+                 link: str | None = None, positive_log_link: bool = False,
+                 hidden_layers=(128, 128), activation: str = "silu", dropout: float = 0.0,
+                 linear_skip: bool = True, fe_penalty: float = 1.0,
+                 learning_rate: float = 1e-3, fe_learning_rate: float | None = None,
+                 weight_decay: float = 1e-4, batch_size: int | None = 512, epochs: int = 500,
+                 patience: int = 20, min_delta: float = 1e-4, val_frac: float = 0.2,
+                 refit: bool = True, grad_clip_norm: float | None = None, max_abs_eta: float = 30.0,
+                 device: str | None = None, dtype: str = "float32", verbose: bool = False, **params):
+        super().__init__(variable_types, **params)
+        self.non_fe_inputs = non_fe_inputs
+        self.categorical_cardinalities = categorical_cardinalities
+        if link is None:
+            sigmoid = params.get("output_activation") == "sigmoid"
+            link = "log" if positive_log_link else "logit" if sigmoid else "identity"
+        if link not in ("identity", "log", "logit"):
+            raise ValueError("link must be 'identity', 'log' or 'logit'")
+        if positive_log_link and link != "log":
+            raise ValueError("positive_log_link=True requires link='log'")
+        self.link = link
+        self.hidden_layers = [int(h) for h in hidden_layers]
+        if any(h <= 0 for h in self.hidden_layers):
+            raise ValueError("hidden_layers must be positive integers")
+        if activation not in self._activations():
+            raise ValueError(f"activation must be one of {sorted(self._activations())}")
+        self.activation = activation
+        self.dropout = float(dropout)
+        if not 0.0 <= self.dropout < 1.0:
+            raise ValueError("dropout must be in [0, 1)")
+        self.linear_skip = bool(linear_skip)
+        self.fe_penalty = float(fe_penalty)
+        if self.fe_penalty < 0:
+            raise ValueError("fe_penalty must be non-negative")
+        self.max_abs_eta = float(max_abs_eta)
+        if dtype not in ("float32", "float64"):
+            raise ValueError("dtype must be 'float32' or 'float64'")
+        self.dtype = dtype
+        self.device_name = device
+        self.train_defaults = {
+            "learning_rate": learning_rate, "fe_learning_rate": fe_learning_rate,
+            "weight_decay": weight_decay, "batch_size": batch_size, "epochs": epochs,
+            "patience": patience, "min_delta": min_delta, "val_frac": val_frac, "refit": refit,
+            "grad_clip_norm": grad_clip_norm, "verbose": verbose,
+        }
+        self._check_train(self.train_defaults)
+
+    # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _activations():
+        import torch.nn as nn
+        return {"silu": nn.SiLU, "gelu": nn.GELU, "tanh": nn.Tanh, "softplus": nn.Softplus,
+                "relu": nn.ReLU, "leaky_relu": nn.LeakyReLU, "elu": nn.ELU}
+
+    @staticmethod
+    def _check_train(cfg):
+        if not cfg["learning_rate"] > 0:
+            raise ValueError("learning_rate must be positive")
+        if cfg["fe_learning_rate"] is not None and not cfg["fe_learning_rate"] > 0:
+            raise ValueError("fe_learning_rate must be positive")
+        if cfg["weight_decay"] < 0:
+            raise ValueError("weight_decay must be non-negative")
+        if cfg["batch_size"] is not None and int(cfg["batch_size"]) <= 0:
+            raise ValueError("batch_size must be positive or None")
+        if int(cfg["epochs"]) <= 0 or int(cfg["patience"]) < 0 or cfg["min_delta"] < 0:
+            raise ValueError("epochs must be positive, patience and min_delta non-negative")
+        if not 0.0 <= float(cfg["val_frac"]) < 1.0:
+            raise ValueError("val_frac must be in [0, 1)")
+        if cfg["grad_clip_norm"] is not None and not cfg["grad_clip_norm"] > 0:
+            raise ValueError("grad_clip_norm must be positive or None")
+
+    def _split(self, X):
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim != 2 or X.shape[1] != self.n_columns_:
+            raise ValueError(f"Expected a 2-D array with {self.n_columns_} columns")
+        codes = np.rint(X[:, self.n_cont_:]).astype(np.int64)
+        return X[:, :self.n_cont_], codes
+
+    def _build_net(self):
+        import torch
+        import torch.nn as nn
+        act = self._activations()[self.activation]
+        layers, width = [], self.n_cont_
+        for h in self.hidden_layers:
+            layers += [nn.Linear(width, h), act()]
+            if self.dropout > 0:
+                layers.append(nn.Dropout(self.dropout))
+            width = h
+        mlp = None
+        if self.hidden_layers and self.n_cont_ > 0:
+            out = nn.Linear(width, 1)
+            nn.init.zeros_(out.weight)
+            nn.init.zeros_(out.bias)
+            mlp = nn.Sequential(*layers, out)
+        linear = nn.Linear(self.n_cont_, 1, bias=False) if (self.linear_skip and self.n_cont_ > 0) else None
+        if linear is not None:
+            nn.init.zeros_(linear.weight)
+        net = nn.Module()
+        net.mlp = mlp
+        net.linear = linear
+        net.intercept = nn.Parameter(torch.zeros(1))
+        net.alphas = nn.ParameterList([nn.Parameter(torch.zeros(k)) for k in self.cardinalities_])
+        return net.to(device=self.device, dtype=self._torch_dtype)
+
+    def _eta_tensor(self, net, z, codes):
+        """Linear predictor on the fitting scale from standardized z and code tensors."""
+        import torch
+        eta = net.intercept.expand(z.shape[0])
+        if net.mlp is not None or net.linear is not None:
+            f = torch.zeros_like(eta)
+            if net.mlp is not None:
+                f = f + net.mlp(z).squeeze(-1)
+            if net.linear is not None:
+                f = f + net.linear(z).squeeze(-1)
+            eta = eta + f
+        for k, alpha in enumerate(net.alphas):
+            eta = eta + alpha[codes[:, k]]
+        return eta
+
+    def _loss_tensor(self, eta, y, w):
+        import torch
+        if self.link == "log":
+            eta = eta.clamp(-self.max_abs_eta, self.max_abs_eta)
+            per = torch.exp(eta) - y * eta
+        elif self.link == "logit":
+            eta = eta.clamp(-self.max_abs_eta, self.max_abs_eta)
+            per = torch.nn.functional.softplus(eta) - y * eta
+        else:
+            per = 0.5 * (y - eta) ** 2
+        return (w * per).sum() / w.sum()
+
+    def _deviance(self, eta, y, w):
+        """Holdout metric (zero at a perfect fit): MSE, Poisson or Bernoulli deviance / 2."""
+        import torch
+        if self.link == "log":
+            eta = eta.clamp(-self.max_abs_eta, self.max_abs_eta)
+            mu = torch.exp(eta)
+            per = mu - y - torch.where(y > 0, y * (eta - torch.log(y.clamp_min(1e-300))), torch.zeros_like(y))
+        elif self.link == "logit":
+            eta = eta.clamp(-self.max_abs_eta, self.max_abs_eta)
+            per = torch.nn.functional.softplus(eta) - y * eta
+        else:
+            per = (y - eta) ** 2
+        return float((w * per).sum() / w.sum())
+
+    def _penalty(self, net, n_train):
+        if self.fe_penalty <= 0 or not len(net.alphas):
+            return 0.0
+        # Scaled by the loss curvature at the overall mean, so for every link a level with
+        # n_g rows is shrunk by about n_g / (n_g + fe_penalty)
+        return 0.5 * self.fe_penalty * self.curvature_ * sum((a ** 2).sum() for a in net.alphas) / n_train
+
+    def _warm_start(self, net, codes, y, w, n_train):
+        """FE-only fit (intercept + scalars) by L-BFGS; the network part is zero."""
+        import torch
+        ybar = float((w * y).sum() / w.sum())
+        if self.link == "log":
+            c0 = np.log(max(ybar, 1e-12))
+        elif self.link == "logit":
+            p = min(max(ybar, 1e-6), 1 - 1e-6)
+            c0 = np.log(p / (1 - p))
+        else:
+            c0 = ybar
+        with torch.no_grad():
+            net.intercept.fill_(float(c0))
+        if not len(net.alphas):
+            return
+        params = [net.intercept, *net.alphas]
+        opt = torch.optim.LBFGS(params, lr=1.0, max_iter=200, tolerance_grad=1e-9,
+                                tolerance_change=1e-12, history_size=20, line_search_fn="strong_wolfe")
+        def closure():
+            opt.zero_grad()
+            eta = net.intercept.expand(len(y))
+            for k, alpha in enumerate(net.alphas):
+                eta = eta + alpha[codes[:, k]]
+            loss = self._loss_tensor(eta, y, w) + self._penalty(net, n_train)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+
+    def _train(self, z, codes, y, w, cfg, z_val=None, codes_val=None, y_val=None, w_val=None,
+               n_epochs=None, generator=None):
+        """Initialize and train one network; returns (net, best_epoch, history)."""
+        import torch
+        n = z.shape[0]
+        net = self._build_net()
+        self._warm_start(net, codes, y, w, n)
+        lr = float(cfg["learning_rate"])
+        fe_lr = float(cfg["fe_learning_rate"] or lr)
+        decay, no_decay = [], []
+        for module in (net.mlp, net.linear):
+            if module is None:
+                continue
+            for name, p in module.named_parameters():
+                (decay if name.endswith("weight") else no_decay).append(p)
+        groups = [{"params": decay, "weight_decay": float(cfg["weight_decay"]), "lr": lr},
+                  {"params": no_decay, "weight_decay": 0.0, "lr": lr},
+                  {"params": [net.intercept, *net.alphas], "weight_decay": 0.0, "lr": fe_lr}]
+        groups = [g for g in groups if g["params"]]
+        opt = torch.optim.AdamW(groups, lr=lr)
+        bs = cfg["batch_size"]
+        bs = n if bs is None or int(bs) >= n else int(bs)
+        max_epochs = int(cfg["epochs"]) if n_epochs is None else int(n_epochs)
+        patience, min_delta = int(cfg["patience"]), float(cfg["min_delta"])
+        clip = cfg["grad_clip_norm"]
+        params = [p for g in groups for p in g["params"]]
+        best, best_epoch, best_state, bad = float("inf"), max_epochs, None, 0
+        history = []
+        for epoch in range(1, max_epochs + 1):
+            net.train()
+            if bs == n:
+                batches = [None]
+            else:
+                perm = torch.randperm(n, generator=generator).to(self.device)
+                batches = torch.split(perm, bs)
+            for idx in batches:
+                if idx is None:
+                    zb, cb, yb, wb = z, codes, y, w
+                else:
+                    zb, cb, yb, wb = z[idx], codes[idx], y[idx], w[idx]
+                opt.zero_grad(set_to_none=True)
+                # Penalty per batch scaled so a full epoch applies it once per row
+                loss = self._loss_tensor(self._eta_tensor(net, zb, cb), yb, wb) + self._penalty(net, n)
+                loss.backward()
+                if clip:
+                    torch.nn.utils.clip_grad_norm_(params, float(clip))
+                opt.step()
+            if z_val is None:
+                continue
+            val = self._evaluate(net, z_val, codes_val, y_val, w_val)
+            history.append(val)
+            if not np.isfinite(val):
+                break
+            if not np.isfinite(best) or val < best - min_delta * abs(best):
+                best, best_epoch, bad = val, epoch, 0
+                best_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+            else:
+                bad += 1
+                if bad > patience:
+                    break
+        if best_state is not None:
+            net.load_state_dict(best_state)
+        net.eval()
+        return net, best_epoch, history
+
+    def _evaluate(self, net, z, codes, y, w, chunk=262144):
+        import torch
+        net.eval()
+        with torch.no_grad():
+            eta = torch.cat([self._eta_tensor(net, z[i:i + chunk], codes[i:i + chunk])
+                             for i in range(0, z.shape[0], chunk)])
+        return self._deviance(eta, y, w)
+
+    # ------------------------------------------------------------------ public
+    def fit(self, X, y, *, sample_weight=None, random_state: int | None = None, train_idx=None,
+            val_idx=None, **fit_params):
+        """Fit the model. Training keys (see class docstring) override the constructor's;
+        other NN-style keys (``num_workers``, ``shuffle``, ...) are ignored. ``train_idx`` /
+        ``val_idx`` fix the early-stopping split."""
+        if random_state is not None:
+            from loglinearcorrection.generalized_dream import _seeded_rng
+            with _seeded_rng(int(random_state)):
+                return self._fit(X, y, sample_weight, train_idx, val_idx, fit_params)
+        return self._fit(X, y, sample_weight, train_idx, val_idx, fit_params)
+
+    def _fit(self, X, y, sample_weight, train_idx, val_idx, fit_params):
+        import time
+        import torch
+        started = time.perf_counter()
+        cfg = dict(self.train_defaults)
+        cfg.update({k: v for k, v in fit_params.items() if k in self.TRAIN_KEYS})
+        self._check_train(cfg)
+        use_cuda = torch.cuda.is_available() and torch.cuda.device_count() > 0
+        self.device = torch.device(self.device_name or ("cuda" if use_cuda else "cpu"))
+        self._torch_dtype = torch.float64 if self.dtype == "float64" else torch.float32
+
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).ravel()
+        if X.ndim != 2 or X.shape[0] != y.shape[0]:
+            raise ValueError("X must be 2-D with one row per element of y")
+        n, d = X.shape
+        if not np.all(np.isfinite(X)) or not np.all(np.isfinite(y)):
+            raise ValueError("X and y must be finite")
+        if self.link == "log" and np.any(y < 0):
+            raise ValueError("link='log' requires a non-negative target")
+        if self.link == "logit" and np.any((y < 0) | (y > 1)):
+            raise ValueError("link='logit' requires a target in [0, 1]")
+        if sample_weight is None:
+            w = np.ones(n)
+        else:
+            w = np.asarray(sample_weight, dtype=np.float64).ravel()
+            if w.shape[0] != n or not np.all(np.isfinite(w)) or np.any(w < 0) or w.sum() <= 0:
+                raise ValueError("sample_weight must be finite, non-negative and match X")
+        w = w / w.mean()
+
+        self.n_columns_ = d
+        self.n_cont_ = d if self.non_fe_inputs is None else int(self.non_fe_inputs)
+        if not 0 <= self.n_cont_ <= d:
+            raise ValueError("non_fe_inputs must be between 0 and the number of columns")
+        cont, codes = self._split(X)
+        if np.any(codes < 0) or not np.allclose(X[:, self.n_cont_:], codes):
+            raise ValueError("fixed-effect columns must hold non-negative integer codes")
+        self.cardinalities_ = [int(c.max()) + 1 if n else 0 for c in codes.T]
+        if self.categorical_cardinalities is not None:
+            if len(self.categorical_cardinalities) != codes.shape[1]:
+                raise ValueError("categorical_cardinalities must have one entry per FE column")
+            self.cardinalities_ = [max(int(k), seen) for k, seen in
+                                   zip(self.categorical_cardinalities, self.cardinalities_)]
+
+        self.x_mean_ = np.average(cont, axis=0, weights=w) if self.n_cont_ else np.zeros(0)
+        sd = np.sqrt(np.average((cont - self.x_mean_) ** 2, axis=0, weights=w)) if self.n_cont_ else np.zeros(0)
+        self.x_scale_ = np.where(sd > 1e-12, sd, 1.0)
+        if self.link == "identity":
+            self.y_center_ = float(np.average(y, weights=w))
+            ysd = float(np.sqrt(np.average((y - self.y_center_) ** 2, weights=w)))
+            self.y_scale_ = ysd if ysd > 1e-12 else 1.0
+        else:
+            self.y_center_, self.y_scale_ = 0.0, 1.0
+        y_fit = (y - self.y_center_) / self.y_scale_
+        ybar = float(np.average(y_fit, weights=w))
+        self.curvature_ = (max(ybar, 1e-12) if self.link == "log" else
+                           min(max(ybar * (1 - ybar), 1e-6), 0.25) if self.link == "logit" else 1.0)
+
+        dev, dt = self.device, self._torch_dtype
+        Z = torch.as_tensor((cont - self.x_mean_) / self.x_scale_, dtype=dt, device=dev)
+        C = torch.as_tensor(codes, dtype=torch.long, device=dev)
+        Y = torch.as_tensor(y_fit, dtype=dt, device=dev)
+        W = torch.as_tensor(w, dtype=dt, device=dev)
+        # Seeds for the split and minibatch order come from numpy's global generator,
+        # which the estimators' seed fixes (torch's global generator drives init and dropout)
+        generator = torch.Generator().manual_seed(int(np.random.randint(0, 2**31 - 1)))
+
+        val_frac = float(cfg["val_frac"])
+        if train_idx is not None and val_idx is not None:
+            tr, va = np.asarray(train_idx), np.asarray(val_idx)
+        elif val_frac > 0 and n >= 20:
+            perm = np.random.permutation(n)
+            n_val = max(1, int(round(n * val_frac)))
+            va, tr = np.sort(perm[:n_val]), np.sort(perm[n_val:])
+        else:
+            tr, va = np.arange(n), None
+        if va is not None and len(va):
+            trt, vat = torch.as_tensor(tr, device=dev), torch.as_tensor(va, device=dev)
+            net, best_epoch, history = self._train(Z[trt], C[trt], Y[trt], W[trt], cfg,
+                                                   Z[vat], C[vat], Y[vat], W[vat], generator=generator)
+            best_val = float(np.min(history)) if history else float("nan")
+            if cfg["refit"]:
+                net, _, _ = self._train(Z, C, Y, W, cfg, n_epochs=best_epoch, generator=generator)
+        else:
+            net, best_epoch, history = self._train(Z, C, Y, W, cfg, generator=generator)
+            best_val = float("nan")
+
+        # Center each FE on its weighted training mean so unseen levels map to the average
+        # level; levels without positive-weight training rows are exactly 0
+        with torch.no_grad():
+            for k, alpha in enumerate(net.alphas):
+                seen = torch.as_tensor(np.bincount(codes[:, k], weights=w, minlength=len(alpha)) > 0,
+                                       device=dev)
+                shift = (W * alpha[C[:, k]]).sum() / W.sum()
+                alpha.copy_(torch.where(seen, alpha - shift, torch.zeros_like(alpha)))
+                net.intercept.add_(shift)
+        self.net_ = net
+        self.model = self
+        train_loss = self._evaluate(net, Z, C, Y, W)
+        if self.link == "identity":
+            train_loss *= self.y_scale_ ** 2
+            best_val *= self.y_scale_ ** 2
+            history = [h * self.y_scale_ ** 2 for h in history]
+        seconds = time.perf_counter() - started
+        if cfg["verbose"]:
+            print(f"[FENNNuisance] n={n}, link={self.link}, cont={self.n_cont_}, fe_levels={self.cardinalities_}, "
+                  f"best_epoch={best_epoch}, val={best_val:.6g}, train={train_loss:.6g}, {seconds:.1f}s")
+        return FENNModelNuisanceResults(self, best_epoch=best_epoch, val_loss=best_val, train_loss=train_loss,
+                                        validation_history=history, seconds=seconds, device=str(dev))
+
+
+class FENNModelNuisanceResults(NPModelResultsNuisance):
+    """Results wrapper for FENNModelNuisance with the NNModelNuisanceResults API."""
+
+    def __init__(self, model, **metrics):
+        super().__init__(model, **metrics)
+        self._nn = model
+
+    def _eta(self, X, var_index=None, chunk=262144):
+        """Linear predictor on the raw scale and, for var_index, d eta / d x_j (raw x)."""
+        import torch
+        m = self._nn
+        cont, codes = m._split(X)
+        dev, dt = m.device, m._torch_dtype
+        mean = torch.as_tensor(m.x_mean_, dtype=dt, device=dev)
+        scale = torch.as_tensor(m.x_scale_, dtype=dt, device=dev)
+        net = m.net_
+        net.eval()
+        etas, grads = [], []
+        for i in range(0, cont.shape[0], chunk):
+            c = np.clip(codes[i:i + chunk], 0, None)
+            unseen = np.zeros(c.shape, dtype=bool)
+            for k, card in enumerate(m.cardinalities_):
+                unseen[:, k] = c[:, k] >= card
+                c[:, k] = np.where(unseen[:, k], 0, c[:, k])
+            ct = torch.as_tensor(c, dtype=torch.long, device=dev)
+            xr = torch.as_tensor(cont[i:i + chunk], dtype=dt, device=dev)
+            if var_index is not None:
+                xr.requires_grad_(True)
+            with torch.set_grad_enabled(var_index is not None):
+                eta = m._eta_tensor(net, (xr - mean) / scale, ct)
+                if unseen.any():
+                    # unseen level -> average level (alpha = 0)
+                    for k, alpha in enumerate(net.alphas):
+                        u = torch.as_tensor(unseen[:, k], device=dev)
+                        eta = eta - torch.where(u, alpha[ct[:, k]], torch.zeros_like(eta))
+                eta = m.y_center_ + m.y_scale_ * eta
+                if var_index is not None:
+                    if m.n_cont_:
+                        g = torch.autograd.grad(eta.sum(), xr)[0][:, var_index]
+                    else:
+                        g = torch.zeros((len(eta), len(var_index)), dtype=dt, device=dev)
+                    grads.append(g.detach().cpu().numpy().astype(np.float64))
+            etas.append(eta.detach().cpu().numpy().astype(np.float64))
+        eta = np.concatenate(etas) if etas else np.zeros(0)
+        grad = np.concatenate(grads) if grads else None
+        return eta, grad
+
+    @staticmethod
+    def _mean(link, eta, max_abs):
+        if link == "log":
+            mean = np.exp(np.clip(eta, -max_abs, max_abs))
+            return mean, mean
+        if link == "logit":
+            mean = 0.5 * (1.0 + np.tanh(0.5 * eta))
+            return mean, mean * (1.0 - mean)
+        return eta, np.ones_like(eta)
+
+    def predict(self, X):
+        eta, _ = self._eta(X)
+        return self._mean(self._nn.link, eta, self._nn.max_abs_eta)[0]
+
+    def derivative(self, X, var_index):
+        """
+        Returns (pred, grad): pred[i] = m(x_i), grad[i, k] = dm(x_i)/dx_k for k in
+        var_index, by autograd on the raw scale of x.
+        """
+        var_index = [int(j) for j in np.atleast_1d(var_index)]
+        for j in var_index:
+            if not 0 <= j < self._nn.n_cont_:
+                raise ValueError(f"Column {j} is a fixed-effect code; derivatives are not defined")
+        eta, grad = self._eta(X, var_index)
+        pred, dmean = self._mean(self._nn.link, eta, self._nn.max_abs_eta)
+        return pred, dmean[:, None] * grad

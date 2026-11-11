@@ -2282,14 +2282,19 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         self, n_folds: int, random_state: Optional[int]
     ) -> list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
         arm_counts = np.bincount(self.treatment, minlength=2)
+        if n_folds == 1 and np.min(arm_counts) > 0:
+            # No cross-fitting, as in GeneralizedDREAM: nuisances are fitted and
+            # evaluated on all rows.
+            everything = np.arange(self.nobs)
+            return [(everything, everything)]
         if (
             not isinstance(n_folds, int)
             or n_folds < 2
             or n_folds > int(np.min(arm_counts))
         ):
             raise ValueError(
-                "n_folds must be an integer between 2 and the size of the "
-                "smaller treatment arm"
+                "n_folds must be 1 (no cross-fitting) or an integer between 2 "
+                "and the size of the smaller treatment arm"
             )
         if self.fe_cols is not None:
             # Same fixed-effect spreading as GEAM, so held-out rows' fixed
