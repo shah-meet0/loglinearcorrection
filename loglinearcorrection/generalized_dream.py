@@ -1271,16 +1271,23 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                 v_test[:, j] = x[test_idx, j] - linear[test_idx, j] - fe_test_j
             absorbed = int(getattr(algorithm, "degrees", 0) or 0)
         absorbed += int(np.linalg.matrix_rank(w[train_idx])) if w.shape[1] else 0
+        n_train = len(train_idx)
         if dof_correction:
-            n_train = len(train_idx)
             if n_train - absorbed <= 0:
                 raise ValueError("No residual degrees of freedom to partial out the fixed effects")
             v_train = v_train * np.sqrt(n_train / (n_train - absorbed))
-        return {"v_train": v_train, "v_test": v_test, "controls": controls}
+        # Stein's identity for g = x - mu_hat: E[s (x - mu_hat)] = -1 when mu_hat is
+        # fitted on other rows (cross-fitting).  Without cross-fitting (n_folds=1)
+        # mu_hat = H x is fitted on the same rows, and E[s_i ((I - H) v)_i] =
+        # -(1 - H_ii), so the target is -(1 - dof / n) (unweighted dof ratio).
+        same_rows = len(test_idx) == n_train and np.array_equal(test_idx, train_idx)
+        stein_target = -(1.0 - absorbed / n_train) if same_rows else -1.0
+        return {"v_train": v_train, "v_test": v_test, "controls": controls,
+                "stein_target": stein_target}
 
     @staticmethod
     def _stein_diagnostics(
-        score: Array, v_test: Array, weights: Array | None = None
+        score: Array, v_test: Array, weights: Array | None = None, target: float = -1.0
     ) -> dict[str, Array]:
         """Held-out Stein moments for the conditional score ``d log f(x | FE, W) / dx``.
 
@@ -1294,17 +1301,20 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         ``conditional_stein`` (``E[s v] + 1``); both should be near 0.  With
         ``weights`` the moments are weighted (the identity then holds for the
         score of the weighted density, which is the one GEAM uses).
+        ``target`` is the value of ``E[s v]`` Stein's identity implies: ``-1`` for
+        held-out rows, ``-(1 - dof / n)`` when ``mu_hat`` was fitted on the same rows
+        (``n_folds=1``); ``conditional_stein`` is ``E[s v] - target``.
         """
         sd = np.sqrt(np.average((v_test - np.average(v_test, axis=0, weights=weights)) ** 2,
                                 axis=0, weights=weights))
         return {
             "mean_score": np.average(score, axis=0, weights=weights) * sd,
-            "conditional_stein": np.average(score * v_test, axis=0, weights=weights) + 1.0,
+            "conditional_stein": np.average(score * v_test, axis=0, weights=weights) - target,
         }
 
     @staticmethod
     def _calibrate_score(
-        score: Array, v_test: Array, weights: Array | None = None
+        score: Array, v_test: Array, weights: Array | None = None, target: float = -1.0
     ) -> tuple[Array, Array]:
         """Rescale each score column so the held-out moment ``E[s v] = -1`` holds.
 
@@ -1314,10 +1324,11 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         One scale factor per column and fold, ``c = -1 / E[s v]``, restores
         Stein's identity for ``g = x - mu_hat``.  It uses held-out ``x`` only,
         never the outcome.  Columns with ``E[s v] >= 0`` (the score has the
-        wrong sign) are left unchanged and get a factor of NaN.
+        wrong sign) are left unchanged and get a factor of NaN.  ``target`` replaces
+        ``-1`` without cross-fitting (see :meth:`_stein_diagnostics`).
         """
         moment = np.average(score * v_test, axis=0, weights=weights)
-        factor = np.where(moment < 0, -1.0 / np.where(moment < 0, moment, -1.0), np.nan)
+        factor = np.where(moment < 0, target / np.where(moment < 0, moment, -1.0), np.nan)
         calibrated = score * np.where(np.isfinite(factor), factor, 1.0)[None, :]
         return calibrated, factor
 
@@ -1336,6 +1347,7 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
                         stein.get("before_calibration", stein["conditional_stein"])[j]
                     ),
                     "calibration_factor": float(stein.get("factor", np.full(len(self.interest), np.nan))[j]),
+                    "stein_target": float(stein.get("target", -1.0)),
                     "n_test": len(fold["test_idx"]),
                 })
         table = pd.DataFrame(rows)
@@ -1347,11 +1359,11 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
         for name, value in pooled.items():
             factors = table.loc[table["variable"] == name, "calibration_factor"]
             calibrated = f"; calibration factors {factors.min():.2f} to {factors.max():.2f}" if factors.notna().any() else ""
-            print(f"Held-out conditional Stein check for {name}: E[s v] + 1 = {value:.3f} (target 0){calibrated}")
+            print(f"Conditional Stein check for {name}: E[s v] - target = {value:.3f} (should be 0){calibrated}")
             if abs(value) > tolerance:
                 warnings.warn(
                     f"The density score for {name} fails the conditional Stein check "
-                    f"(E[s v] + 1 = {value:.3f}, tolerance {tolerance}); it does not "
+                    f"(E[s v] - target = {value:.3f}, tolerance {tolerance}); it does not "
                     "match the conditional density given the fixed effects and controls. "
                     "See model.score_diagnostics.",
                     stacklevel=3,
@@ -1428,14 +1440,16 @@ class GeneralizedDREAM(DoublyRobustElasticityEstimatorModel):
             raise ValueError("The fitted density score returned non-finite values")
 
         test_weights = None if self.weights is None else np.asarray(self.weights, dtype=np.float64)[test_idx]
-        stein = self._stein_diagnostics(density_score, partialled["v_test"], test_weights)
+        target = partialled["stein_target"]
+        stein = self._stein_diagnostics(density_score, partialled["v_test"], test_weights, target)
+        stein["target"] = target
         if options["score_calibration"] == "stein":
             stein["before_calibration"] = stein["conditional_stein"]
             density_score, stein["factor"] = self._calibrate_score(
-                density_score, partialled["v_test"], test_weights
+                density_score, partialled["v_test"], test_weights, target
             )
             stein["conditional_stein"] = self._stein_diagnostics(
-                density_score, partialled["v_test"], test_weights
+                density_score, partialled["v_test"], test_weights, target
             )["conditional_stein"]
 
         h, h_prime = self._evaluate_policy(x_test, interest_indices)
@@ -2282,14 +2296,19 @@ class GeneralizedPCAM(DoublyRobustElasticityEstimatorModel):
         self, n_folds: int, random_state: Optional[int]
     ) -> list[tuple[npt.NDArray[np.int64], npt.NDArray[np.int64]]]:
         arm_counts = np.bincount(self.treatment, minlength=2)
+        if n_folds == 1 and np.min(arm_counts) > 0:
+            # No cross-fitting, as in GeneralizedDREAM: nuisances are fitted and
+            # evaluated on all rows.
+            everything = np.arange(self.nobs)
+            return [(everything, everything)]
         if (
             not isinstance(n_folds, int)
             or n_folds < 2
             or n_folds > int(np.min(arm_counts))
         ):
             raise ValueError(
-                "n_folds must be an integer between 2 and the size of the "
-                "smaller treatment arm"
+                "n_folds must be 1 (no cross-fitting) or an integer between 2 "
+                "and the size of the smaller treatment arm"
             )
         if self.fe_cols is not None:
             # Same fixed-effect spreading as GEAM, so held-out rows' fixed
