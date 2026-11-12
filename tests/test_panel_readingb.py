@@ -205,11 +205,17 @@ def test_detect_panel_structure():
     rng = np.random.default_rng(0)
     unit = np.repeat(np.arange(200), 5)
     year = np.tile(np.arange(5), 200)
-    region_year = (unit // 50) * 10 + year
+    region_year = (unit % 50) * 10 + year  # more levels than unit, nested in year
     x = rng.normal(0, 1, 200)[unit] + rng.normal(0, 1, len(unit))
     fe = pd.DataFrame({"region_year": region_year, "unit": unit, "year": year})
     out = detect_panel_structure(fe, x)
     assert out["unit"] == "unit" and out["time"] == "year" and out["absorbed"] == ["region_year"]
+    big = pd.DataFrame({"ind_year": (np.repeat(np.arange(200), 5) % 60) * 10 + year, "unit": unit, "year": year})
+    big = big.assign(ind_year=(unit % 300) * 10 + year)  # 1000 levels > 200 units
+    assert detect_panel_structure(big, x)["unit"] == "unit"
+    # county nested in state (not time-like): county is still the unit
+    nested = pd.DataFrame({"county": unit, "state": unit // 20, "year": year})
+    assert detect_panel_structure(nested, x)["unit"] == "county"
     # an interest regressor constant within units rules the unit out
     out = detect_panel_structure(fe[["unit", "year"]], rng.normal(0, 1, 200)[unit])
     assert out["unit"] == "year"
@@ -231,3 +237,33 @@ def test_in_sample_corrections_vanish_with_continuous_controls_and_time_effects(
     for phi, psi in res.targets:
         assert abs(np.sum(w * res.per_row[f"kappa_correction_{phi:g}_{psi:g}"])) < 1e-8 * w.sum()
     np.testing.assert_allclose(res.estimates, res.plugin_estimates, atol=1e-7)
+
+
+def test_geam_one_fold_partial_out_with_stein_calibration():
+    """The settings the replication driver uses (FESpline m, partial-out NN score,
+    Stein calibration, codes) run with n_folds=1 and use the in-sample Stein target."""
+    from loglinearcorrection.generalized_dream import JointGeneralizedDREAM
+    from loglinearcorrection.nonparametric import FESplineModelNuisance
+
+    rng = np.random.default_rng(2)
+    n_units, T = 120, 5
+    unit = np.repeat(np.arange(n_units), T)
+    c = rng.normal(0, 0.5, n_units)[unit]
+    x = 0.5 * c + rng.normal(0, 1, len(unit))
+    z = rng.normal(0, 1, len(unit))
+    y = np.exp(c + 0.8 * x + 0.2 * z + rng.normal(0, 0.5, len(unit)))
+    exog = pd.DataFrame({"x": x, "z": z, "unit": unit})
+    model = JointGeneralizedDREAM(y, exog, fixed_effects=["unit"], interest=["x"], fe_encoding="codes",
+                                  nuisance_fixed_effects=20, seed=1)
+    res = model.fit(
+        n_folds=1,
+        m_params={"model_class": FESplineModelNuisance, "arch_params": {}, "fit_params": {}},
+        density_params={"score_method": "partial_out", "score_calibration": "stein",
+                        "arch_params": {"shared": {"hidden_layers": [16], "activation": "silu"}},
+                        "fit_params": {"epochs": 15, "batch_size": 256, "verbose": False}},
+    )
+    assert res.n_folds == 1 and np.all(np.isfinite(res.estimates))
+    diag = model.score_diagnostics.iloc[0]
+    dof = n_units + 1  # unit levels + the control z
+    assert diag["stein_target"] == pytest.approx(-(1 - dof / len(y)))
+    assert abs(diag["conditional_stein"]) < 1e-8

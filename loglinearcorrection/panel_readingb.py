@@ -1422,47 +1422,58 @@ def detect_panel_structure(
 ) -> dict[str, Any]:
     """Suggest the panel unit and period among a design's fixed-effect columns.
 
-    Rule: candidate units are fixed effects whose median group has at least two
-    rows and within which ``interest`` (if given) keeps at least
-    ``min_within_share`` of its variance; the unit is the candidate with the most
-    levels.  The period is the other fixed effect with the fewest levels such that
-    every (unit, level) pair occurs at most once; ``None`` if there is none.  Every
-    other fixed effect is absorbed (and crossed into the kappa cells).  Returns
-    ``{"unit", "time", "absorbed", "within_share", "reason"}``; ``unit`` is ``None``
-    when no column qualifies (reading (b) needs a unit with within variation).
+    Two fixed effects *cross* when every (a, b) pair occurs at most once and b
+    varies within a; b is then *time-like* if it has fewer levels than a.
+    Candidate units are fixed effects that (i) have a median group of at least two
+    rows, (ii) keep at least ``min_within_share`` of the variance of ``interest``
+    within levels (if given) and (iii) are not nested in a time-like fixed effect
+    (an industry x year cell is nested in year, so it is a cell, not a unit).  The
+    unit is the candidate with the most levels; the period is the time-like fixed
+    effect crossing the unit with the fewest levels (``None`` if there is none).
+    Every other fixed effect is absorbed.  Returns ``{"unit", "time", "absorbed",
+    "within_share", "reason"}``; ``unit`` is ``None`` when no column qualifies
+    (reading (b) needs a unit with within variation).
     """
     frame = fixed_effects.reset_index(drop=True)
+    names = list(frame.columns)
+    codes = {name: _codes(frame[name].to_numpy()) for name in names}
+    levels = {name: int(c.max()) + 1 for name, c in codes.items()}
+
+    def nested(a: str, b: str) -> bool:  # every level of a has one level of b
+        return bool(pd.DataFrame({"a": codes[a], "b": codes[b]}).groupby("a")["b"].nunique().max() == 1)
+
+    def crosses(a: str, b: str) -> bool:  # unique (a, b) pairs, b varies within a
+        pairs = pd.DataFrame({"a": codes[a], "b": codes[b]})
+        return (not pairs.duplicated().any()) and not nested(a, b)
+
+    time_like = {b for a in names for b in names if a != b and levels[b] < levels[a] and crosses(a, b)}
     x = None if interest is None else np.asarray(interest, dtype=np.float64).reshape(-1)
     shares: dict[str, float] = {}
     candidates = []
-    for name in frame.columns:
-        codes = _codes(frame[name].to_numpy())
-        sizes = np.bincount(codes)
-        if np.median(sizes[codes]) < 2:
+    for name in names:
+        sizes = np.bincount(codes[name])
+        if np.median(sizes[codes[name]]) < 2:
             continue
         if x is not None:
-            within = x - _group_mean(x, codes, np.ones(len(x)))
+            within = x - _group_mean(x, codes[name], np.ones(len(x)))
             total = float(np.sum((x - x.mean()) ** 2))
             shares[name] = float(np.sum(within ** 2) / total) if total > 0 else 0.0
             if shares[name] < min_within_share:
                 continue
-        candidates.append((len(sizes), name))
-    if not candidates:
-        return {"unit": None, "time": None, "absorbed": list(frame.columns), "within_share": shares,
-                "reason": "no fixed effect has repeated rows with within variation in the interest regressor"}
-    unit = max(candidates)[1]
-    unit_codes = _codes(frame[unit].to_numpy())
-    times = []
-    for name in frame.columns:
-        if name == unit:
+        if any(t != name and nested(name, t) for t in time_like):
             continue
-        pairs = pd.DataFrame({"u": unit_codes, "t": _codes(frame[name].to_numpy())})
-        if not pairs.duplicated().any():
-            times.append((pairs["t"].nunique(), name))
+        candidates.append((levels[name], name))
+    if not candidates:
+        return {"unit": None, "time": None, "absorbed": names, "within_share": shares,
+                "reason": "no fixed effect has repeated rows with within variation in the interest "
+                          "regressor outside time-like cells"}
+    unit = max(candidates)[1]
+    times = [(levels[t], t) for t in names if t != unit and crosses(unit, t) and levels[t] < levels[unit]]
     time_name = min(times)[1] if times else None
-    absorbed = [c for c in frame.columns if c not in (unit, time_name)]
+    absorbed = [c for c in names if c not in (unit, time_name)]
     return {"unit": unit, "time": time_name, "absorbed": absorbed, "within_share": shares,
-            "reason": f"unit = {unit} (most levels among fixed effects with within variation)"}
+            "reason": f"unit = {unit} (most levels among fixed effects with within variation, "
+                      "not nested in a time-like effect)"}
 
 
 def _single(value: Sequence[Any]) -> Any:
